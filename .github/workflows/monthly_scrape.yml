@@ -8,7 +8,30 @@ on:
 jobs:
   scrape_and_push:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 2        # keep concurrent hits on Arctic Shift low to avoid IP bans
+      matrix:
+        include:
+          - start: 0
+            end: 20
+          - start: 20
+            end: 40
+          - start: 40
+            end: 60
+          - start: 60
+            end: 80
+          - start: 80
+            end: 100
+          - start: 100
+            end: 120
+          - start: 120
+            end: 140
+          - start: 140
+            end: 160
+          - start: 160
+            end: 163
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -23,7 +46,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests pandas datasets huggingface_hub python-dateutil urllib3
 
-      - name: Run Data Scraper & Uploader
+      - name: Run Data Scraper & Uploader (batch ${{ matrix.start }}-${{ matrix.end }})
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          PYTHONUNBUFFERED: "1"
+          BATCH_START: ${{ matrix.start }}
+          BATCH_END: ${{ matrix.end }}
         run: python fetch_arctic_to_hf.py
