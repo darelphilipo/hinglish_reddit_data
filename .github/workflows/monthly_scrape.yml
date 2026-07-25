@@ -4,6 +4,15 @@ on:
   schedule:
     - cron: '0 0 1 * *'
   workflow_dispatch:
+    inputs:
+      target_year:
+        description: 'Year to scrape (leave blank to default to previous calendar month)'
+        required: false
+        type: string
+      target_month:
+        description: 'Month to scrape, 1-12 (leave blank to default to previous calendar month)'
+        required: false
+        type: string
 
 jobs:
   scrape_and_push:
@@ -52,6 +61,8 @@ jobs:
           PYTHONUNBUFFERED: "1"
           BATCH_START: ${{ matrix.start }}
           BATCH_END: ${{ matrix.end }}
+          TARGET_YEAR: ${{ inputs.target_year }}
+          TARGET_MONTH: ${{ inputs.target_month }}
         run: python fetch_arctic_to_hf.py
 
   consolidate:
