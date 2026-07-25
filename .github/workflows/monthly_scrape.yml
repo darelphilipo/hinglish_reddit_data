@@ -1,12 +1,11 @@
 name: Monthly Arctic Shift Scrape to HF
 
-on: schedule: # Runs automatically at 00:00 UTC on the 1st day of every month - cron: '0 0 1 * *' workflow_dispatch: # Allows you to click "Run workflow" manually to test it
+on:schedule: - cron: '0 0 1 * *'workflow_dispatch:
 
-jobs: scrape_and_push: runs-on: ubuntu-latest timeout-minutes: 350 # Prevents GitHub from killing it too early
+jobs: scrape_and_push: runs-on: ubuntu-latest timeout-minutes: 350 steps: - name: Checkout Repository uses: actions/checkout@v4
 
-steps:
-  - name: Checkout Repository
-    uses: actions/checkout@v4
+- name: Checkout Repository
+uses: actions/checkout@v4
 
   - name: Set up Python 3.10
     uses: actions/setup-python@v5
@@ -20,6 +19,5 @@ steps:
 
   - name: Run Data Scraper & Uploader
     env:
-      # Pulls the token from your GitHub Repository Secrets
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
     run: python fetch_arctic_to_hf.py
