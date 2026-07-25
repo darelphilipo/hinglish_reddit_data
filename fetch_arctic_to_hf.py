@@ -6,8 +6,6 @@ from datetime import datetime
 from dateutil.relativedelta import relativedelta
 from datasets import Dataset
 from huggingface_hub import login
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 # ==========================================
 # CONFIGURATION
@@ -52,12 +50,32 @@ SUBREDDITS_FULL = [
 # The slice this specific job/batch is responsible for
 SUBREDDITS = SUBREDDITS_FULL[BATCH_START:BATCH_END]
 
-ARCTIC_SHIFT_URL = "https://arctic-shift.xk.io/api/comments/search"
+ARCTIC_SHIFT_URL = "https://arctic-shift.photon-reddit.com/api/comments/search"
 
-# Calculate timestamps for the previous calendar month
-today = datetime.now()
-first_day_this_month = today.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-first_day_last_month = first_day_this_month - relativedelta(months=1)
+# ==========================================
+# TARGET MONTH SELECTION
+# ==========================================
+# Defaults to the previous calendar month (for the normal scheduled run).
+# Override by setting TARGET_YEAR and TARGET_MONTH env vars, e.g. to backfill
+# a specific historical month (TARGET_YEAR=2025, TARGET_MONTH=3 for March 2025).
+target_year = os.getenv("TARGET_YEAR")
+target_month = os.getenv("TARGET_MONTH")
+
+if target_year and target_month:
+    target_year = int(target_year)
+    target_month = int(target_month)
+    if not (1 <= target_month <= 12):
+        raise ValueError(f"TARGET_MONTH must be 1-12, got {target_month}")
+    first_day_last_month = datetime(target_year, target_month, 1)
+    first_day_this_month = first_day_last_month + relativedelta(months=1)
+    print(f"Using manually specified target month: {first_day_last_month.strftime('%Y-%m')}", flush=True)
+else:
+    today = datetime.now()
+    first_day_this_month = today.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    first_day_last_month = first_day_this_month - relativedelta(months=1)
+    print(f"No TARGET_YEAR/TARGET_MONTH set -- defaulting to previous calendar month: "
+          f"{first_day_last_month.strftime('%Y-%m')}", flush=True)
+
 BEFORE_EPOCH = int(first_day_this_month.timestamp())
 AFTER_EPOCH = int(first_day_last_month.timestamp())
 
@@ -70,26 +88,46 @@ SPLIT_NAME = f"tmp_batch_{BATCH_START:03d}_{min(BATCH_END, len(SUBREDDITS_FULL))
 
 
 def get_secure_session():
-    """Returns a requests Session with built-in retry logic to survive API hiccups."""
+    """Returns a plain requests Session. Retries are now handled manually
+    inside fetch_subreddit_comments so every attempt is logged -- urllib3's
+    built-in Retry sleeps silently between attempts, which is what was
+    causing long stretches with no visible output."""
     session = requests.Session()
-    retry = Retry(
-        total=10,
-        read=10,
-        connect=10,
-        backoff_factor=2,
-        status_forcelist=[429, 500, 502, 503, 504]
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
     return session
 
 
 session = get_secure_session()
 
+MAX_ATTEMPTS = 5
+
+
+def fetch_page_with_retries(params):
+    """Fetches a single page, retrying on failure with visible logging
+    for every attempt instead of a silent backoff."""
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        t0 = time.time()
+        try:
+            response = session.get(ARCTIC_SHIFT_URL, params=params, timeout=15)
+            response.raise_for_status()
+            elapsed = time.time() - t0
+            remaining = response.headers.get("X-RateLimit-Remaining")
+            if remaining is not None and int(remaining) < 5:
+                print(f"    [!] Rate limit getting low: {remaining} requests remaining "
+                      f"(resets at {response.headers.get('X-RateLimit-Reset')})", flush=True)
+            return response.json(), elapsed
+        except Exception as e:
+            elapsed = time.time() - t0
+            wait = min(2 ** attempt, 30)  # capped backoff, max 30s
+            print(f"    [retry] attempt {attempt}/{MAX_ATTEMPTS} failed after {elapsed:.1f}s: {e}. "
+                  f"Waiting {wait}s before retry...", flush=True)
+            if attempt == MAX_ATTEMPTS:
+                raise
+            time.sleep(wait)
+
 
 def fetch_subreddit_comments(subreddit, after, before):
     print(f"--- Fetching r/{subreddit} ---", flush=True)
+    sub_start_time = time.time()
     all_comments = []
     current_after = after
     page_count = 0
@@ -105,19 +143,20 @@ def fetch_subreddit_comments(subreddit, after, before):
         }
 
         try:
-            response = session.get(ARCTIC_SHIFT_URL, params=params, timeout=15)
-            response.raise_for_status()
-            data = response.json()
+            data, elapsed = fetch_page_with_retries(params)
             comments = data.get("data", [])
 
             if not comments:
+                print(f"    r/{subreddit} page {page_count}: 0 new comments (end of range), req took {elapsed:.1f}s", flush=True)
                 break
 
+            kept = 0
             for comment in comments:
                 body = comment.get("body", "")
 
                 # Skip strictly deleted/removed content to save DB space
                 if body and body not in ["[removed]", "[deleted]"]:
+                    kept += 1
                     # Keep exactly the columns requested
                     all_comments.append({
                         "id": comment.get("id"),
@@ -129,17 +168,20 @@ def fetch_subreddit_comments(subreddit, after, before):
                         "collapsed_reason_code": comment.get("collapsed_reason_code")
                     })
 
-            if page_count % 10 == 0:
-                print(f"    ...r/{subreddit} page {page_count}, {len(all_comments)} collected so far", flush=True)
+            print(f"    r/{subreddit} page {page_count}: fetched {len(comments)}, kept {kept} "
+                  f"(running total {len(all_comments)}), req took {elapsed:.1f}s", flush=True)
 
             current_after = comments[-1]["created_utc"]
             time.sleep(1.2)  # Crucial sleep to avoid IP bans from Arctic Shift
 
         except Exception as e:
-            print(f"  [!] Error on r/{subreddit} (page {page_count}): {e}. Skipping remainder of this sub.", flush=True)
+            print(f"  [!] Giving up on r/{subreddit} at page {page_count} after {MAX_ATTEMPTS} failed "
+                  f"attempts: {e}. Moving on with what was collected.", flush=True)
             break
 
-    print(f"Collected {len(all_comments)} comments from r/{subreddit} ({page_count} pages)", flush=True)
+    sub_elapsed = time.time() - sub_start_time
+    print(f"Collected {len(all_comments)} comments from r/{subreddit} "
+          f"({page_count} pages, {sub_elapsed:.0f}s)", flush=True)
     return all_comments
 
 
@@ -177,6 +219,8 @@ def main():
     for i, sub in enumerate(SUBREDDITS, start=1):
         sub_comments = fetch_subreddit_comments(sub, AFTER_EPOCH, BEFORE_EPOCH)
         master_dataset.extend(sub_comments)
+        print(f"[batch progress] {i}/{len(SUBREDDITS)} subreddits done, "
+              f"{len(master_dataset)} total rows collected so far in this batch\n", flush=True)
         time.sleep(1.5)  # Pause between subreddits
 
         if i % CHECKPOINT_EVERY == 0 or i == len(SUBREDDITS):
