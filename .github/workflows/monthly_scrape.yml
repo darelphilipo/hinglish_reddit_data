@@ -1,3 +1,9 @@
+name: Monthly Arctic Shift Scrape to HF
+
+on: schedule: # Runs automatically at 00:00 UTC on the 1st day of every month - cron: '0 0 1 * *' workflow_dispatch: # Allows you to click "Run workflow" manually to test it
+
+jobs: scrape_and_push: runs-on: ubuntu-latest timeout-minutes: 350 # Prevents GitHub from killing it too early
+
 steps:
   - name: Checkout Repository
     uses: actions/checkout@v4
