@@ -6,6 +6,7 @@ from datetime import datetime
 from dateutil.relativedelta import relativedelta
 from datasets import Dataset
 from huggingface_hub import login
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
 # ==========================================
 # CONFIGURATION
@@ -14,8 +15,9 @@ HF_DATASET_REPO = "darelphilip/reddit_indian_subs"  # CHANGE THIS
 HF_TOKEN = os.getenv("HF_TOKEN")
 
 # Push a checkpoint split to HF every N subreddits *within* this batch,
-# so a mid-batch failure only loses the in-flight chunk, not the whole batch.
-CHECKPOINT_EVERY = 5
+# so a failure only loses the in-flight chunk, not the whole batch.
+# Kept small since failures now move on quickly rather than retrying at length.
+CHECKPOINT_EVERY = 3
 
 # Which slice of SUBREDDITS this job processes. Defaults to the full list
 # so the script still works fine for local/manual full runs.
@@ -98,31 +100,47 @@ def get_secure_session():
 
 session = get_secure_session()
 
-MAX_ATTEMPTS = 5
+MAX_ATTEMPTS = 2               # one try, one retry -- then move on, don't chase it
+HARD_REQUEST_TIMEOUT = 15      # true wall-clock cap per attempt, regardless of trickling data
+
+_executor = ThreadPoolExecutor(max_workers=1)
+
+
+def _do_request(params):
+    """The actual blocking network call, run in a worker thread so we can
+    enforce a true total-duration timeout around it. requests' own `timeout`
+    kwarg only resets on each new byte received, so a slow-trickling
+    response can hang far longer than the value you pass it."""
+    response = session.get(ARCTIC_SHIFT_URL, params=params, timeout=HARD_REQUEST_TIMEOUT)
+    response.raise_for_status()
+    return response
 
 
 def fetch_page_with_retries(params):
-    """Fetches a single page, retrying on failure with visible logging
-    for every attempt instead of a silent backoff."""
+    """Fetches a single page. One attempt, capped at HARD_REQUEST_TIMEOUT
+    seconds. On failure, one retry with the same cap. If that also fails,
+    raises so the caller can abandon this subreddit and move on -- data
+    collection matters more than squeezing every last page out of a
+    struggling subreddit."""
     for attempt in range(1, MAX_ATTEMPTS + 1):
         t0 = time.time()
         try:
-            response = session.get(ARCTIC_SHIFT_URL, params=params, timeout=15)
-            response.raise_for_status()
+            future = _executor.submit(_do_request, params)
+            response = future.result(timeout=HARD_REQUEST_TIMEOUT)
             elapsed = time.time() - t0
-            remaining = response.headers.get("X-RateLimit-Remaining")
-            if remaining is not None and int(remaining) < 5:
-                print(f"    [!] Rate limit getting low: {remaining} requests remaining "
-                      f"(resets at {response.headers.get('X-RateLimit-Reset')})", flush=True)
             return response.json(), elapsed
-        except Exception as e:
+        except FutureTimeoutError:
             elapsed = time.time() - t0
-            wait = min(2 ** attempt, 30)  # capped backoff, max 30s
-            print(f"    [retry] attempt {attempt}/{MAX_ATTEMPTS} failed after {elapsed:.1f}s: {e}. "
-                  f"Waiting {wait}s before retry...", flush=True)
+            future.cancel()  # best-effort; underlying request may keep running in the worker thread
+            print(f"    [!] attempt {attempt}/{MAX_ATTEMPTS} timed out after {elapsed:.1f}s "
+                  f"(no response within {HARD_REQUEST_TIMEOUT}s).", flush=True)
             if attempt == MAX_ATTEMPTS:
                 raise
-            time.sleep(wait)
+        except Exception as e:
+            elapsed = time.time() - t0
+            print(f"    [!] attempt {attempt}/{MAX_ATTEMPTS} failed after {elapsed:.1f}s: {e}", flush=True)
+            if attempt == MAX_ATTEMPTS:
+                raise
 
 
 def fetch_subreddit_comments(subreddit, after, before):
@@ -171,12 +189,18 @@ def fetch_subreddit_comments(subreddit, after, before):
             print(f"    r/{subreddit} page {page_count}: fetched {len(comments)}, kept {kept} "
                   f"(running total {len(all_comments)}), req took {elapsed:.1f}s", flush=True)
 
-            current_after = comments[-1]["created_utc"]
+            new_after = comments[-1]["created_utc"]
+            if new_after == current_after:
+                # Pagination cursor didn't advance -- would loop forever otherwise.
+                print(f"    [!] Pagination cursor stuck at {new_after} on r/{subreddit} "
+                      f"(page {page_count}). Nudging cursor forward by 1s to avoid an infinite loop.", flush=True)
+                new_after += 1
+            current_after = new_after
             time.sleep(1.2)  # Crucial sleep to avoid IP bans from Arctic Shift
 
         except Exception as e:
             print(f"  [!] Giving up on r/{subreddit} at page {page_count} after {MAX_ATTEMPTS} failed "
-                  f"attempts: {e}. Moving on with what was collected.", flush=True)
+                  f"attempts: {e}. Moving on with what was collected so far.", flush=True)
             break
 
     sub_elapsed = time.time() - sub_start_time
@@ -221,10 +245,12 @@ def main():
         master_dataset.extend(sub_comments)
         print(f"[batch progress] {i}/{len(SUBREDDITS)} subreddits done, "
               f"{len(master_dataset)} total rows collected so far in this batch\n", flush=True)
-        time.sleep(1.5)  # Pause between subreddits
 
-        if i % CHECKPOINT_EVERY == 0 or i == len(SUBREDDITS):
+        should_checkpoint = (i % CHECKPOINT_EVERY == 0) or (i == len(SUBREDDITS))
+        if should_checkpoint:
             push_checkpoint(master_dataset, SPLIT_NAME, label=f"{i}/{len(SUBREDDITS)} subs done")
+
+        time.sleep(1.5)  # Pause between subreddits
 
     print(f"\nBatch finished. Final size for this batch: {len(master_dataset)} comments "
           f"across {len(SUBREDDITS)} subreddits.", flush=True)
