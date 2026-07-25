@@ -61,7 +61,12 @@ first_day_last_month = first_day_this_month - relativedelta(months=1)
 BEFORE_EPOCH = int(first_day_this_month.timestamp())
 AFTER_EPOCH = int(first_day_last_month.timestamp())
 
-SPLIT_NAME = f"raw_{first_day_last_month.strftime('%Y_%m')}__batch_{BATCH_START:03d}_{min(BATCH_END, len(SUBREDDITS_FULL)):03d}"
+# Fixed scratch-space split name (no month in it) -- this gets overwritten
+# every run. It's purely a staging area the consolidation job reads from
+# and folds into the single permanent 'train' split. This also means we
+# never need to delete old splits: each month's run just overwrites the
+# same 9 scratch splits.
+SPLIT_NAME = f"tmp_batch_{BATCH_START:03d}_{min(BATCH_END, len(SUBREDDITS_FULL)):03d}"
 
 
 def get_secure_session():
