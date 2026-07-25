@@ -12,7 +12,7 @@ from urllib3.util.retry import Retry
 # ==========================================
 # CONFIGURATION
 # ==========================================
-HF_DATASET_REPO = "your-hf-username/hinglish-moderation-raw" # CHANGE THIS
+HF_DATASET_REPO = "darelphilip/reddit_indian_subs" # CHANGE THIS
 HF_TOKEN = os.getenv("HF_TOKEN")
 
 SUBREDDITS = [
