@@ -2,9 +2,24 @@ import os
 import time
 import random
 import pandas as pd
-from datasets import load_dataset, Dataset, concatenate_datasets
-from huggingface_hub import login
+from datasets import load_dataset, Dataset, concatenate_datasets, Features, Value
+from huggingface_hub import login, HfApi
+from huggingface_hub.hf_api import CommitOperationDelete
 from huggingface_hub.errors import HfHubHTTPError
+
+# Must exactly match the schema in fetch_arctic_to_hf.py. Applied when
+# loading each split (in case an existing split on the hub already has a
+# null-vs-string type mismatch baked in from before this fix) and again on
+# the final push, so 'train' never drifts back into an inconsistent schema.
+SCHEMA = Features({
+    "id": Value("string"),
+    "body": Value("string"),
+    "created_utc": Value("int64"),
+    "subreddit": Value("string"),
+    "score": Value("int64"),
+    "controversiality": Value("int64"),
+    "collapsed_reason_code": Value("string"),
+})
 
 # ==========================================
 # CONFIGURATION -- keep in sync with fetch_arctic_to_hf.py
@@ -33,14 +48,72 @@ LEGACY_BATCH_NAMES = [
 
 def load_split_safely(split_name):
     """Loads a split if it exists; returns None (with a warning) if it doesn't,
-    instead of crashing the whole consolidation run."""
+    instead of crashing the whole consolidation run. Casts to the pinned
+    SCHEMA on load, so a split saved before the schema fix (or one that
+    happened to be all-null in some column) gets normalized here rather
+    than blowing up concatenate_datasets with a features mismatch."""
     try:
         ds = load_dataset(HF_DATASET_REPO, split=split_name)
+        ds = ds.cast(SCHEMA)
         print(f"  Loaded split '{split_name}': {len(ds)} rows", flush=True)
         return ds
     except Exception as e:
         print(f"  [!] Could not load split '{split_name}': {e}. Skipping it.", flush=True)
         return None
+
+
+def cleanup_consumed_splits(repo_id, split_names):
+    """Deletes the repo files backing each split in split_names. Only ever
+    called AFTER a confirmed-successful push of the merged data to 'train' --
+    this is what makes it safe: every row from these splits is already
+    folded into 'train' by the time anything gets deleted, so this is
+    tidying up consumed scratch data, not risking loss of unconsolidated data."""
+    if not split_names:
+        print("No consumed splits to clean up.", flush=True)
+        return
+
+    api = HfApi()
+    try:
+        all_files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
+    except Exception as e:
+        print(f"  [!] Could not list repo files for cleanup: {e}. Skipping cleanup this run "
+              f"(leftover files just mean next run's cleanup will catch them instead).", flush=True)
+        return
+
+    to_delete = [f for f in all_files if any(f"/{name}-" in f or f == name for name in split_names)]
+    # Fallback broader match in case of a different file layout than expected
+    if not to_delete:
+        to_delete = [f for f in all_files if any(name in f for name in split_names)]
+
+    if not to_delete:
+        print(f"No repo files matched the {len(split_names)} consumed split(s) -- nothing to delete.", flush=True)
+        return
+
+    print(f"Cleaning up {len(to_delete)} file(s) backing {len(split_names)} consumed split(s): "
+          f"{to_delete}", flush=True)
+
+    max_attempts = 5
+    for attempt in range(1, max_attempts + 1):
+        try:
+            ops = [CommitOperationDelete(path_in_repo=f) for f in to_delete]
+            api.create_commit(
+                repo_id=repo_id,
+                repo_type="dataset",
+                operations=ops,
+                commit_message="Cleanup: remove consolidated tmp_batch scratch files",
+            )
+            print("Cleanup commit complete.", flush=True)
+            return
+        except HfHubHTTPError as e:
+            is_conflict = "412" in str(e) or "Precondition Failed" in str(e)
+            if is_conflict and attempt < max_attempts:
+                wait = random.uniform(3, 10) * attempt
+                print(f"Branch conflict during cleanup commit. Retrying in {wait:.1f}s...", flush=True)
+                time.sleep(wait)
+                continue
+            print(f"  [!] Cleanup commit failed after {attempt} attempt(s): {e}. "
+                  f"Leftover files will just get picked up by the next run's cleanup.", flush=True)
+            return
 
 
 def main():
@@ -49,6 +122,7 @@ def main():
     login(token=HF_TOKEN)
 
     pieces = []
+    loaded_split_names = []  # every tmp_batch split we actually folded in, for cleanup later
 
     # 1. Load whatever is already permanently saved (empty on the very first run)
     print(f"Loading existing '{FINAL_SPLIT}' split (if it exists)...", flush=True)
@@ -64,6 +138,7 @@ def main():
         ds = load_split_safely(split_name)
         if ds is not None:
             pieces.append(ds)
+            loaded_split_names.append(split_name)
             loaded_batches += 1
 
     print("Sweeping for any leftover legacy-named splits (pre-rewrite naming)...", flush=True)
@@ -73,6 +148,7 @@ def main():
         ds = load_split_safely(split_name)
         if ds is not None:
             pieces.append(ds)
+            loaded_split_names.append(split_name)
             legacy_loaded += 1
     if legacy_loaded:
         print(f"  Found and folded in {legacy_loaded} legacy-named leftover split(s).", flush=True)
@@ -96,14 +172,16 @@ def main():
     print(f"Combined total after dedupe:  {len(df)} rows", flush=True)
 
     # 4. Push back as the single permanent split (retry on transient branch conflicts)
-    final_dataset = Dataset.from_pandas(df, preserve_index=False)
+    final_dataset = Dataset.from_pandas(df, features=SCHEMA, preserve_index=False)
     max_push_attempts = 5
+    push_succeeded = False
     for attempt in range(1, max_push_attempts + 1):
         try:
             print(f"\nPushing consolidated dataset to split '{FINAL_SPLIT}' "
                   f"(attempt {attempt}/{max_push_attempts})...", flush=True)
             final_dataset.push_to_hub(repo_id=HF_DATASET_REPO, split=FINAL_SPLIT, private=True)
             print("✅ Consolidation complete.", flush=True)
+            push_succeeded = True
             break
         except HfHubHTTPError as e:
             is_conflict = "412" in str(e) or "Precondition Failed" in str(e)
@@ -114,6 +192,13 @@ def main():
                 continue
             print(f"Push failed after {attempt} attempt(s): {e}", flush=True)
             raise
+
+    # Only clean up scratch files once the merged data is confirmed safely
+    # sitting in 'train' -- never delete before a confirmed successful push.
+    if push_succeeded:
+        print(f"\nCleaning up {len(loaded_split_names)} consumed scratch split(s) now that "
+              f"the merge is confirmed in '{FINAL_SPLIT}'...", flush=True)
+        cleanup_consumed_splits(HF_DATASET_REPO, loaded_split_names)
 
 
 if __name__ == "__main__":
