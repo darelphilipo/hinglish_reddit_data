@@ -104,11 +104,12 @@ def cleanup_consumed_splits(repo_id, split_names):
             )
             print("Cleanup commit complete.", flush=True)
             return
-        except HfHubHTTPError as e:
+        except Exception as e:
             is_conflict = "412" in str(e) or "Precondition Failed" in str(e)
-            if is_conflict and attempt < max_attempts:
+            if attempt < max_attempts:
                 wait = random.uniform(3, 10) * attempt
-                print(f"Branch conflict during cleanup commit. Retrying in {wait:.1f}s...", flush=True)
+                reason = "branch conflict" if is_conflict else f"transient error ({type(e).__name__}: {e})"
+                print(f"Cleanup commit failed -- {reason}. Retrying in {wait:.1f}s...", flush=True)
                 time.sleep(wait)
                 continue
             print(f"  [!] Cleanup commit failed after {attempt} attempt(s): {e}. "
@@ -183,11 +184,15 @@ def main():
             print("✅ Consolidation complete.", flush=True)
             push_succeeded = True
             break
-        except HfHubHTTPError as e:
+        except Exception as e:
+            # Broad catch: HfHubHTTPError (412 conflicts) plus lower-level
+            # transport errors (httpx.RemoteProtocolError etc.) that aren't
+            # HfHubHTTPError subclasses and would otherwise crash uncaught.
             is_conflict = "412" in str(e) or "Precondition Failed" in str(e)
-            if is_conflict and attempt < max_push_attempts:
+            if attempt < max_push_attempts:
                 wait = random.uniform(3, 10) * attempt
-                print(f"Branch conflict (412) from a concurrent push. Retrying in {wait:.1f}s...", flush=True)
+                reason = "branch conflict (412)" if is_conflict else f"transient error ({type(e).__name__}: {e})"
+                print(f"Push failed -- {reason}. Retrying in {wait:.1f}s...", flush=True)
                 time.sleep(wait)
                 continue
             print(f"Push failed after {attempt} attempt(s): {e}", flush=True)
