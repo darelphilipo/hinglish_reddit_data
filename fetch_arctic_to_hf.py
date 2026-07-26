@@ -264,17 +264,23 @@ def push_checkpoint(master_dataset, split_name, label):
             dataset.push_to_hub(repo_id=HF_DATASET_REPO, split=split_name, private=True)
             print(f"  [checkpoint:{label}] Push complete.", flush=True)
             return
-        except HfHubHTTPError as e:
+        except Exception as e:
+            # Catches HfHubHTTPError (e.g. 412 branch conflicts) AND lower-level
+            # transport errors (httpx.RemoteProtocolError, ConnectError, etc.)
+            # that HF's own request layer can throw on a dropped connection --
+            # those aren't HfHubHTTPError subclasses, so a narrower except
+            # clause would let them crash the job uncaught, as happened here.
             is_conflict = "412" in str(e) or "Precondition Failed" in str(e)
-            if is_conflict and attempt < max_push_attempts:
+            if attempt < max_push_attempts:
                 wait = random.uniform(3, 10) * attempt  # jittered, growing backoff
-                print(f"  [checkpoint:{label}] Branch conflict from a concurrent job's push "
-                      f"(412). Retrying in {wait:.1f}s...", flush=True)
+                reason = "branch conflict from a concurrent job's push" if is_conflict else \
+                          f"transient error ({type(e).__name__}: {e})"
+                print(f"  [checkpoint:{label}] Push failed -- {reason}. "
+                      f"Retrying in {wait:.1f}s...", flush=True)
                 time.sleep(wait)
                 continue
             print(f"  [checkpoint:{label}] Push failed after {attempt} attempt(s): {e}", flush=True)
-            if attempt == max_push_attempts:
-                raise
+            raise
 
 
 def main():
