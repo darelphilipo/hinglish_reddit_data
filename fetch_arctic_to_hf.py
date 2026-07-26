@@ -14,52 +14,53 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 HF_DATASET_REPO = "darelphilip/reddit_indian_subs"  # CHANGE THIS
 HF_TOKEN = os.getenv("HF_TOKEN")
 
-# Push a checkpoint split to HF every N subreddits *within* this batch,
-# so a failure only loses the in-flight chunk, not the whole batch.
-# Kept small since failures now move on quickly rather than retrying at length.
-CHECKPOINT_EVERY = 3
+# Push a checkpoint split to HF every N subreddits *within* this batch.
+CHECKPOINT_EVERY = 2
 
-# Which slice of SUBREDDITS this job processes. Defaults to the full list
-# so the script still works fine for local/manual full runs.
-BATCH_START = int(os.getenv("BATCH_START", "0"))
-BATCH_END = int(os.getenv("BATCH_END", "999999"))
+# Which named batch this job processes (set via the workflow matrix)
+BATCH_NAME = os.getenv("BATCH_NAME", "heavy_1")
 
-SUBREDDITS_FULL = [
-    # National / General
-    "india", "indiasocial", "AskIndia", "IndiaNostalgia", "IndiaTrending", "IncredibleIndia", "IndianHistory", "AajMaineJana", "ZyadaKuchNai",
-    # Cities / States
-    "delhi", "bangalore", "mumbai", "chennai", "hyderabad", "Kerala", "kolkata", "TamilNadu", "pune", "Maharashtra", "bihar", "ahmedabad", "lucknow", "Goa", "Uttarakhand", "assam", "gurgaon", "karnataka", "Rajasthan", "HimachalPradesh", "Chandigarh", "gujarat", "Odisha", "uttarpradesh", "Northeastindia",
-    # Political
-    "IndiaSpeaks", "unitedstatesofindia", "indianews", "indiadiscussion", "CriticalThinkingIndia",
-    # Entertainment
-    "BollyBlindsNGossip", "bollywood", "InstaCelebsGossip", "bollywoodmemes", "BollywoodFashion", "AnimeMirchi", "animeindian", "BollywoodMusic", "IndianOTTbestof", "MalayalamMovies", "kollywood", "IndianHipHopHeads", "tollywood", "BollywoodRealism", "IndianCinema", "sharktankindia", "biggboss", "IndianTellyTalk", "DHHMemes", "punjabimusic",
-    # Sports
-    "IndiaCricket", "ipl", "CricketShitpost", "indiansports", "IndianFootball", "RCB", "csk", "chessindia",
-    # Social / Demographic
-    "RelationshipIndia", "TwoXIndia", "TeenIndia", "IndianTeenagers", "Indiangirlsontinder", "AskIndianWomen", "DesiWeddings", "TwentiesIndia", "OffMyChestIndia", "Arrangedmarriage", "AskIndianMen",
-    # Youtubers
-    "SaimanSays", "CarryMinati", "ShahRukhKhan", "SamayRaina", "thugeshh", "beastboyshub", "sunraybee", "FingMemes", "dankrishu", "ViratKohli",
-    # Finance
-    "IndianStockMarket", "IndiaInvestments", "personalfinanceindia", "IndianStreetBets", "beermoneyindia", "CreditCardsIndia", "CryptoIndia", "FIREIndia", "StockMarketIndia", "IndiaTax", "mutualfunds", "BitcoinIndia", "FatFIREIndia", "IndianStocks", "Frugal_Ind",
-    # Career / Academics
-    "developersIndia", "JEENEETards", "UPSC", "StartUpIndia", "CBSE", "Btechtards", "indianmedschool", "CATpreparation", "Indian_Academia", "JEE", "IndiaCareers", "BITSPilani", "Indians_StudyAbroad", "IndianWorkplace", "ICSE", "CharteredAccountants", "IndiaBusiness", "smallbusinessindia",
-    # Lifestyle / Travel
-    "IndianFashionAddicts", "IndianSkincareAddicts", "DesiFragranceAddicts", "desitravellers", "Fitness_India", "watchesindia", "india_tourism", "IndianMakeupAddicts", "indianbeautyhauls", "SneakersIndia", "Indian_flex", "DesiKeto", "SoloTravel_India", "indiafitcheck", "indianfitness",
-    # Auto / Art / Tech / Memes
-    "CarsIndia", "indianrailways", "indianbikes", "AirTravelIndia", "Indianbooks", "IndianArtAndThinking", "indiafood", "IndianArtAI", "hindi", "IndianFoodPhotos", "IndiaCoffee", "PhotographyIndia", "IndiansRead", "IndiaTech", "IndianGaming", "GadgetsIndia", "Indiangamers", "XboxIndia", "IndiaPS5", "indiameme", "funnyIndia", "IndianDankMemes", "DesiVideoMemes", "indianmemer", "IndianMeyMeys", "IndianMemeTemplates", "desimemes"
-]
+# Total wall-clock budget this job gives itself for scraping, leaving a
+# safety margin inside the step's own timeout-minutes for the final
+# checkpoint push and log flush. Tune JOB_TIME_BUDGET_MINUTES to comfortably
+# fit inside your workflow's timeout-minutes (e.g. 55 for a 60-min step).
+JOB_TIME_BUDGET_MINUTES = 55
+JOB_TIME_BUDGET_SECONDS = JOB_TIME_BUDGET_MINUTES * 60
+MIN_SUBREDDIT_SECONDS = 45  # floor so a late subreddit still gets *some* real time
 
-# The slice this specific job/batch is responsible for
-SUBREDDITS = SUBREDDITS_FULL[BATCH_START:BATCH_END]
+# ==========================================
+# SUBREDDIT BATCHES -- grouped by (a) how likely the sub is to yield hate
+# speech / toxic content, ordered highest-likelihood-first within each tier,
+# and (b) traffic volume, which drives batch size:
+#   heavy_*  : 8 large/high-traffic subs per batch  (few subs, each can hog time)
+#   medium_* : ~17 medium-traffic subs per batch
+#   tiny_*   : 30+ small/niche subs per batch (many subs, each is quick)
+# ==========================================
+BATCH_DEFINITIONS = {
+    "heavy_1": ["IndiaSpeaks", "india", "indiameme", "funnyIndia", "IndianDankMemes", "CarryMinati", "ipl", "IndianGaming"],
+    "heavy_2": ["bollywood", "developersIndia", "UPSC", "IndianStockMarket", "JEENEETards", "Btechtards", "StartUpIndia", "AskIndia"],
+
+    "medium_1": ["indianews", "indiadiscussion", "CriticalThinkingIndia", "unitedstatesofindia", "bihar", "uttarpradesh", "delhi", "karnataka", "TamilNadu", "Maharashtra", "gujarat", "Rajasthan", "bangalore", "mumbai", "chennai", "hyderabad", "kolkata"],
+    "medium_2": ["pune", "ahmedabad", "lucknow", "Arrangedmarriage", "RelationshipIndia", "TwoXIndia", "AskIndianWomen", "AskIndianMen", "OffMyChestIndia", "TeenIndia", "IndianTeenagers", "Indiangirlsontinder", "DesiWeddings", "TwentiesIndia", "CricketShitpost", "IndiaCricket", "IndianFootball"],
+    "medium_3": ["indiansports", "RCB", "csk", "chessindia", "SaimanSays", "ShahRukhKhan", "SamayRaina", "thugeshh", "beastboyshub", "sunraybee", "FingMemes", "dankrishu", "ViratKohli", "BollyBlindsNGossip", "InstaCelebsGossip", "bollywoodmemes", "BollywoodFashion"],
+    "medium_4": ["sharktankindia", "biggboss", "IndianTellyTalk", "DHHMemes", "punjabimusic", "kollywood", "tollywood", "IndianCinema", "BollywoodRealism", "IndianOTTbestof", "AnimeMirchi", "animeindian", "BollywoodMusic", "MalayalamMovies", "IndianHipHopHeads", "IndianStreetBets", "IndiaInvestments"],
+    "medium_5": ["personalfinanceindia", "CreditCardsIndia", "CryptoIndia", "mutualfunds", "IndiaTax", "BitcoinIndia", "StockMarketIndia", "FIREIndia", "FatFIREIndia", "IndianStocks", "beermoneyindia", "Frugal_Ind", "CATpreparation", "Indian_Academia", "JEE", "IndiaCareers", "BITSPilani"],
+    "medium_6": ["Indians_StudyAbroad", "IndianWorkplace", "ICSE", "CharteredAccountants", "IndiaBusiness", "smallbusinessindia", "CBSE", "indianmedschool", "CarsIndia", "indianrailways", "indianbikes", "AirTravelIndia", "Indianbooks", "IndianArtAndThinking", "indiafood", "IndianArtAI", "hindi"],
+    "medium_7": ["IndianFoodPhotos", "IndiaCoffee", "PhotographyIndia", "IndiansRead", "IndiaTech", "GadgetsIndia", "Indiangamers", "XboxIndia", "IndiaPS5", "DesiVideoMemes", "indianmemer", "IndianMeyMeys", "IndianMemeTemplates", "desimemes"],
+
+    "tiny_1": ["AajMaineJana", "Chandigarh", "DesiFragranceAddicts", "DesiKeto", "Fitness_India", "Goa", "HimachalPradesh", "IncredibleIndia", "IndiaNostalgia", "IndiaTrending", "IndianFashionAddicts", "IndianHistory", "IndianMakeupAddicts", "IndianSkincareAddicts", "Indian_flex", "Kerala", "Northeastindia", "Odisha", "SneakersIndia", "SoloTravel_India", "Uttarakhand", "ZyadaKuchNai", "assam", "desitravellers", "gurgaon", "india_tourism", "indiafitcheck", "indianbeautyhauls", "indianfitness", "indiasocial", "watchesindia"],
+}
+
+if BATCH_NAME not in BATCH_DEFINITIONS:
+    raise ValueError(f"Unknown BATCH_NAME '{BATCH_NAME}'. Valid options: {list(BATCH_DEFINITIONS.keys())}")
+
+SUBREDDITS = BATCH_DEFINITIONS[BATCH_NAME]
 
 ARCTIC_SHIFT_URL = "https://arctic-shift.photon-reddit.com/api/comments/search"
 
 # ==========================================
 # TARGET MONTH SELECTION
 # ==========================================
-# Defaults to the previous calendar month (for the normal scheduled run).
-# Override by setting TARGET_YEAR and TARGET_MONTH env vars, e.g. to backfill
-# a specific historical month (TARGET_YEAR=2025, TARGET_MONTH=3 for March 2025).
 target_year = os.getenv("TARGET_YEAR")
 target_month = os.getenv("TARGET_MONTH")
 
@@ -81,29 +82,21 @@ else:
 BEFORE_EPOCH = int(first_day_this_month.timestamp())
 AFTER_EPOCH = int(first_day_last_month.timestamp())
 
-# Fixed scratch-space split name (no month in it) -- this gets overwritten
-# every run. It's purely a staging area the consolidation job reads from
-# and folds into the single permanent 'train' split. This also means we
-# never need to delete old splits: each month's run just overwrites the
-# same 9 scratch splits.
-SPLIT_NAME = f"tmp_batch_{BATCH_START:03d}_{min(BATCH_END, len(SUBREDDITS_FULL)):03d}"
+# Fixed scratch-space split name (no month in it) -- overwritten every run.
+# The consolidation job reads these and folds them into the permanent 'train' split.
+SPLIT_NAME = f"tmp_batch_{BATCH_NAME}"
 
-
-def get_secure_session():
-    """Returns a plain requests Session. Retries are now handled manually
-    inside fetch_subreddit_comments so every attempt is logged -- urllib3's
-    built-in Retry sleeps silently between attempts, which is what was
-    causing long stretches with no visible output."""
-    session = requests.Session()
-    return session
-
-
-session = get_secure_session()
-
-MAX_ATTEMPTS = 2               # one try, one retry -- then move on, don't chase it
+MAX_ATTEMPTS = 2               # one try, one retry -- then move on
 HARD_REQUEST_TIMEOUT = 15      # true wall-clock cap per attempt, regardless of trickling data
 
 _executor = ThreadPoolExecutor(max_workers=1)
+
+
+def get_secure_session():
+    return requests.Session()
+
+
+session = get_secure_session()
 
 
 def _do_request(params):
@@ -112,26 +105,48 @@ def _do_request(params):
     kwarg only resets on each new byte received, so a slow-trickling
     response can hang far longer than the value you pass it."""
     response = session.get(ARCTIC_SHIFT_URL, params=params, timeout=HARD_REQUEST_TIMEOUT)
-    response.raise_for_status()
     return response
+
+
+def _log_response_headers(response, context):
+    """Log rate-limit / retry-after headers whenever we get a non-200,
+    so future tuning is based on what the server actually tells us
+    instead of trial and error."""
+    interesting = {}
+    for key in ("Retry-After", "X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"):
+        if key in response.headers:
+            interesting[key] = response.headers[key]
+    if interesting:
+        print(f"    [headers:{context}] status={response.status_code} {interesting}", flush=True)
+    else:
+        print(f"    [headers:{context}] status={response.status_code} (no rate-limit headers present)", flush=True)
 
 
 def fetch_page_with_retries(params):
     """Fetches a single page. One attempt, capped at HARD_REQUEST_TIMEOUT
-    seconds. On failure, one retry with the same cap. If that also fails,
-    raises so the caller can abandon this subreddit and move on -- data
-    collection matters more than squeezing every last page out of a
-    struggling subreddit."""
+    seconds. On failure, one retry with the same cap, then raises so the
+    caller can abandon this subreddit and move on."""
     for attempt in range(1, MAX_ATTEMPTS + 1):
         t0 = time.time()
         try:
             future = _executor.submit(_do_request, params)
             response = future.result(timeout=HARD_REQUEST_TIMEOUT)
             elapsed = time.time() - t0
+
+            if response.status_code >= 400:
+                _log_response_headers(response, context=f"attempt {attempt}")
+                response.raise_for_status()
+
+            remaining = response.headers.get("X-RateLimit-Remaining")
+            if remaining is not None and int(remaining) < 5:
+                print(f"    [!] Rate limit getting low: {remaining} requests remaining "
+                      f"(resets at {response.headers.get('X-RateLimit-Reset')})", flush=True)
+
             return response.json(), elapsed
+
         except FutureTimeoutError:
             elapsed = time.time() - t0
-            future.cancel()  # best-effort; underlying request may keep running in the worker thread
+            future.cancel()
             print(f"    [!] attempt {attempt}/{MAX_ATTEMPTS} timed out after {elapsed:.1f}s "
                   f"(no response within {HARD_REQUEST_TIMEOUT}s).", flush=True)
             if attempt == MAX_ATTEMPTS:
@@ -143,14 +158,20 @@ def fetch_page_with_retries(params):
                 raise
 
 
-def fetch_subreddit_comments(subreddit, after, before):
-    print(f"--- Fetching r/{subreddit} ---", flush=True)
+def fetch_subreddit_comments(subreddit, after, before, time_budget_seconds):
+    print(f"--- Fetching r/{subreddit} (time budget: {time_budget_seconds:.0f}s) ---", flush=True)
     sub_start_time = time.time()
     all_comments = []
     current_after = after
     page_count = 0
 
     while True:
+        elapsed_this_sub = time.time() - sub_start_time
+        if elapsed_this_sub > time_budget_seconds:
+            print(f"  [!] r/{subreddit} hit its {time_budget_seconds:.0f}s allocated budget at page "
+                  f"{page_count} ({len(all_comments)} collected). Moving on.", flush=True)
+            break
+
         page_count += 1
         params = {
             "subreddit": subreddit,
@@ -171,11 +192,8 @@ def fetch_subreddit_comments(subreddit, after, before):
             kept = 0
             for comment in comments:
                 body = comment.get("body", "")
-
-                # Skip strictly deleted/removed content to save DB space
                 if body and body not in ["[removed]", "[deleted]"]:
                     kept += 1
-                    # Keep exactly the columns requested
                     all_comments.append({
                         "id": comment.get("id"),
                         "body": body,
@@ -191,12 +209,11 @@ def fetch_subreddit_comments(subreddit, after, before):
 
             new_after = comments[-1]["created_utc"]
             if new_after == current_after:
-                # Pagination cursor didn't advance -- would loop forever otherwise.
                 print(f"    [!] Pagination cursor stuck at {new_after} on r/{subreddit} "
-                      f"(page {page_count}). Nudging cursor forward by 1s to avoid an infinite loop.", flush=True)
+                      f"(page {page_count}). Nudging cursor forward by 1s.", flush=True)
                 new_after += 1
             current_after = new_after
-            time.sleep(1.2)  # Crucial sleep to avoid IP bans from Arctic Shift
+            time.sleep(1.0)  # reduced wait between pages
 
         except Exception as e:
             print(f"  [!] Giving up on r/{subreddit} at page {page_count} after {MAX_ATTEMPTS} failed "
@@ -210,14 +227,9 @@ def fetch_subreddit_comments(subreddit, after, before):
 
 
 def push_checkpoint(master_dataset, split_name, label):
-    """Push whatever has been collected so far under this batch's split name.
-    Safe to call repeatedly -- each call re-pushes the full in-memory
-    dataset for this batch, deduped, so a later checkpoint simply
-    supersedes an earlier one for the same split."""
     if not master_dataset:
         print(f"  [checkpoint:{label}] Nothing to push yet, skipping.", flush=True)
         return
-
     df_chunk = pd.DataFrame(master_dataset).drop_duplicates(subset=["id"])
     print(f"  [checkpoint:{label}] Pushing {len(df_chunk)} rows to split '{split_name}'...", flush=True)
     dataset = Dataset.from_pandas(df_chunk, preserve_index=False)
@@ -231,29 +243,48 @@ def main():
     login(token=HF_TOKEN)
 
     if not SUBREDDITS:
-        print(f"Batch range [{BATCH_START}:{BATCH_END}] is empty against a list of "
-              f"{len(SUBREDDITS_FULL)} subreddits. Nothing to do.", flush=True)
+        print(f"Batch '{BATCH_NAME}' is empty. Nothing to do.", flush=True)
         return
 
-    print(f"Batch covers {len(SUBREDDITS)} subreddits (indices {BATCH_START}:{BATCH_END} "
-          f"of {len(SUBREDDITS_FULL)} total). Target split: '{SPLIT_NAME}'", flush=True)
+    print(f"Batch '{BATCH_NAME}' covers {len(SUBREDDITS)} subreddits. Target split: '{SPLIT_NAME}'", flush=True)
+    print(f"Job time budget: {JOB_TIME_BUDGET_SECONDS}s across {len(SUBREDDITS)} subreddits "
+          f"(adaptive per-subreddit allocation, {MIN_SUBREDDIT_SECONDS}s floor)", flush=True)
 
     master_dataset = []
+    job_start_time = time.time()
 
     for i, sub in enumerate(SUBREDDITS, start=1):
-        sub_comments = fetch_subreddit_comments(sub, AFTER_EPOCH, BEFORE_EPOCH)
+        elapsed_job = time.time() - job_start_time
+        remaining_total = JOB_TIME_BUDGET_SECONDS - elapsed_job
+        remaining_subs = len(SUBREDDITS) - i + 1
+
+        if remaining_total <= MIN_SUBREDDIT_SECONDS:
+            skipped = SUBREDDITS[i - 1:]
+            print(f"[!] Job time budget nearly exhausted after {i - 1}/{len(SUBREDDITS)} subreddits "
+                  f"({remaining_total:.0f}s left). Skipping remaining {len(skipped)} subs: {skipped}", flush=True)
+            break
+
+        # Adaptive fair share: divide what's left evenly across what's left,
+        # so an early subreddit hogging time automatically shrinks the
+        # allowance for the rest, rather than the last subreddit getting zero.
+        fair_share = max(remaining_total / remaining_subs, MIN_SUBREDDIT_SECONDS)
+        print(f"[time budget] {remaining_total:.0f}s left for {remaining_subs} subs remaining "
+              f"-> allocating up to {fair_share:.0f}s to r/{sub}", flush=True)
+
+        sub_comments = fetch_subreddit_comments(sub, AFTER_EPOCH, BEFORE_EPOCH, time_budget_seconds=fair_share)
         master_dataset.extend(sub_comments)
         print(f"[batch progress] {i}/{len(SUBREDDITS)} subreddits done, "
               f"{len(master_dataset)} total rows collected so far in this batch\n", flush=True)
 
-        should_checkpoint = (i % CHECKPOINT_EVERY == 0) or (i == len(SUBREDDITS))
-        if should_checkpoint:
+        if i % CHECKPOINT_EVERY == 0 or i == len(SUBREDDITS):
             push_checkpoint(master_dataset, SPLIT_NAME, label=f"{i}/{len(SUBREDDITS)} subs done")
 
-        time.sleep(1.5)  # Pause between subreddits
+        time.sleep(1.0)  # reduced wait between subreddits
 
-    print(f"\nBatch finished. Final size for this batch: {len(master_dataset)} comments "
-          f"across {len(SUBREDDITS)} subreddits.", flush=True)
+    # Final safety-net push in case the loop broke early due to time budget
+    push_checkpoint(master_dataset, SPLIT_NAME, label="final")
+
+    print(f"\nBatch '{BATCH_NAME}' finished. Final size: {len(master_dataset)} comments.", flush=True)
 
 
 if __name__ == "__main__":
