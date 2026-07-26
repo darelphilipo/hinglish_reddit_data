@@ -11,10 +11,20 @@ HF_TOKEN = os.getenv("HF_TOKEN")
 
 FINAL_SPLIT = "train"
 
-# Must match the batch ranges defined in the workflow matrix
-BATCH_RANGES = [
-    (0, 20), (20, 40), (40, 60), (60, 80), (80, 100),
-    (100, 120), (120, 140), (140, 160), (160, 163),
+# Must match the batch names defined in fetch_arctic_to_hf.py / the workflow matrix
+BATCH_NAMES = [
+    "heavy_1", "heavy_2",
+    "medium_1", "medium_2", "medium_3", "medium_4", "medium_5", "medium_6", "medium_7",
+    "tiny_1",
+]
+
+# One-time inclusion of the OLD index-range naming scheme, so leftover splits
+# from before the batching rewrite (e.g. tmp_batch_020_040) get swept into
+# 'train' rather than sitting there orphaned forever. Safe to leave in
+# permanently -- load_split_safely just skips anything that doesn't exist.
+LEGACY_BATCH_NAMES = [
+    "000_020", "020_040", "040_060", "060_080", "080_100",
+    "100_120", "120_140", "140_160", "160_163",
 ]
 
 
@@ -46,17 +56,30 @@ def main():
     # 2. Load every batch's scratch split from this run
     print("Loading this run's batch scratch splits...", flush=True)
     loaded_batches = 0
-    for start, end in BATCH_RANGES:
-        split_name = f"tmp_batch_{start:03d}_{end:03d}"
+    for batch_name in BATCH_NAMES:
+        split_name = f"tmp_batch_{batch_name}"
         ds = load_split_safely(split_name)
         if ds is not None:
             pieces.append(ds)
             loaded_batches += 1
 
-    print(f"\nLoaded {loaded_batches}/{len(BATCH_RANGES)} batch splits this run.", flush=True)
-    if loaded_batches < len(BATCH_RANGES):
-        print("  [!] WARNING: fewer batches than expected -- check the scrape_and_push "
-              "job logs above for a failed/timed-out batch before trusting this merge.", flush=True)
+    print("Sweeping for any leftover legacy-named splits (pre-rewrite naming)...", flush=True)
+    legacy_loaded = 0
+    for legacy_name in LEGACY_BATCH_NAMES:
+        split_name = f"tmp_batch_{legacy_name}"
+        ds = load_split_safely(split_name)
+        if ds is not None:
+            pieces.append(ds)
+            legacy_loaded += 1
+    if legacy_loaded:
+        print(f"  Found and folded in {legacy_loaded} legacy-named leftover split(s).", flush=True)
+
+    print(f"\nLoaded {loaded_batches}/{len(BATCH_NAMES)} current batch splits this run "
+          f"(+ {legacy_loaded} legacy leftovers).", flush=True)
+    if loaded_batches < len(BATCH_NAMES):
+        print("  [!] Some batches are missing -- check the scrape_and_push job logs above for a "
+              "failed/timed-out/cancelled batch. Proceeding with whatever data is available, "
+              "since partial data beats no data.", flush=True)
 
     if not pieces:
         print("Nothing to consolidate (no existing train split and no batch splits found). Exiting.", flush=True)
