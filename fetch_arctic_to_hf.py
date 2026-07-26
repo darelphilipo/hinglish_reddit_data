@@ -2,10 +2,12 @@ import requests
 import pandas as pd
 import time
 import os
+import random
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 from datasets import Dataset
 from huggingface_hub import login
+from huggingface_hub.errors import HfHubHTTPError
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
 # ==========================================
@@ -227,14 +229,38 @@ def fetch_subreddit_comments(subreddit, after, before, time_budget_seconds):
 
 
 def push_checkpoint(master_dataset, split_name, label):
+    """Pushes to HF with retries. push_to_hub commits to the repo's shared
+    main branch -- with multiple matrix jobs pushing concurrently (different
+    splits, same branch), two commits can race and one gets rejected with a
+    412 Precondition Failed ('branch was updated since you opened this
+    page'). That's an expected collision under parallelism, not a real
+    error -- retrying against the now-current HEAD resolves it."""
     if not master_dataset:
         print(f"  [checkpoint:{label}] Nothing to push yet, skipping.", flush=True)
         return
+
     df_chunk = pd.DataFrame(master_dataset).drop_duplicates(subset=["id"])
-    print(f"  [checkpoint:{label}] Pushing {len(df_chunk)} rows to split '{split_name}'...", flush=True)
     dataset = Dataset.from_pandas(df_chunk, preserve_index=False)
-    dataset.push_to_hub(repo_id=HF_DATASET_REPO, split=split_name, private=True)
-    print(f"  [checkpoint:{label}] Push complete.", flush=True)
+
+    max_push_attempts = 5
+    for attempt in range(1, max_push_attempts + 1):
+        try:
+            print(f"  [checkpoint:{label}] Pushing {len(df_chunk)} rows to split '{split_name}' "
+                  f"(attempt {attempt}/{max_push_attempts})...", flush=True)
+            dataset.push_to_hub(repo_id=HF_DATASET_REPO, split=split_name, private=True)
+            print(f"  [checkpoint:{label}] Push complete.", flush=True)
+            return
+        except HfHubHTTPError as e:
+            is_conflict = "412" in str(e) or "Precondition Failed" in str(e)
+            if is_conflict and attempt < max_push_attempts:
+                wait = random.uniform(3, 10) * attempt  # jittered, growing backoff
+                print(f"  [checkpoint:{label}] Branch conflict from a concurrent job's push "
+                      f"(412). Retrying in {wait:.1f}s...", flush=True)
+                time.sleep(wait)
+                continue
+            print(f"  [checkpoint:{label}] Push failed after {attempt} attempt(s): {e}", flush=True)
+            if attempt == max_push_attempts:
+                raise
 
 
 def main():
