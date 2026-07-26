@@ -5,10 +5,24 @@ import os
 import random
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
-from datasets import Dataset
+from datasets import Dataset, Features, Value
 from huggingface_hub import login
 from huggingface_hub.errors import HfHubHTTPError
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+
+# Explicit schema -- pinned so a batch where a column happens to be all-null
+# (e.g. no [removed]/[deleted] comments in this particular slice) doesn't get
+# its type inferred as Arrow 'null' and clash with other splits where that
+# same column has real string values. This is what caused the last failure.
+SCHEMA = Features({
+    "id": Value("string"),
+    "body": Value("string"),
+    "created_utc": Value("int64"),
+    "subreddit": Value("string"),
+    "score": Value("int64"),
+    "controversiality": Value("int64"),
+    "collapsed_reason_code": Value("string"),
+})
 
 # ==========================================
 # CONFIGURATION
@@ -240,7 +254,7 @@ def push_checkpoint(master_dataset, split_name, label):
         return
 
     df_chunk = pd.DataFrame(master_dataset).drop_duplicates(subset=["id"])
-    dataset = Dataset.from_pandas(df_chunk, preserve_index=False)
+    dataset = Dataset.from_pandas(df_chunk, features=SCHEMA, preserve_index=False)
 
     max_push_attempts = 5
     for attempt in range(1, max_push_attempts + 1):
