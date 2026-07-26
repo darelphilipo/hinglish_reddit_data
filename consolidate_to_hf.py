@@ -3,7 +3,7 @@ import time
 import random
 import pandas as pd
 from datasets import load_dataset, Dataset, concatenate_datasets, Features, Value
-from huggingface_hub import login, HfApi
+from huggingface_hub import login, HfApi, DatasetCard, DatasetCardData
 from huggingface_hub.hf_api import CommitOperationDelete
 from huggingface_hub.errors import HfHubHTTPError
 
@@ -62,6 +62,50 @@ def load_split_safely(split_name):
         return None
 
 
+def scrub_split_metadata(repo_id, split_names):
+    """Removes split_names from the dataset card's YAML metadata (configs +
+    dataset_info.splits). This MUST run whenever files backing a split are
+    deleted -- datasets validates file format across every split listed in
+    this metadata in one pass, so a dangling entry pointing at a deleted
+    file breaks load_dataset() for the ENTIRE repo, not just that split.
+    This was the exact bug that broke every split including 'train' after
+    an earlier cleanup run deleted files but skipped this step."""
+    if not split_names:
+        return
+    try:
+        card = DatasetCard.load(repo_id, repo_type="dataset")
+        card_dict = card.data.to_dict()
+        modified = False
+
+        for config in card_dict.get("configs", []):
+            data_files = config.get("data_files", [])
+            new_data_files = [df for df in data_files if df.get("split") not in split_names]
+            if len(new_data_files) != len(data_files):
+                config["data_files"] = new_data_files
+                modified = True
+
+        dataset_info = card_dict.get("dataset_info")
+        info_list = dataset_info if isinstance(dataset_info, list) else \
+                    ([dataset_info] if isinstance(dataset_info, dict) else [])
+        for di in info_list:
+            splits = di.get("splits", [])
+            new_splits = [s for s in splits if s.get("name") not in split_names]
+            if len(new_splits) != len(splits):
+                di["splits"] = new_splits
+                modified = True
+
+        if modified:
+            card.data = DatasetCardData(**card_dict)
+            card.push_to_hub(repo_id, repo_type="dataset",
+                              commit_message="Cleanup: scrub metadata for deleted tmp_batch splits")
+            print(f"  Scrubbed metadata for {len(split_names)} deleted split(s).", flush=True)
+        else:
+            print("  No matching metadata entries found to scrub (already clean).", flush=True)
+    except Exception as e:
+        print(f"  [!] Could not scrub split metadata: {e}. This risks leaving dangling split "
+              f"references -- check the repo manually if the next run fails to load anything.", flush=True)
+
+
 def cleanup_consumed_splits(repo_id, split_names):
     """Deletes the repo files backing each split in split_names. Only ever
     called AFTER a confirmed-successful push of the merged data to 'train' --
@@ -103,6 +147,7 @@ def cleanup_consumed_splits(repo_id, split_names):
                 commit_message="Cleanup: remove consolidated tmp_batch scratch files",
             )
             print("Cleanup commit complete.", flush=True)
+            scrub_split_metadata(repo_id, split_names)
             return
         except Exception as e:
             is_conflict = "412" in str(e) or "Precondition Failed" in str(e)
