@@ -1,7 +1,10 @@
 import os
+import time
+import random
 import pandas as pd
 from datasets import load_dataset, Dataset, concatenate_datasets
 from huggingface_hub import login
+from huggingface_hub.errors import HfHubHTTPError
 
 # ==========================================
 # CONFIGURATION -- keep in sync with fetch_arctic_to_hf.py
@@ -92,11 +95,25 @@ def main():
     print(f"\nCombined total before dedupe: {sum(len(p) for p in pieces)} rows", flush=True)
     print(f"Combined total after dedupe:  {len(df)} rows", flush=True)
 
-    # 4. Push back as the single permanent split
+    # 4. Push back as the single permanent split (retry on transient branch conflicts)
     final_dataset = Dataset.from_pandas(df, preserve_index=False)
-    print(f"\nPushing consolidated dataset to split '{FINAL_SPLIT}'...", flush=True)
-    final_dataset.push_to_hub(repo_id=HF_DATASET_REPO, split=FINAL_SPLIT, private=True)
-    print("✅ Consolidation complete.", flush=True)
+    max_push_attempts = 5
+    for attempt in range(1, max_push_attempts + 1):
+        try:
+            print(f"\nPushing consolidated dataset to split '{FINAL_SPLIT}' "
+                  f"(attempt {attempt}/{max_push_attempts})...", flush=True)
+            final_dataset.push_to_hub(repo_id=HF_DATASET_REPO, split=FINAL_SPLIT, private=True)
+            print("✅ Consolidation complete.", flush=True)
+            break
+        except HfHubHTTPError as e:
+            is_conflict = "412" in str(e) or "Precondition Failed" in str(e)
+            if is_conflict and attempt < max_push_attempts:
+                wait = random.uniform(3, 10) * attempt
+                print(f"Branch conflict (412) from a concurrent push. Retrying in {wait:.1f}s...", flush=True)
+                time.sleep(wait)
+                continue
+            print(f"Push failed after {attempt} attempt(s): {e}", flush=True)
+            raise
 
 
 if __name__ == "__main__":
