@@ -85,7 +85,7 @@ jobs:
     if: always()   # run even if some/all batches failed, timed out, or the run was cancelled --
                     # partial data beats losing everything, which is what happened before this fix
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
