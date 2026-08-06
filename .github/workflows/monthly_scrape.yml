@@ -44,7 +44,7 @@ jobs:
     timeout-minutes: 60
     strategy:
       fail-fast: false
-      max-parallel: 5
+      max-parallel: 7
       matrix:
         batch_name:
           - heavy_1
