@@ -6,10 +6,10 @@ import pandas as pd
 import os
 import time
 import json
-import re
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from tqdm.notebook import tqdm
+from huggingface_hub import HfApi
 from openai import OpenAI
 
 try:
@@ -19,7 +19,7 @@ except ImportError:
     IN_COLAB = False
 
 # ==========================================
-# 1. SETUP & API CONFIG
+# 1. SETUP & API CONFIG (Synchronous)
 # ==========================================
 if IN_COLAB:
     print("🔗 Mounting Google Drive...")
@@ -33,46 +33,36 @@ OUTPUT_FILE = os.path.join(WORK_DIR, "chodi_labeled.csv")
 CHECKPOINT_FILE = os.path.join(WORK_DIR, "chodi_checkpoint.csv")
 
 TARGET_SUBREDDIT = "chodi"
-TOTAL_ROWS_TO_LABEL = 500 # Configurable limit
+TOTAL_ROWS_TO_LABEL = 500
 
-print("🔌 Connecting to OpenCode Go API...")
+print("🔌 Connecting to OpenCode Go API (Sync Mode)...")
 if IN_COLAB:
     try: OPENCODE_KEY = userdata.get("opencode")
     except: OPENCODE_KEY = userdata.get("OPENCODE_KEY")
 else:
     OPENCODE_KEY = os.getenv("OPENCODE_KEY")
 
+# Standard Synchronous OpenAI Client
 client = OpenAI(api_key=OPENCODE_KEY, base_url="https://opencode.ai/zen/go/v1")
 MODEL_NAME = "deepseek-v4-flash"
 
 # ==========================================
 # 2. DUCKDB LIGHTNING EXTRACTION (Anti-Hang Fix)
 # ==========================================
-from huggingface_hub import HfApi
-import random
-
 print(f"\n🕵️ Fetching exact file paths via HF API to prevent metadata hang...")
 api = HfApi()
 
 try:
-    # 1. Instantly fetch all file names in the repo
+    import random
     all_files = api.list_repo_files("open-index/arctic", repo_type="dataset")
-
-    # 2. Filter for only 2020 and 2021 comment Parquet files
     target_era_files = [
-        f for f in all_files
+        f for f in all_files 
         if f.endswith('.parquet') and ('data/comments/2020' in f or 'data/comments/2021' in f)
     ]
-
-    # 3. Randomly select ~50 shards (~2.5 million rows) to scan.
-    # This prevents DuckDB from trying to read 5,000 files at once.
     random.seed(42)
     selected_shards = random.sample(target_era_files, min(50, len(target_era_files)))
-
-    # 4. Create explicit URLs
     hf_urls = [f"hf://datasets/open-index/arctic/{f}" for f in selected_shards]
     print(f"✅ Locked onto {len(hf_urls)} explicit data shards. Booting DuckDB...")
-
 except Exception as e:
     raise RuntimeError(f"❌ Failed to communicate with Hugging Face: {e}")
 
@@ -80,13 +70,9 @@ con = duckdb.connect()
 con.execute("INSTALL httpfs; LOAD httpfs;")
 
 fetch_start = time.time()
-
-# Pass the explicit python list of URLs directly into read_parquet()
 query = f"""
-SELECT
-    subreddit,
-    body,
-    score,
+SELECT 
+    subreddit, body, score,
     0 AS pv, 0 AS tah, 0 AS dhs, 0 AS cst, 0 AS cr, 0 AS rx, 0 AS mg
 FROM read_parquet({hf_urls})
 WHERE LOWER(subreddit) = '{TARGET_SUBREDDIT}'
@@ -99,15 +85,13 @@ LIMIT {TOTAL_ROWS_TO_LABEL};
 
 try:
     df = con.query(query).to_df()
-    if df.empty:
-        raise ValueError(f"🚨 Found 0 rows for r/{TARGET_SUBREDDIT} in these specific shards. Try increasing the sample size from 50 to 100.")
-
+    if df.empty: raise ValueError(f"🚨 Found 0 rows. Try increasing shard sample size.")
     print(f"✅ Fast-fetch complete! Downloaded {len(df)} rows in {time.time() - fetch_start:.2f}s")
 except Exception as e:
     raise RuntimeError(f"❌ DuckDB Extraction failed: {e}")
 
 # ==========================================
-# 3. TEACHER MODEL PROMPT & HELPERS
+# 3. TEACHER MODEL PROMPT & SYNC FUNCTION
 # ==========================================
 SYSTEM_PROMPT = """Hinglish Content Moderation — Teacher Model Labeling Prompt
 Version: 6.1 (Decoupled 3-Flag Architecture, Token Optimized) | Hindi-English code-mixed, Roman script | Reddit comments
@@ -196,84 +180,90 @@ ANCHOR EXAMPLES
 ]
 """
 
-
-def parse_labels(raw_text):
-    text = raw_text.strip()
-    if text.startswith("```"): text = re.sub(r"^```(json)?|```$", "", text, flags=re.MULTILINE).strip()
-    try: return json.loads(text)
-    except: pass
-    match = re.search(r"\[.*\]", text, re.DOTALL)
-    if match:
-        try: return json.loads(match.group(0))
-        except: pass
-    return None
-
-# 🔥 NEW: Asynchronous batch labeling function with Minimal Thinking ON
-async def label_batch_async(comments_batch, attempt=1):
+def label_batch(comments_batch, attempt=1):
     numbered = "\n".join(f'ID: {cid} | Comment: {body}' for cid, body in comments_batch)
     user_prompt = f"Label these {len(comments_batch)} comments strictly following the JSON schema:\n{numbered}"
 
     try:
         start = time.time()
-        res = await client.chat.completions.create(
+        res = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_prompt}],
             temperature=0.1,
-            max_tokens=4000, # ⬆️ Bumped up to give the model room to "think"
+            max_tokens=2500,
             response_format={"type": "json_object"},
-            #reasoning_effort="low", # 🧠 Instructs the model to keep thinking minimal
-            extra_body={"thinking": {"type": "disabled"}} # ✅ Turns thinking ON/OFF , also uncomment the previous reasoning_effort line
+            extra_body={"thinking": {"type": "disabled"}} # Thinking OFF for fast-hack speed
         )
         duration = time.time() - start
-
-        # Parse directly via standard JSON module
-        parsed_data = json.loads(res.choices[0].message.content)
-        parsed_array = parsed_data.get("results", [])
-
+        
+        # 🛡️ DEFENSIVE PARSING: Handles both [...] and {"results": [...]}
+        raw_content = res.choices[0].message.content
+        parsed_data = json.loads(raw_content)
+        
+        if isinstance(parsed_data, list):
+            parsed_array = parsed_data
+        elif isinstance(parsed_data, dict):
+            parsed_array = parsed_data.get("results", [])
+            # Fallback in case it names the key something weird
+            if not parsed_array:
+                for val in parsed_data.values():
+                    if isinstance(val, list):
+                        parsed_array = val
+                        break
+        else:
+            parsed_array = []
+        
         if len(parsed_array) == len(comments_batch):
-            for idx, item in enumerate(parsed_array):
+            for idx, item in enumerate(parsed_array): 
                 item["id"] = str(comments_batch[idx][0])
-
-            # Log the token usage to track how many extra tokens the "thinking" takes
-            tqdm.write(f"  [🧠 Minimal Think] Time: {duration:.2f}s | Out tkns: {res.usage.completion_tokens}")
+                
+            tqdm.write(f"  [⚡ inference] Time: {duration:.2f}s | Out tkns: {res.usage.completion_tokens}")
             return parsed_array
-
-        raise ValueError("Dropped item in JSON array.")
-
+            
+        raise ValueError(f"Dropped items. Expected {len(comments_batch)}, got {len(parsed_array)}")
+        
     except Exception as e:
         if attempt <= 4:
-            await asyncio.sleep(min(2 ** attempt, 15))
-            return await label_batch_async(comments_batch, attempt + 1)
+            wait_time = min(2 ** attempt, 10)
+            tqdm.write(f"    [!] Retry {attempt}/4 (Error: {e}). Waiting {wait_time}s...")
+            time.sleep(wait_time)
+            return label_batch(comments_batch, attempt + 1)
+        tqdm.write(f"    [❌] Batch permanently failed.")
         return []
+
 # ==========================================
-# 4. LABELING PIPELINE
+# 4. LABELING PIPELINE (Thread Pool)
 # ==========================================
 df["id"] = df.index.astype(str)
 batches = [list(zip(df["id"], df["body"]))[i:i + 20] for i in range(0, len(df), 20)]
 all_labels = []
 
-print(f"\n🚀 Starting Inference on {len(df)} rows...")
+print(f"\n🚀 Starting Inference on {len(df)} rows with 10 Workers...")
 lock = threading.Lock()
 
 with tqdm(total=len(batches), desc="Labeling Batches") as pbar:
     with ThreadPoolExecutor(max_workers=10) as executor:
+        # Using executor.map for simple synchronous multi-threading
         for labels in executor.map(label_batch, batches):
             with lock:
                 all_labels.extend(labels)
-                if len(all_labels) % 100 < 20:
+                if len(all_labels) % 100 < 20 and len(all_labels) > 0:
                     pd.DataFrame(all_labels).to_csv(CHECKPOINT_FILE, index=False)
             pbar.update(1)
 
 labels_df = pd.DataFrame(all_labels)
-labels_df["id"] = labels_df["id"].astype(str)
+if not labels_df.empty:
+    labels_df["id"] = labels_df["id"].astype(str)
 
-KEY_MAPPING = {
-    "analysis": "step_by_step_analysis", "pv": "profanity_vulgarity", "tah": "targeted_abuse_harassment",
-    "dhs": "discriminatory_hate_speech", "cst": "caste", "cr": "communal_religious",
-    "rx": "regional_xenophobic", "mg": "misogyny_gender"
-}
-labels_df.rename(columns=KEY_MAPPING, inplace=True)
-final_df = df.merge(labels_df, on="id", how="left").drop(columns=["id", "pv", "tah", "dhs", "cst", "cr", "rx", "mg"], errors='ignore')
-
-final_df.to_csv(OUTPUT_FILE, index=False)
-print(f"\n✅ SUCCESS! Saved {len(final_df)} labeled r/{TARGET_SUBREDDIT} rows to: {OUTPUT_FILE}")
+    KEY_MAPPING = {
+        "analysis": "step_by_step_analysis", "pv": "profanity_vulgarity", "tah": "targeted_abuse_harassment",
+        "dhs": "discriminatory_hate_speech", "cst": "caste", "cr": "communal_religious", 
+        "rx": "regional_xenophobic", "mg": "misogyny_gender"
+    }
+    labels_df.rename(columns=KEY_MAPPING, inplace=True)
+    
+    final_df = df.merge(labels_df, on="id", how="left").drop(columns=["id", "pv", "tah", "dhs", "cst", "cr", "rx", "mg"], errors='ignore')
+    final_df.to_csv(OUTPUT_FILE, index=False)
+    print(f"\n✅ SUCCESS! Saved {len(final_df)} labeled r/{TARGET_SUBREDDIT} rows to: {OUTPUT_FILE}")
+else:
+    print("\n❌ Failed to generate labels.")
