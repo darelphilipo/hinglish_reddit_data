@@ -8,7 +8,7 @@ import pandas as pd
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 from datasets import Dataset, Features, Value
-from huggingface_hub import login, HfApi
+from huggingface_hub import HfApi
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
 # Explicit schema -- pinned so a slice where a column happens to be all-null
@@ -334,8 +334,6 @@ def main():
     print(f"  Range: {range_start.strftime('%Y-%m')} through "
           f"{range_end.strftime('%Y-%m')} inclusive "
           f"({len(months)} month(s): {[m.strftime('%Y-%m') for m in months]})", flush=True)
-
-    login(token=HF_TOKEN)
 
     seen_ids = set()
     outcomes = []
