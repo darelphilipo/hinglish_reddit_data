@@ -5,7 +5,7 @@ import uuid
 import random
 import pandas as pd
 from datasets import load_dataset, concatenate_datasets, Features, Value
-from huggingface_hub import login, HfApi, CommitOperationDelete
+from huggingface_hub import HfApi, CommitOperationDelete
 
 # ==========================================
 # DIAGNOSTIC HELPER
@@ -89,8 +89,6 @@ def main():
     if not HF_TOKEN:
         raise ValueError("HF_TOKEN environment variable is not set!")
     
-    log_step("Logging into Hugging Face...")
-    login(token=HF_TOKEN)
     api = HfApi()
 
     log_step(f"Fetching repository file layout for '{HF_DATASET_REPO}'...")

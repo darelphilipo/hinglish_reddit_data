@@ -6,7 +6,6 @@ import random
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 from datasets import Dataset, Features, Value
-from huggingface_hub import login
 from huggingface_hub.errors import HfHubHTTPError
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
@@ -286,7 +285,6 @@ def push_checkpoint(master_dataset, split_name, label):
 def main():
     if not HF_TOKEN:
         raise ValueError("HF_TOKEN environment variable is not set!")
-    login(token=HF_TOKEN)
 
     if not SUBREDDITS:
         print(f"Batch '{BATCH_NAME}' is empty. Nothing to do.", flush=True)
