@@ -1,0 +1,168 @@
+# Hinglish Content Moderation — Teacher Model Labeling Prompt
+Version: 6.1 (Decoupled 3-Flag Architecture, v5 content restored) | Hindi-English code-mixed, Roman script | Reddit comments
+
+**Philosophy:** When in doubt on harassment/hate speech, output 0. Silencing
+legitimate speech is worse than missing an edge case. Never flag opinions,
+criticism, or political disagreement as harassment or hate speech.
+
+**Design note on `profanity_vulgarity`:** this flag is a **detection signal,
+not a moderation verdict**. It fires whenever explicit profanity is present,
+regardless of target — including profanity aimed at a government, institution,
+or policy ("government chutiya hai"). This is intentional: downstream
+platforms decide their own policy on whether non-personal profanity should be
+moderated (some communities want a fully clean feed; others only care about
+profanity directed at people). `targeted_abuse_harassment` and
+`discriminatory_hate_speech` are the two flags that indicate an actual
+person/group was attacked — those are the ones a platform would typically act
+on by default. Do not treat `profanity_vulgarity: 1` alone as grounds to
+remove a comment; it is a component signal, not a removal trigger.
+
+---
+
+## OUTPUT FORMAT
+
+Return ONLY this JSON, no preamble:
+```json
+{"id": "<id>", "profanity_vulgarity": 0/1, "targeted_abuse_harassment": 0/1,
+ "discriminatory_hate_speech": 0/1,
+ "dimensions": {"caste": 0/1, "communal_religious": 0/1, "regional_xenophobic": 0/1, "misogyny_gender": 0/1}}
+```
+`discriminatory_hate_speech` = 1 iff any dimension = 1. If 0, all dimensions = 0.
+The three top-level flags are independent — any combination is valid, including all three at once.
+
+---
+
+## THE DECISION PROCEDURE
+
+**Step 1 — Is explicit profanity/vulgarity present anywhere in the text?**
+Check for curse words, obscene terms, sexual slurs, or vulgar swearing (chutiya,
+bsdk, mc, bc, gaand, lund, randi, fuck, madarchod, behenchod, bhosadike,
+gandu, harami, kamine), including obfuscated variants (ch0tiya, b5dk,
+chutiyaaaa, spaced-out c h u t i y a).
+- Present anywhere — even filler, self-directed, or aimed at an abstract
+  target — → `profanity_vulgarity: 1`. Otherwise 0.
+- This step does NOT determine the other two flags. Continue to Steps 2-3
+  regardless of this result.
+
+**Step 2 — Is there targeted personal abuse/harassment OR an identity-based
+stereotype/objectification/hierarchy statement present?**
+*(Note: this gate is intentionally broader than "is there profanity" — a
+calmly-stated demeaning premise with no curse word still needs evaluation,
+e.g. "kya maal hai yeh ladki" or "auratein sirf ghar sambhale ke liye bani hain".)*
+- Aimed at an abstract entity (government, system, company, policy, game, title-alone) → `targeted_abuse_harassment: 0`
+- Self-directed ("main chutiya hoon") or reported speech ("usne mujhe X bola") → 0
+- Filler/exclamation not directed at anyone ("bc yaar", "chutiya release date") → 0
+- Public figure — reverse test: *would this be said about a private citizen the same way?* Personal (appearance/family/character) → 1. Professional (policy/performance) → 0.
+- A specific person insulted, threatened, or personally degraded → `targeted_abuse_harassment: 1`
+
+**Step 3 — Is an identity dimension (caste/religion/region/gender) load-bearing?**
+Test: *if you removed the identity reference, would the sentence lose its hostile punch?*
+- Yes → `discriminatory_hate_speech: 1` + correct dimension(s). Applies even
+  with NO profanity present — covert othering, rhetorical questions ("Muslim
+  tera baap he kya??"), sarcastic praise-as-mockery ("Modiji kitne acche
+  leader hai" in a soldier-death thread), objectification ("kya maal hai"),
+  gender-hierarchy statements, mocking a religious practice to demean its
+  adherents, and conspiracy framing ("ye sab convert karne aaye hain") all count.
+- No, the insult/target is generic and would apply regardless of identity
+  ("abe randi" to a male gamer; "behenchod" as filler; an animal metaphor used
+  as meta-commentary, not a direct insult — "EK KUTTA BHAUKTA HAI") → identity
+  dimensions stay 0, even if the other two flags are 1.
+
+**Step 4 — Political-affiliation terms (sanghi/bhakt/libtard/chamcha) are NOT
+an identity dimension on their own.** Only flag `communal_religious` if
+hostility is also tied to actual religious/communal identity, not political
+tribe alone.
+
+**Confidence check:** if a comment hinges on one ambiguous/borderline term
+with no other corroborating signal (no clear target, no clear framing, could
+plausibly be a homonym or filler), prefer 0 on `targeted_abuse_harassment` and
+`discriminatory_hate_speech`. Reserve those flags for cases with a clear
+target AND a clear personal/identity basis.
+
+---
+
+## CATEGORY DEFINITIONS
+
+**profanity_vulgarity** — explicit swearing/obscenity present anywhere in the text, regardless of target, intent, or filler use. Detection signal only (see design note above).
+
+**targeted_abuse_harassment** — an insult, threat, character attack, or personal degradation aimed at a specific identifiable person, for personal (not institutional/professional) reasons.
+
+**discriminatory_hate_speech** — hostility where caste, religion, region/language, or gender is the load-bearing basis of the attack (Step 3 test), not incidental.
+
+Common vocabulary (non-exhaustive — use judgment for phonetic/obfuscated variants):
+- Profanity: chutiya, bsdk, madarchod, behenchod, bhosadike, gandu, lund, gaand, harami, kamine, randi
+- Caste slurs: chamar, bhangi, neech jaati, dedh, chura (Punjab), pallan (Tamil Nadu), kanjar, dhobi (as slur), mehtar, harijan (derogatory use), "aarakshanjeevi"/"quota khane wale" (only when demeaning people, not policy debate)
+- Communal slurs: katwa, mulla/mulle, kafir, malaun, pajeet, "cow piss drinker", "dung worshipper" (phrase-level mockery of religious practice), "sanghi/bhakt" (only when dehumanizing, not political critique — Step 4)
+- Regional slurs: bihari/madrasi (pejorative use), bimaru, chinki, ghati, bhaiyya (as slur for North Indians, Mumbai context), "Porki"/"Porkistan" (ethnic slur)
+- Gendered: chhakka/hijra (pejorative), "maal"/"item" (objectifying), "randi khana"/"randi rona" (demeaning emotional expression as weakness), "feminazi" (dismissive slur), gender-hierarchy statements ("aurat ghar sambhale")
+
+---
+
+## KNOWN TRAPS — read carefully, these cause the most errors
+
+1. **Homonyms:** `chakka` = jackfruit (food context) vs. slur (identity context). `BC` = "Before Christ"/date vs. profanity. `bhakt` = literal devotee vs. political-dehumanization slur (Step 4). Context decides — never pattern-match the bare word.
+2. **Idioms:** `ke chakkar mein`, `chakkar aana`, `chakka jam` — contain slur-adjacent fragments but are benign idioms. Do not trigger on substrings.
+3. **Meta-commentary:** "Randia/Randians" as a subreddit nickname in benign self-referential discussion is not a slur.
+4. **India-Pakistan content:** criticizing the Pakistani government/army/policy = 0 on harassment/hate. Nationalist boasts that don't dehumanize anyone ("Agr hindu army may himat ha") = 0, political rhetoric. Blanket-dehumanizing "Pakistani people" or Indian Muslims as a class (loyalty-questioning, "gaddar" framing) = 1 on discriminatory_hate_speech (communal/regional, per Step 3 — no slur needed).
+5. **Body-shaming/mental-health insults** (motu, paagal, mental, psycho) = `targeted_abuse_harassment: 1` when directed at a person; NOT discriminatory_hate_speech unless also identity-based (e.g. "aurat ko moti nahi hona chahiye" → misogyny: 1). Neutral discussion ("mental health important hai") = 0 on all flags.
+6. **Obfuscation/evasion:** letter repetition (chutiyaaaa), character substitution (ch0@tiya, b5dk), spacing (c h u t i y a), emoji substitution for slur words, leetspeak (bh0$adik3), and occasional reverse spelling all still count for `profanity_vulgarity` — match the intent, not the exact spelling.
+7. **Topic discussion vs. endorsement:** discussing a controversy as news/debate ("love jihad controversy discussed in news") = 0 on discriminatory_hate_speech. Asserting the conspiracy as fact with hostile intent ("love jihad karke hindu ladkiyon ko fasa rahe hain") = 1.
+8. **Humor without animus:** a joke referencing a region/group with no demeaning framing can be 0 on discriminatory_hate_speech — judge by whether it demeans or just references.
+9. **Icon-mocking:** hostile mockery of a community's cultural/political icons specifically to humiliate the community (e.g. mocking Ambedkar to demean Dalits) counts under Step 3, even without a slur word.
+
+---
+
+## ANCHOR EXAMPLES
+
+```
+"fuck the Indian government, ye system chor hai" (profanity present, but institutional target) → {"profanity_vulgarity":1,"targeted_abuse_harassment":0,"discriminatory_hate_speech":0,"dimensions":{"caste":0,"communal_religious":0,"regional_xenophobic":0,"misogyny_gender":0}}
+
+"tu ekdum chutiya hai yaar" → {"profanity_vulgarity":1,"targeted_abuse_harassment":1,"discriminatory_hate_speech":0,"dimensions":{"caste":0,"communal_religious":0,"regional_xenophobic":0,"misogyny_gender":0}}
+
+"abe mulle harami hai, tum logo ko yahan se nikalna chahiye" → {"profanity_vulgarity":1,"targeted_abuse_harassment":1,"discriminatory_hate_speech":1,"dimensions":{"caste":0,"communal_religious":1,"regional_xenophobic":0,"misogyny_gender":0}}
+
+"chamar log ko kabhi izzat nahi milegi, aukaat mein raho" (no profanity, hate speech) → {"profanity_vulgarity":0,"targeted_abuse_harassment":0,"discriminatory_hate_speech":1,"dimensions":{"caste":1,"communal_religious":0,"regional_xenophobic":0,"misogyny_gender":0}}
+
+"ye chamar mulle dono ek hi jaise hain, desh ko barbaad kar rahe hain" (caste+communal overlap, no profanity) → {"profanity_vulgarity":0,"targeted_abuse_harassment":0,"discriminatory_hate_speech":1,"dimensions":{"caste":1,"communal_religious":1,"regional_xenophobic":0,"misogyny_gender":0}}
+
+"bihari log idhar aake culture kharab kar rahe" → {"profanity_vulgarity":0,"targeted_abuse_harassment":0,"discriminatory_hate_speech":1,"dimensions":{"caste":0,"communal_religious":0,"regional_xenophobic":1,"misogyny_gender":0}}
+
+"aurat ko itna dimag nahi lagana chahiye, ghar sambhalna hi kaafi hai" → {"profanity_vulgarity":0,"targeted_abuse_harassment":0,"discriminatory_hate_speech":1,"dimensions":{"caste":0,"communal_religious":0,"regional_xenophobic":0,"misogyny_gender":1}}
+
+"kya maal hai yeh ladki" (objectification, no profanity) → {"profanity_vulgarity":0,"targeted_abuse_harassment":0,"discriminatory_hate_speech":1,"dimensions":{"caste":0,"communal_religious":0,"regional_xenophobic":0,"misogyny_gender":1}}
+
+"Muslim tera baap he kya??" (no slur, covert othering) → {"profanity_vulgarity":0,"targeted_abuse_harassment":0,"discriminatory_hate_speech":1,"dimensions":{"caste":0,"communal_religious":1,"regional_xenophobic":0,"misogyny_gender":0}}
+
+"Modiji kitne acche leader hai" (sarcastic praise in soldier-death thread) → {"profanity_vulgarity":0,"targeted_abuse_harassment":0,"discriminatory_hate_speech":1,"dimensions":{"caste":0,"communal_religious":1,"regional_xenophobic":0,"misogyny_gender":0}}
+
+"HINDOO k khilaf jihad karo" (violence call, no profanity) → {"profanity_vulgarity":0,"targeted_abuse_harassment":0,"discriminatory_hate_speech":1,"dimensions":{"caste":0,"communal_religious":1,"regional_xenophobic":0,"misogyny_gender":0}}
+
+"Teri sister ko pel kr Pakistan mai bhej dunga" (severe combined threat, no swear word but graphic) → {"profanity_vulgarity":0,"targeted_abuse_harassment":1,"discriminatory_hate_speech":1,"dimensions":{"caste":0,"communal_religious":0,"regional_xenophobic":0,"misogyny_gender":1}}
+
+"Modi ki economic policy chutiya hai, GDP gir rahi hai" (profanity present, professional criticism) → {"profanity_vulgarity":1,"targeted_abuse_harassment":0,"discriminatory_hate_speech":0,"dimensions":{"caste":0,"communal_religious":0,"regional_xenophobic":0,"misogyny_gender":0}}
+
+"Modi ki shakal dekh ke pata chalta hai woh chutiya hai" (profanity + personal attack) → {"profanity_vulgarity":1,"targeted_abuse_harassment":1,"discriminatory_hate_speech":0,"dimensions":{"caste":0,"communal_religious":0,"regional_xenophobic":0,"misogyny_gender":0}}
+
+"Agr hindu army may himat ha" (nationalist boast, not a slur) → {"profanity_vulgarity":0,"targeted_abuse_harassment":0,"discriminatory_hate_speech":0,"dimensions":{"caste":0,"communal_religious":0,"regional_xenophobic":0,"misogyny_gender":0}}
+
+"love jihad controversy discussed in news" (topic discussion, not endorsement) → {"profanity_vulgarity":0,"targeted_abuse_harassment":0,"discriminatory_hate_speech":0,"dimensions":{"caste":0,"communal_religious":0,"regional_xenophobic":0,"misogyny_gender":0}}
+
+"EK KUTTA BHAUKTA HAI" (animal metaphor as complaint, not insult) → {"profanity_vulgarity":0,"targeted_abuse_harassment":0,"discriminatory_hate_speech":0,"dimensions":{"caste":0,"communal_religious":0,"regional_xenophobic":0,"misogyny_gender":0}}
+
+"bc yaar, release date push ho gayi" (profanity as filler) → {"profanity_vulgarity":1,"targeted_abuse_harassment":0,"discriminatory_hate_speech":0,"dimensions":{"caste":0,"communal_religious":0,"regional_xenophobic":0,"misogyny_gender":0}}
+
+"main toh chutiya hoon" (self-directed profanity) → {"profanity_vulgarity":1,"targeted_abuse_harassment":0,"discriminatory_hate_speech":0,"dimensions":{"caste":0,"communal_religious":0,"regional_xenophobic":0,"misogyny_gender":0}}
+
+"abe randi, tu toh har game mein feed karta hai" (to male gamer — profanity + harassment, no gender hate) → {"profanity_vulgarity":1,"targeted_abuse_harassment":1,"discriminatory_hate_speech":0,"dimensions":{"caste":0,"communal_religious":0,"regional_xenophobic":0,"misogyny_gender":0}}
+
+"tu paagal hai kya, aisa kyun kar raha" (mental-health insult, personal, no profanity) → {"profanity_vulgarity":0,"targeted_abuse_harassment":1,"discriminatory_hate_speech":0,"dimensions":{"caste":0,"communal_religious":0,"regional_xenophobic":0,"misogyny_gender":0}}
+
+"chakka ki sabzi banayi thi aaj" (food homonym) → {"profanity_vulgarity":0,"targeted_abuse_harassment":0,"discriminatory_hate_speech":0,"dimensions":{"caste":0,"communal_religious":0,"regional_xenophobic":0,"misogyny_gender":0}}
+
+"reservation policy ko revisit karna chahiye, merit ke basis pe" (policy debate) → {"profanity_vulgarity":0,"targeted_abuse_harassment":0,"discriminatory_hate_speech":0,"dimensions":{"caste":0,"communal_religious":0,"regional_xenophobic":0,"misogyny_gender":0}}
+
+"sanghi economic policy criticize karni chahiye" (political critique, Step 4) → {"profanity_vulgarity":0,"targeted_abuse_harassment":0,"discriminatory_hate_speech":0,"dimensions":{"caste":0,"communal_religious":0,"regional_xenophobic":0,"misogyny_gender":0}}
+```
+
+---
+
