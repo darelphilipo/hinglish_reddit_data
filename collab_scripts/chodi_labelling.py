@@ -221,8 +221,8 @@ async def label_batch_async(comments_batch, attempt=1):
             temperature=0.1,
             max_tokens=4000, # ⬆️ Bumped up to give the model room to "think"
             response_format={"type": "json_object"},
-            reasoning_effort="low", # 🧠 Instructs the model to keep thinking minimal
-            extra_body={"thinking": {"type": "enabled"}} # ✅ Turns thinking ON
+            #reasoning_effort="low", # 🧠 Instructs the model to keep thinking minimal
+            extra_body={"thinking": {"type": "disabled"}} # ✅ Turns thinking ON/OFF , also uncomment the previous reasoning_effort line
         )
         duration = time.time() - start
 
