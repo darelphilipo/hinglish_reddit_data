@@ -1,0 +1,58 @@
+name: Fetch Subreddit Range to HF
+
+on:
+  workflow_dispatch:
+    inputs:
+      subreddits:
+        description: 'Comma-separated subreddit names'
+        required: true
+        type: string
+      start_year:
+        description: 'Start year (inclusive)'
+        required: true
+        type: string
+      start_month:
+        description: 'Start month, 1-12 (inclusive)'
+        required: true
+        type: string
+      end_year:
+        description: 'End year (inclusive)'
+        required: true
+        type: string
+      end_month:
+        description: 'End month, 1-12 (inclusive)'
+        required: true
+        type: string
+
+concurrency:
+  group: fetch-subreddit-range
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas datasets huggingface_hub python-dateutil urllib3
+
+      - name: Run Subreddit Range Fetch
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          PYTHONUNBUFFERED: "1"
+          SUBREDDITS: ${{ inputs.subreddits }}
+          START_YEAR: ${{ inputs.start_year }}
+          START_MONTH: ${{ inputs.start_month }}
+          END_YEAR: ${{ inputs.end_year }}
+          END_MONTH: ${{ inputs.end_month }}
+        run: python fetch_subreddit_range_to_hf.py
