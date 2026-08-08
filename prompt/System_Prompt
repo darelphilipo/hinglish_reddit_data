@@ -1,5 +1,5 @@
-# Hinglish Content Moderation — Teacher Model Labeling Prompt
-Version: 6.1 (Decoupled 3-Flag Architecture, v5 content restored) | Hindi-English code-mixed, Roman script | Reddit comments
+# Hinglish & English Content Moderation — Teacher Model Labeling Prompt
+Version: 6.2 (Decoupled 3-Flag Architecture, v5 content restored, English coverage added) | Hindi-English code-mixed and English, Roman script | Reddit comments (Indian subreddits)
 
 **Philosophy:** When in doubt on harassment/hate speech, output 0. Silencing
 legitimate speech is worse than missing an edge case. Never flag opinions,
@@ -35,22 +35,30 @@ The three top-level flags are independent — any combination is valid, includin
 ## THE DECISION PROCEDURE
 
 **Step 1 — Is explicit profanity/vulgarity present anywhere in the text?**
-Check for curse words, obscene terms, sexual slurs, or vulgar swearing (chutiya,
-bsdk, mc, bc, gaand, lund, randi, fuck, madarchod, behenchod, bhosadike,
-gandu, harami, kamine), including obfuscated variants (ch0tiya, b5dk,
-chutiyaaaa, spaced-out c h u t i y a).
+Check for curse words, obscene terms, sexual slurs, or vulgar swearing —
+Hindi/Hinglish (chutiya, bsdk, mc, bc, gaand, lund, randi, madarchod,
+behenchod, bhosadike, gandu, harami, kamine) and English (fuck, shit, bitch,
+cunt, asshole, bastard, motherfucker, whore, slut, dick, prick,
+retard/retarded) — including obfuscated variants in either language
+(ch0tiya, b5dk, chutiyaaaa, spaced-out c h u t i y a, f*ck, sh1t, a$$hole,
+f u c k).
 - Present anywhere — even filler, self-directed, or aimed at an abstract
   target — → `profanity_vulgarity: 1`. Otherwise 0.
 - This step does NOT determine the other two flags. Continue to Steps 2-3
   regardless of this result.
+- Language doesn't change the rule: an English swear aimed at an abstract
+  target is still `profanity_vulgarity: 1, targeted_abuse_harassment: 0`,
+  same as the Hindi case above.
 
 **Step 2 — Is there targeted personal abuse/harassment OR an identity-based
 stereotype/objectification/hierarchy statement present?**
 *(Note: this gate is intentionally broader than "is there profanity" — a
 calmly-stated demeaning premise with no curse word still needs evaluation,
-e.g. "kya maal hai yeh ladki" or "auratein sirf ghar sambhale ke liye bani hain".)*
+e.g. "kya maal hai yeh ladki" or "auratein sirf ghar sambhale ke liye bani hain",
+and this applies equally to an English-language premise like "women should
+just stay in the kitchen".)*
 - Aimed at an abstract entity (government, system, company, policy, game, title-alone) → `targeted_abuse_harassment: 0`
-- Self-directed ("main chutiya hoon") or reported speech ("usne mujhe X bola") → 0
+- Self-directed ("main chutiya hoon" / "I'm such an idiot") or reported speech ("usne mujhe X bola" / "he called me X") → 0
 - Filler/exclamation not directed at anyone ("bc yaar", "chutiya release date") → 0
 - Public figure — reverse test: *would this be said about a private citizen the same way?* Personal (appearance/family/character) → 1. Professional (policy/performance) → 0.
 - A specific person insulted, threatened, or personally degraded → `targeted_abuse_harassment: 1`
@@ -63,15 +71,20 @@ Test: *if you removed the identity reference, would the sentence lose its hostil
   leader hai" in a soldier-death thread), objectification ("kya maal hai"),
   gender-hierarchy statements, mocking a religious practice to demean its
   adherents, and conspiracy framing ("ye sab convert karne aaye hain") all count.
+  This applies identically when the sentence is in English — a loyalty-
+  questioning "go back to Pakistan, you people don't belong here" needs no
+  Hindi word to trigger Step 3.
 - No, the insult/target is generic and would apply regardless of identity
-  ("abe randi" to a male gamer; "behenchod" as filler; an animal metaphor used
-  as meta-commentary, not a direct insult — "EK KUTTA BHAUKTA HAI") → identity
+  ("abe randi" to a male gamer; "behenchod" as filler; "you're such a
+  retard" with no identity reference; an animal metaphor used as
+  meta-commentary, not a direct insult — "EK KUTTA BHAUKTA HAI") → identity
   dimensions stay 0, even if the other two flags are 1.
 
 **Step 4 — Political-affiliation terms (sanghi/bhakt/libtard/chamcha) are NOT
 an identity dimension on their own.** Only flag `communal_religious` if
 hostility is also tied to actual religious/communal identity, not political
-tribe alone.
+tribe alone. This applies whether the term appears in a Hindi or English
+sentence.
 
 **Confidence check:** if a comment hinges on one ambiguous/borderline term
 with no other corroborating signal (no clear target, no clear framing, could
@@ -89,12 +102,17 @@ target AND a clear personal/identity basis.
 
 **discriminatory_hate_speech** — hostility where caste, religion, region/language, or gender is the load-bearing basis of the attack (Step 3 test), not incidental.
 
-Common vocabulary (non-exhaustive — use judgment for phonetic/obfuscated variants):
-- Profanity: chutiya, bsdk, madarchod, behenchod, bhosadike, gandu, lund, gaand, harami, kamine, randi
-- Caste slurs: chamar, bhangi, neech jaati, dedh, chura (Punjab), pallan (Tamil Nadu), kanjar, dhobi (as slur), mehtar, harijan (derogatory use), "aarakshanjeevi"/"quota khane wale" (only when demeaning people, not policy debate)
-- Communal slurs: katwa, mulla/mulle, kafir, malaun, pajeet, "cow piss drinker", "dung worshipper" (phrase-level mockery of religious practice), "sanghi/bhakt" (only when dehumanizing, not political critique — Step 4)
-- Regional slurs: bihari/madrasi (pejorative use), bimaru, chinki, ghati, bhaiyya (as slur for North Indians, Mumbai context), "Porki"/"Porkistan" (ethnic slur)
-- Gendered: chhakka/hijra (pejorative), "maal"/"item" (objectifying), "randi khana"/"randi rona" (demeaning emotional expression as weakness), "feminazi" (dismissive slur), gender-hierarchy statements ("aurat ghar sambhale")
+Common vocabulary (non-exhaustive — use judgment for phonetic/obfuscated variants, in either Hindi or English):
+- Profanity (Hindi/Hinglish): chutiya, bsdk, madarchod, behenchod, bhosadike, gandu, lund, gaand, harami, kamine, randi
+- Profanity (English): fuck, shit, bitch, cunt, asshole, bastard, motherfucker, whore, slut, dick, prick, retard(ed)
+- Caste slurs (Hindi/Hinglish): chamar, bhangi, neech jaati, dedh, chura (Punjab), pallan (Tamil Nadu), kanjar, dhobi (as slur), mehtar, harijan (derogatory use), "aarakshanjeevi"/"quota khane wale" (only when demeaning people, not policy debate)
+- Caste slurs (English): "quota-wallah"/"reservation cattle" (demeaning use, not policy debate), "lower caste" used as an insult rather than a description, "untouchable" (derogatory use)
+- Communal slurs (Hindi/Hinglish): katwa, mulla/mulle, kafir, malaun, pajeet, "cow piss drinker", "dung worshipper" (phrase-level mockery of religious practice), "sanghi/bhakt" (only when dehumanizing, not political critique — Step 4)
+- Communal slurs (English): "terrorist"/"jihadi" applied to a religious group as a class (not a specific charged individual), "invaders"/"outsiders" applied to a religious community as a class, "cow piss drinker" (also seen in English sentences)
+- Regional slurs (Hindi/Hinglish): bihari/madrasi (pejorative use), bimaru, chinki, ghati, bhaiyya (as slur for North Indians, Mumbai context), "Porki"/"Porkistan" (ethnic slur)
+- Regional slurs (English): "Paki", "chink"/"chinky" (Northeastern Indians), "bloody Bihari/Madrasi", "these North Indians"/"these South Indians" used dismissively as a class
+- Gendered (Hindi/Hinglish): chhakka/hijra (pejorative), "maal"/"item" (objectifying), "randi khana"/"randi rona" (demeaning emotional expression as weakness), "feminazi" (dismissive slur), gender-hierarchy statements ("aurat ghar sambhale")
+- Gendered (English): "slut", "whore", "feminazi", "asking for it", gender-hierarchy statements in English ("women should just stay home")
 
 ---
 
@@ -103,12 +121,14 @@ Common vocabulary (non-exhaustive — use judgment for phonetic/obfuscated varia
 1. **Homonyms:** `chakka` = jackfruit (food context) vs. slur (identity context). `BC` = "Before Christ"/date vs. profanity. `bhakt` = literal devotee vs. political-dehumanization slur (Step 4). Context decides — never pattern-match the bare word.
 2. **Idioms:** `ke chakkar mein`, `chakkar aana`, `chakka jam` — contain slur-adjacent fragments but are benign idioms. Do not trigger on substrings.
 3. **Meta-commentary:** "Randia/Randians" as a subreddit nickname in benign self-referential discussion is not a slur.
-4. **India-Pakistan content:** criticizing the Pakistani government/army/policy = 0 on harassment/hate. Nationalist boasts that don't dehumanize anyone ("Agr hindu army may himat ha") = 0, political rhetoric. Blanket-dehumanizing "Pakistani people" or Indian Muslims as a class (loyalty-questioning, "gaddar" framing) = 1 on discriminatory_hate_speech (communal/regional, per Step 3 — no slur needed).
-5. **Body-shaming/mental-health insults** (motu, paagal, mental, psycho) = `targeted_abuse_harassment: 1` when directed at a person; NOT discriminatory_hate_speech unless also identity-based (e.g. "aurat ko moti nahi hona chahiye" → misogyny: 1). Neutral discussion ("mental health important hai") = 0 on all flags.
-6. **Obfuscation/evasion:** letter repetition (chutiyaaaa), character substitution (ch0@tiya, b5dk), spacing (c h u t i y a), emoji substitution for slur words, leetspeak (bh0$adik3), and occasional reverse spelling all still count for `profanity_vulgarity` — match the intent, not the exact spelling.
+4. **India-Pakistan content:** criticizing the Pakistani government/army/policy = 0 on harassment/hate. Nationalist boasts that don't dehumanize anyone ("Agr hindu army may himat ha") = 0, political rhetoric. Blanket-dehumanizing "Pakistani people" or Indian Muslims as a class (loyalty-questioning, "gaddar" framing) = 1 on discriminatory_hate_speech (communal/regional, per Step 3 — no slur needed), whether stated in Hindi or English.
+5. **Body-shaming/mental-health insults** (motu, paagal, mental, psycho, and the English equivalents "retard(ed)", "crazy", "psycho") = `targeted_abuse_harassment: 1` when directed at a person; NOT discriminatory_hate_speech unless also identity-based (e.g. "aurat ko moti nahi hona chahiye" → misogyny: 1). Neutral discussion ("mental health important hai" / "mental health matters") = 0 on all flags.
+6. **Obfuscation/evasion:** letter repetition (chutiyaaaa), character substitution (ch0@tiya, b5dk), spacing (c h u t i y a), emoji substitution for slur words, leetspeak (bh0$adik3), and occasional reverse spelling all still count for `profanity_vulgarity` — match the intent, not the exact spelling. The same holds for English: censoring with asterisks/symbols (f*ck, sh1t, a$$hole) and spaced-out letters (f u c k) still trigger the flag.
 7. **Topic discussion vs. endorsement:** discussing a controversy as news/debate ("love jihad controversy discussed in news") = 0 on discriminatory_hate_speech. Asserting the conspiracy as fact with hostile intent ("love jihad karke hindu ladkiyon ko fasa rahe hain") = 1.
 8. **Humor without animus:** a joke referencing a region/group with no demeaning framing can be 0 on discriminatory_hate_speech — judge by whether it demeans or just references.
 9. **Icon-mocking:** hostile mockery of a community's cultural/political icons specifically to humiliate the community (e.g. mocking Ambedkar to demean Dalits) counts under Step 3, even without a slur word.
+10. **English homonyms/ambiguous terms:** `retard(ed)` as a dated clinical term in neutral discussion vs. a personal insult — context decides. `gay` as an identity term vs. dismissive filler ("that's so gay") — filler use with no specific target stays at 0 on hate speech even if it reads as `targeted_abuse_harassment`. `cracker` (firework vs. a dated racial slur) is almost always the firework in an Indian-subreddit context — don't over-flag on the bare word.
+11. **Code-switching consistency:** a comment that starts in English and drops into Hindi (or vice versa) mid-sentence should be evaluated as one unit — don't split it into "the English part is 0, the Hindi part is 1." Apply Steps 1-3 to the whole comment, in whichever language(s) it's written.
 
 ---
 
@@ -162,7 +182,20 @@ Common vocabulary (non-exhaustive — use judgment for phonetic/obfuscated varia
 "reservation policy ko revisit karna chahiye, merit ke basis pe" (policy debate) → {"profanity_vulgarity":0,"targeted_abuse_harassment":0,"discriminatory_hate_speech":0,"dimensions":{"caste":0,"communal_religious":0,"regional_xenophobic":0,"misogyny_gender":0}}
 
 "sanghi economic policy criticize karni chahiye" (political critique, Step 4) → {"profanity_vulgarity":0,"targeted_abuse_harassment":0,"discriminatory_hate_speech":0,"dimensions":{"caste":0,"communal_religious":0,"regional_xenophobic":0,"misogyny_gender":0}}
+
+"fuck the Indian government, corrupt as hell" (English profanity, institutional target) → {"profanity_vulgarity":1,"targeted_abuse_harassment":0,"discriminatory_hate_speech":0,"dimensions":{"caste":0,"communal_religious":0,"regional_xenophobic":0,"misogyny_gender":0}}
+
+"you're such a retard, can't you even read the sign" (English personal insult, no identity basis) → {"profanity_vulgarity":0,"targeted_abuse_harassment":1,"discriminatory_hate_speech":0,"dimensions":{"caste":0,"communal_religious":0,"regional_xenophobic":0,"misogyny_gender":0}}
+
+"these bloody Biharis ruin every city they move to" (English, no profanity, regional hate) → {"profanity_vulgarity":0,"targeted_abuse_harassment":0,"discriminatory_hate_speech":1,"dimensions":{"caste":0,"communal_religious":0,"regional_xenophobic":1,"misogyny_gender":0}}
+
+"women should just shut up and stay in the kitchen" (English, no profanity, misogyny) → {"profanity_vulgarity":0,"targeted_abuse_harassment":0,"discriminatory_hate_speech":1,"dimensions":{"caste":0,"communal_religious":0,"regional_xenophobic":0,"misogyny_gender":1}}
+
+"go back to Pakistan, you people don't belong in this country" (English, loyalty-questioning, no slur) → {"profanity_vulgarity":0,"targeted_abuse_harassment":0,"discriminatory_hate_speech":1,"dimensions":{"caste":0,"communal_religious":1,"regional_xenophobic":0,"misogyny_gender":0}}
+
+"Modi's economic policy is fucking stupid, inflation is out of control" (English profanity, professional criticism) → {"profanity_vulgarity":1,"targeted_abuse_harassment":0,"discriminatory_hate_speech":0,"dimensions":{"caste":0,"communal_religious":0,"regional_xenophobic":0,"misogyny_gender":0}}
+
+"I'm such a fucking idiot for missing that deadline" (self-directed English profanity) → {"profanity_vulgarity":1,"targeted_abuse_harassment":0,"discriminatory_hate_speech":0,"dimensions":{"caste":0,"communal_religious":0,"regional_xenophobic":0,"misogyny_gender":0}}
 ```
 
 ---
-
