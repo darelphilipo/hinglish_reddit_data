@@ -90,6 +90,38 @@ try:
 except Exception as e:
     raise RuntimeError(f"❌ DuckDB Extraction failed: {e}")
 
+import html
+import re
+
+def sanitize_reddit_text(text):
+    if not isinstance(text, str):
+        return ""
+
+    # 1. Decode HTML entities (&gt; becomes >, &amp; becomes &)
+    text = html.unescape(text)
+
+    # 2. Extract text from Markdown links [Click Here](http://...) -> Click Here
+    text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
+
+    # 3. Strip all remaining raw URLs (http://..., https://..., www...)
+    text = re.sub(r'http\S+|www\.\S+', '', text)
+
+    # 4. Remove excessive line breaks and multiple spaces (squash to single space)
+    text = re.sub(r'\s+', ' ', text)
+
+    # 5. Remove Zero-Width spaces (often used by trolls to bypass auto-mods)
+    text = text.replace('\u200b', '')
+
+    # 6. Strip leading/trailing whitespace
+    return text.strip()
+
+# Apply the sanitization to your dataframe
+print("🧹 Sanitizing Reddit text to optimize tokens...")
+df['body'] = df['body'].apply(sanitize_reddit_text)
+
+# Drop any rows that became completely empty after removing URLs
+df = df[df['body'].str.len() > 0].reset_index(drop=True)
+
 # ==========================================
 # 3. TEACHER MODEL PROMPT & SYNC FUNCTION
 # ==========================================
