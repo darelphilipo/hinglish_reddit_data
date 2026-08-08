@@ -65,6 +65,7 @@ import random
 
 print("\n🦆 Initializing DuckDB and Fetching Exact Parquet Paths...")
 con = duckdb.connect()
+con.execute("PRAGMA memory_limit='5GB';")
 con.execute("INSTALL httpfs; LOAD httpfs;")
 
 # 🔑 Authenticate DuckDB using your Colab Secret
@@ -144,6 +145,9 @@ if not raw_df.empty:
         sampled_df = sampled_df.sample(n=TOTAL_RECORD_LIMIT, random_state=42).reset_index(drop=True)
     
     df = sampled_df
+    import gc
+    del raw_df
+    gc.collect() # Forces Python to instantly free up the RAM
 else:
     df = raw_df
 
@@ -395,3 +399,64 @@ def analyze_distribution(rdf):
             print(f"r/{sub:<20}: {int(row['sum']):>3}/{int(row['count']):>3} toxic ({row['toxic_pct']:>5.1f}%)")
 
 run_experiment()
+
+# ==========================================
+# 7. HUNTER-SEEKER KEYWORD HARVESTER
+# ==========================================
+import re
+from collections import Counter
+
+def extract_minority_keywords(df, top_n=12):
+    print("\n==================================================")
+    print(" 🕵️ HUNTER-SEEKER DEBUG ALERTS (KEYWORD HARVESTER)")
+    print("==================================================")
+    
+    # 🛑 Comprehensive Hinglish & English Stop Words
+    stop_words = set([
+        "hai", "ki", "ko", "se", "aur", "hi", "mein", "pe", "ye", "yeh", "woh", "tha", "thi", 
+        "ka", "ke", "toh", "bhi", "na", "nahi", "kar", "liye", "kya", "ek", "jo", "tu", "tum",
+        "aap", "ne", "is", "kuch", "koi", "sirf", "sab", "ab", "karna", "baat", "ho", "raha",
+        "the", "a", "an", "and", "or", "but", "if", "for", "to", "of", "in", "on", "with", 
+        "at", "by", "from", "up", "about", "into", "over", "after", "is", "are", "am", "was", 
+        "were", "be", "been", "being", "have", "has", "had", "do", "does", "did", "i", "you", 
+        "he", "she", "it", "we", "they", "this", "that", "these", "those", "my", "your", "his", 
+        "her", "their", "just", "like", "so", "how", "what", "when", "where", "why", "who", 
+        "not", "out", "then", "there", "can", "will", "would", "karo", "log", "wale", "kese"
+    ])
+    
+    # The sub-categories we need to aggressively harvest for
+    target_columns = ['caste', 'communal_religious', 'regional_xenophobic', 'misogyny_gender']
+    
+    for col in target_columns:
+        if col not in df.columns: 
+            continue
+            
+        # Filter for rows where this specific flag was triggered
+        subset = df[df[col] == 1]['body'] 
+        
+        if subset.empty:
+            print(f"[{col}] ⚠️ No data available to analyze.")
+            continue
+            
+        # Combine all text, convert to lowercase, and extract alphanumeric words (3+ chars)
+        all_text = " ".join(subset.astype(str).tolist()).lower()
+        tokens = re.findall(r'\b[a-z]{3,}\b', all_text)
+        
+        # Filter out the stop words
+        meaningful_words = [word for word in tokens if word not in stop_words]
+        
+        # Count frequencies
+        word_counts = Counter(meaningful_words)
+        top_words = word_counts.most_common(top_n)
+        
+        # Format the output for the console
+        signals = ", ".join([f"'{word}' ({count})" for word, count in top_words])
+        print(f"[{col:<18}] Signals: {signals}\n")
+
+# To run it on your freshly saved final dataset:
+# Ensure you are loading the file we just saved in the previous step
+try:
+    final_output_df = pd.read_csv(FINAL_CSV_PATH)
+    extract_minority_keywords(final_output_df)
+except Exception as e:
+    print(f"❌ Could not load final CSV for keyword analysis: {e}")
