@@ -1,7 +1,11 @@
 # subreddit-range-fetch Specification
 
 ## Purpose
-TBD - created by archiving change e2-subreddit-range-fetch. Update Purpose after archive.
+This spec covers the standalone `fetch_subreddit_range_to_hf.py` script and
+its manually triggered workflow, including Arctic Shift pagination,
+filtering/deduplication, graceful empty handling, direct append uploads to
+Hugging Face, failure handling and exit codes, and the manual standalone
+workflow.
 ## Requirements
 ### Requirement: Standalone subreddit range fetch script
 

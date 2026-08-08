@@ -1,7 +1,10 @@
 # fetch-script Specification
 
 ## Purpose
-TBD - created by archiving change fix-fetch-login-rate-limit. Update Purpose after archive.
+This spec covers the subreddit range fetch script
+(`fetch_subreddit_range_to_hf.py`) not calling `huggingface_hub`'s
+`login()`/whoami endpoint at startup, while still authenticating its uploads
+via the `HF_TOKEN` env var passed to each `HfApi.upload_file` call.
 ## Requirements
 ### Requirement: No whoami call at startup
 

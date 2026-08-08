@@ -1,7 +1,10 @@
 # consolidation-workflow Specification
 
 ## Purpose
-TBD - created by archiving change e1-standalone-consolidation-workflow. Update Purpose after archive.
+This spec covers the standalone, manually triggered GitHub Actions workflow
+that runs `consolidate_to_hf.py` independently of the monthly scrape workflow,
+including how the `HF_TOKEN` credential is provided to the script and how the
+script's exit status determines the workflow result.
 ## Requirements
 ### Requirement: Manual standalone consolidation workflow
 

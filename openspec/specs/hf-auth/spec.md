@@ -1,7 +1,9 @@
 # hf-auth Specification
 
 ## Purpose
-TBD - created by archiving change fix-remove-login-from-scripts. Update Purpose after archive.
+This spec covers both `fetch_arctic_to_hf.py` and `consolidate_to_hf.py` not
+calling `login()`/whoami at startup, with authentication handled by the
+`HF_TOKEN` env var for `push_to_hub`/`HfApi` uploads and commits.
 ## Requirements
 ### Requirement: No whoami call at startup
 

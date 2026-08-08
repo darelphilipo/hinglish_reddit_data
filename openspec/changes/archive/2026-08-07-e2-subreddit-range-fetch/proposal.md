@@ -2,6 +2,8 @@
 
 # Proposal: Subreddit Range Fetch to Hugging Face
 
+## Why
+
 Add a standalone Python script and a separate, manually triggered GitHub
 Actions workflow that fetch a date range of Reddit comments for one or more
 subreddits via the Arctic Shift API and append the results directly to the
@@ -15,7 +17,7 @@ cleans the comments, and uploads each non-empty subreddit-month slice directly
 to Hugging Face without needing the batch/checkpoint machinery in
 `fetch_arctic_to_hf.py`.
 
-## Scope
+## What Changes
 
 - Add a new standalone script `fetch_subreddit_range_to_hf.py` modeled on
   `fetch_arctic_to_hf.py`.

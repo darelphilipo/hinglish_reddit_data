@@ -2,6 +2,8 @@
 
 # Proposal: Remove `login()` from the HF upload scripts
 
+## Why
+
 `fetch_arctic_to_hf.py` (line 289) and `consolidate_to_hf.py` (line 93) both
 call `login(token=HF_TOKEN)` from `huggingface_hub`. That call validates the
 token against the strictly rate-limited `/api/whoami-v2` endpoint, which is a
@@ -24,7 +26,7 @@ scripts so no whoami request is made at all.
 This is a blocking fix: it removes the extra, unused whoami request from both
 workflows, preventing startup failures when `/api/whoami-v2` is rate limited.
 
-## Scope
+## What Changes
 
 - Remove the `login(token=HF_TOKEN)` call in `fetch_arctic_to_hf.py`.
 - Remove `login` from the `from huggingface_hub import login` line in

@@ -1,4 +1,8 @@
-# Consolidation Workflow Specification
+# consolidation-workflow Specification
+
+## Purpose
+This capability covers the manually triggered GitHub Actions workflow that runs
+`consolidate_to_hf.py` independently of the monthly scrape workflow.
 
 ## ADDED Requirements
 

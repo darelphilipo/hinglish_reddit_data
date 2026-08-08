@@ -1,4 +1,8 @@
-# Subreddit Range Fetch Specification
+# subreddit-range-fetch Specification
+
+## Purpose
+This capability covers the standalone `fetch_subreddit_range_to_hf.py` script
+and its manually triggered GitHub Actions workflow.
 
 ## ADDED Requirements
 

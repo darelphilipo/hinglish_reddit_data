@@ -2,6 +2,8 @@
 
 # Proposal: Remove `login()` from the subreddit range fetch script
 
+## Why
+
 `fetch_subreddit_range_to_hf.py` calls `login(token=HF_TOKEN)` from
 `huggingface_hub` before fetching. That call validates the token via the
 strictly rate-limited `/api/whoami-v2` endpoint, which returned HTTP 429
@@ -16,7 +18,7 @@ endpoint it does not use.
 This is a blocking fix: it unblocks the `fetch_subreddit_range` workflow,
 which is currently failing at startup before a single page is fetched.
 
-## Scope
+## What Changes
 
 - Remove the `login(token=HF_TOKEN)` call in `fetch_subreddit_range_to_hf.py`.
 - Remove `login` from the `huggingface_hub` import in
