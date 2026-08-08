@@ -1,5 +1,5 @@
 # Hinglish & English Content Moderation — Teacher Model Labeling Prompt
-Version: 6.2 (Decoupled 3-Flag Architecture, v5 content restored, English coverage added) | Hindi-English code-mixed and English, Roman script | Reddit comments (Indian subreddits)
+Hindi-English code-mixed and English, Roman script 
 
 **Philosophy:** When in doubt on harassment/hate speech, output 0. Silencing
 legitimate speech is worse than missing an edge case. Never flag opinions,
