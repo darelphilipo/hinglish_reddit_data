@@ -94,15 +94,14 @@ except Exception as e:
 perf_metrics['prompt_fetch_time'] = time.time() - prompt_start
 
 # ==========================================
-# 3. OPTIMIZED DUCKDB EXTRACTION
+# 3. OPTIMIZED DUCKDB EXTRACTION (WITH NET STATS)
 # ==========================================
 db_start = time.time()
 print(f"\n🦆 [Worker {TARGET_YEAR}] Initializing DuckDB (Dynamic Seed: {SEED_VALUE})...")
 con = duckdb.connect()
 
-# 1. OPTIMIZATION: More threads = faster parallel network downloads
-con.execute("PRAGMA memory_limit='6GB';") # Safely bumped to 6GB
-con.execute("PRAGMA threads=8;")          # Force 8 parallel network connections
+con.execute("PRAGMA memory_limit='6GB';") 
+con.execute("PRAGMA threads=8;")          
 con.execute("INSTALL httpfs; LOAD httpfs;")
 
 if HF_TOKEN:
@@ -116,20 +115,18 @@ if not year_files:
     stop_telemetry.set()
     raise ValueError(f"❌ No Parquet shards found for year {TARGET_YEAR}.")
 
-# 2. OPTIMIZATION: Dynamic Shard Scaling
 target_rows = int(os.environ.get("TARGET_ROWS", 12500))
 if target_rows < 1000:
-    max_shards = 10  # Super fast test run
+    max_shards = 10  
 elif target_rows < 5000:
-    max_shards = 50  # Medium run
+    max_shards = 50  
 else:
-    max_shards = 200 # Full production run
+    max_shards = 200 
 
 selected_shards = random.sample(year_files, min(max_shards, len(year_files)))
 hf_urls = [f"hf://datasets/open-index/arctic/{f}" for f in selected_shards]
 subs_formatted = ", ".join([f"'{s.lower()}'" for s in TARGET_SUBREDDITS])
 
-# 3. OPTIMIZATION: Push filtering deeper into DuckDB to save RAM
 query = f"""
 SELECT id, body, LOWER(subreddit) as subreddit, created_utc, strftime(epoch_ms(created_utc * 1000), '%Y-%m') as year_month
 FROM read_parquet({hf_urls})
@@ -140,18 +137,37 @@ WHERE LOWER(subreddit) IN ({subs_formatted})
 
 print(f"⏳ Extracting candidate records for {TARGET_YEAR} across {len(selected_shards)} shards...")
 
+# --- THE NETWORK SNIFFER HEARTBEAT ---
 duckdb_running = True
 def duckdb_heartbeat():
-    start = time.time()
+    start_time = time.time()
+    # Record the baseline network bytes the moment DuckDB starts
+    net_start = psutil.net_io_counters().bytes_recv
+    last_net = net_start
+    
     while duckdb_running:
-        elapsed = int(time.time() - start)
+        time.sleep(15)
+        if not duckdb_running:
+            break
+            
+        current_time = time.time()
+        elapsed = int(current_time - start_time)
         mins, secs = divmod(elapsed, 60)
-        if elapsed > 0:
-            print(f"   ⏳ [DuckDB Network Scan] Threads active... Elapsed: {mins}m {secs}s")
-        time.sleep(15) 
+        
+        # Calculate Network Stats
+        current_net = psutil.net_io_counters().bytes_recv
+        total_downloaded_mb = (current_net - net_start) / (1024 * 1024)
+        
+        # Calculate speed over the last 15 seconds
+        bytes_in_window = current_net - last_net
+        speed_mb_s = (bytes_in_window / (1024 * 1024)) / 15
+        last_net = current_net
+        
+        print(f"   📡 [HF Network] Time: {mins}m {secs}s | Pulled: {total_downloaded_mb:.1f} MB | Speed: {speed_mb_s:.1f} MB/s")
 
 heartbeat_thread = threading.Thread(target=duckdb_heartbeat, daemon=True)
 heartbeat_thread.start()
+# -------------------------------------
 
 try:
     raw_df = con.query(query).to_df()
@@ -163,7 +179,6 @@ except Exception as e:
 finally:
     duckdb_running = False
     heartbeat_thread.join()
-
 # ==========================================
 # 4. ADVANCED SANITIZATION & DEDUPLICATION
 # ==========================================
