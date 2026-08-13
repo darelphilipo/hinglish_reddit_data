@@ -20,7 +20,14 @@ from cleantext import clean
 # ==========================================
 # 0. TELEMETRY & PROFILER SETUP
 # ==========================================
-perf_metrics = {}
+perf_metrics = {
+    'total_prompt_tokens': 0,
+    'total_completion_tokens': 0,
+    'total_combined_tokens': 0,
+    'total_cache_hits': 0,
+    'total_cache_misses': 0
+}
+token_lock = threading.Lock()
 stop_telemetry = threading.Event()
 
 def resource_monitor():
@@ -41,19 +48,17 @@ TARGET_YEAR = os.environ.get("TARGET_YEAR", "2017")
 RUN_ID = os.environ.get("GITHUB_RUN_ID", str(int(time.time())))
 GITHUB_STARTED_AT = os.environ.get("GITHUB_RUN_STARTED_AT")
 
-# Format the GitHub start time into a safe folder name (e.g. 2026-08-13_13-45-32)
 if GITHUB_STARTED_AT:
     safe_timestamp = GITHUB_STARTED_AT.replace('T', '_').replace(':', '-').replace('Z', '')
 else:
     safe_timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 
-# New Directory Structure
 BASE_OUTPUT_DIR = './labelled_output/'
 TIMESTAMP_DIR = os.path.join(BASE_OUTPUT_DIR, safe_timestamp)
 os.makedirs(TIMESTAMP_DIR, exist_ok=True)
 
 FINAL_CSV_PATH = os.path.join(TIMESTAMP_DIR, f'baseline_tier1_{TARGET_YEAR}.csv')
-LEDGER_PATH = os.path.join(BASE_OUTPUT_DIR, 'seen_ids_ledger.txt') # Kept at root for cross-run tracking
+LEDGER_PATH = os.path.join(BASE_OUTPUT_DIR, 'seen_ids_ledger.txt')
 
 SEED_VALUE = int(RUN_ID) % 100000 
 random.seed(SEED_VALUE)
@@ -65,7 +70,7 @@ TARGET_SUBREDDITS = [
     'arrangedmarriage', 'bollyblindsngossip'
 ]
 
-TARGET_ROWS_PER_JOB = 12500 
+TARGET_ROWS_PER_JOB = int(os.environ.get("TARGET_ROWS", 12500))
 MAX_WORKERS = 10 
 
 OPENCODE_KEY = os.environ.get("OPENCODE_KEY")
@@ -94,7 +99,7 @@ except Exception as e:
 perf_metrics['prompt_fetch_time'] = time.time() - prompt_start
 
 # ==========================================
-# 3. OPTIMIZED DUCKDB EXTRACTION (WITH NET STATS)
+# 3. DUCKDB EXTRACTION (WITH NET STATS)
 # ==========================================
 db_start = time.time()
 print(f"\n🦆 [Worker {TARGET_YEAR}] Initializing DuckDB (Dynamic Seed: {SEED_VALUE})...")
@@ -115,10 +120,9 @@ if not year_files:
     stop_telemetry.set()
     raise ValueError(f"❌ No Parquet shards found for year {TARGET_YEAR}.")
 
-target_rows = int(os.environ.get("TARGET_ROWS", 12500))
-if target_rows < 1000:
+if TARGET_ROWS_PER_JOB < 1000:
     max_shards = 10  
-elif target_rows < 5000:
+elif TARGET_ROWS_PER_JOB < 5000:
     max_shards = 50  
 else:
     max_shards = 200 
@@ -137,11 +141,9 @@ WHERE LOWER(subreddit) IN ({subs_formatted})
 
 print(f"⏳ Extracting candidate records for {TARGET_YEAR} across {len(selected_shards)} shards...")
 
-# --- THE NETWORK SNIFFER HEARTBEAT ---
 duckdb_running = True
 def duckdb_heartbeat():
     start_time = time.time()
-    # Record the baseline network bytes the moment DuckDB starts
     net_start = psutil.net_io_counters().bytes_recv
     last_net = net_start
     
@@ -154,11 +156,8 @@ def duckdb_heartbeat():
         elapsed = int(current_time - start_time)
         mins, secs = divmod(elapsed, 60)
         
-        # Calculate Network Stats
         current_net = psutil.net_io_counters().bytes_recv
         total_downloaded_mb = (current_net - net_start) / (1024 * 1024)
-        
-        # Calculate speed over the last 15 seconds
         bytes_in_window = current_net - last_net
         speed_mb_s = (bytes_in_window / (1024 * 1024)) / 15
         last_net = current_net
@@ -167,7 +166,6 @@ def duckdb_heartbeat():
 
 heartbeat_thread = threading.Thread(target=duckdb_heartbeat, daemon=True)
 heartbeat_thread.start()
-# -------------------------------------
 
 try:
     raw_df = con.query(query).to_df()
@@ -179,6 +177,7 @@ except Exception as e:
 finally:
     duckdb_running = False
     heartbeat_thread.join()
+
 # ==========================================
 # 4. ADVANCED SANITIZATION & DEDUPLICATION
 # ==========================================
@@ -262,12 +261,9 @@ with open(LEDGER_PATH, 'a') as f:
         f.write(f"{cid}\n")
 
 # ==========================================
-# 6. INFERENCE ENGINE (WITH PERFORMANCE TRACKING)
+# 6. INFERENCE ENGINE (THREAD-SAFE TOKEN TRACKING)
 # ==========================================
 api_start = time.time()
-perf_metrics['total_cache_hits'] = 0
-perf_metrics['total_cache_misses'] = 0
-perf_metrics['total_completion_tokens'] = 0
 
 def label_batch(comments_batch, attempt=1):
     numbered = "\n".join(f'ID: {cid} | Comment: {body}' for cid, body in comments_batch)
@@ -283,9 +279,21 @@ def label_batch(comments_batch, attempt=1):
         
         usage_dict = res.usage.model_dump() if hasattr(res.usage, 'model_dump') else vars(res.usage)
         token_details = usage_dict.get('prompt_tokens_details', {}) or {}
-        perf_metrics['total_cache_hits'] += usage_dict.get('prompt_cache_hit_tokens', token_details.get('cached_tokens', 0))
-        perf_metrics['total_cache_misses'] += usage_dict.get('prompt_cache_miss_tokens', usage_dict.get('prompt_tokens', 0) - usage_dict.get('prompt_cache_hit_tokens', 0))
-        perf_metrics['total_completion_tokens'] += usage_dict.get('completion_tokens', 0)
+        
+        p_tokens = usage_dict.get('prompt_tokens', 0)
+        c_tokens = usage_dict.get('completion_tokens', 0)
+        t_tokens = usage_dict.get('total_tokens', p_tokens + c_tokens)
+        
+        c_hits = usage_dict.get('prompt_cache_hit_tokens', token_details.get('cached_tokens', 0))
+        c_misses = usage_dict.get('prompt_cache_miss_tokens', p_tokens - c_hits)
+
+        # Thread-safe accumulation using dedicated lock
+        with token_lock:
+            perf_metrics['total_prompt_tokens'] += p_tokens
+            perf_metrics['total_completion_tokens'] += c_tokens
+            perf_metrics['total_combined_tokens'] += t_tokens
+            perf_metrics['total_cache_hits'] += c_hits
+            perf_metrics['total_cache_misses'] += c_misses
 
         raw_content = res.choices[0].message.content.strip()
         if raw_content.startswith("```"):
@@ -338,20 +346,33 @@ stop_telemetry.set()
 monitor_thread.join()
 
 # ==========================================
-# 7. PERFORMANCE REPORT FOR GITHUB ACTIONS
+# 7. EXPANDED PERFORMANCE & TOKEN LOG
 # ==========================================
+total_lbl = len(final_df)
+p_tokens = perf_metrics['total_prompt_tokens']
+c_tokens = perf_metrics['total_completion_tokens']
+comb_tokens = perf_metrics['total_combined_tokens']
+hits = perf_metrics['total_cache_hits']
+misses = perf_metrics['total_cache_misses']
+
+hit_rate = (hits / p_tokens * 100) if p_tokens > 0 else 0.0
+avg_tokens_per_comment = (comb_tokens / total_lbl) if total_lbl > 0 else 0.0
+
 print("\n==================================================")
 print(" 📈 PIPELINE PERFORMANCE & RESOURCE LOG")
 print("==================================================")
-print(f"Total Rows Labeled    : {len(final_df)}")
-print(f"Prompt Fetch Time     : {perf_metrics['prompt_fetch_time']:.2f}s")
-print(f"DuckDB Extract Time   : {perf_metrics['duckdb_extract_time']:.2f}s")
-print(f"Data Prep & Sanitize  : {perf_metrics['sanitization_and_balancing_time']:.2f}s")
-print(f"API Inference Time    : {perf_metrics['api_inference_time']:.2f}s")
-print(f"Total Workflow Time   : {perf_metrics['total_script_time']:.2f}s")
-print("--- API Token Metrics ---")
-print(f"Cache Hits (Tokens)   : {perf_metrics['total_cache_hits']}")
-print(f"Cache Misses (Tokens) : {perf_metrics['total_cache_misses']}")
-print(f"Generated Out Tokens  : {perf_metrics['total_completion_tokens']}")
+print(f"Total Rows Labeled       : {total_lbl:,}")
+print(f"Prompt Fetch Time        : {perf_metrics['prompt_fetch_time']:.2f}s")
+print(f"DuckDB Extract Time      : {perf_metrics['duckdb_extract_time']:.2f}s")
+print(f"Data Prep & Sanitize     : {perf_metrics['sanitization_and_balancing_time']:.2f}s")
+print(f"API Inference Time       : {perf_metrics['api_inference_time']:.2f}s")
+print(f"Total Workflow Time      : {perf_metrics['total_script_time']:.2f}s")
+print("\n--- 💳 COMPLETE API TOKEN METRICS ---")
+print(f"Total Input / Prompt Tokens : {p_tokens:,}")
+print(f"  ↳ Prompt Cache Hits       : {hits:,} ({hit_rate:.1f}% Cache Hit Rate)")
+print(f"  ↳ Prompt Cache Misses     : {misses:,}")
+print(f"Total Output / Completion   : {c_tokens:,}")
+print(f"Total Combined Tokens       : {comb_tokens:,}")
+print(f"Average Tokens / Comment    : {avg_tokens_per_comment:.1f} tokens/comment")
 print("==================================================")
 print(f"✅ Worker {TARGET_YEAR} Complete! Saved to {FINAL_CSV_PATH}")
