@@ -48,35 +48,23 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: baseline-part-${{ matrix.target_year }}
-          path: ./labelled_output/**/*.csv
+          path: ./labelled_output/chunks/*.csv
           retention-days: 7
 
-  # ==========================================
-  # JOB 2: MERGE & PUSH TO REPO
-  # ==========================================
   merge-and-commit:
-    needs: run-parallel-matrix  # 🚨 Forces this job to wait for all 4 matrix workers to finish
+    needs: run-parallel-matrix
     runs-on: ubuntu-latest
     permissions:
-      contents: write           # 🚨 Grants GitHub Actions permission to push code
+      contents: write
     
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install Pandas
-        run: pip install pandas
-
-      # Downloads all 4 artifacts from Job 1 into the labelled_output folder
       - name: Download Matrix Artifacts
         uses: actions/download-artifact@v4
         with:
-          path: ./labelled_output/
+          path: ./labelled_output/chunks/
           merge-multiple: true
 
       - name: Run Master Merge & Analysis
@@ -84,11 +72,11 @@ jobs:
           PYTHONUNBUFFERED: 1
         run: python step2_merge_and_analyze.py
 
-      # Safely commit and push all newly generated CSVs to the repository
       - name: Commit and Push Datasets
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          # Stage the chunks AND the new master file
           git add labelled_output/
-          git commit -m "Auto-generated: Merged toxic dataset pipeline run" || echo "No changes to commit"
+          git commit -m "Auto-generated: Updated master dataset and chunks" || echo "No changes"
           git push
