@@ -138,34 +138,33 @@ if HF_TOKEN: con.execute(f"CREATE SECRET hf_auth (TYPE HUGGINGFACE, TOKEN '{HF_T
 
 api = HfApi(token=HF_TOKEN)
 parquet_files = [f for f in api.list_repo_files("open-index/arctic", repo_type="dataset") if f.endswith('.parquet') and 'data/comments/' in f]
-selected_shards = random.sample(parquet_files, min(30, len(parquet_files)))
+selected_shards = random.sample(parquet_files, min(40, len(parquet_files))) # Bumped to 40 shards since we are filtering by subreddit
 hf_urls = [f"hf://datasets/open-index/arctic/{f}" for f in selected_shards]
+
+# 🔒 NEW: Lock down the extraction to your specific target communities
+TARGET_SUBREDDITS = [
+    'chodi', 'bakchodi', 'sham_sharma_show', 'desimeta',
+    'indiandankmemes', 'dankinindia', 'saimansays', 'librandu',
+    'unitedstatesofindia', 'indiadiscussion', 'canconfirmiamindian',
+    'arrangedmarriage', 'bollyblindsngossip'
+]
+subs_formatted = ", ".join([f"'{s.lower()}'" for s in TARGET_SUBREDDITS])
 
 safe_keywords = [k.replace("'", "''").lower() for k in final_keywords[:35]]
 filter_clauses = " OR ".join([f"LOWER(body) LIKE '%{k}%'" for k in safe_keywords if k])
-limit_rows = min(5000, current_shortfall * 5) # Pull up to 5x the shortfall to account for false positives
+limit_rows = min(5000, current_shortfall * 5) 
 
+# 🔒 NEW: Added the subreddit filter to the WHERE clause
 query = f"""
 SELECT id, body, LOWER(subreddit) as subreddit, created_utc, strftime(epoch_ms(created_utc * 1000), '%Y-%m') as year_month
 FROM read_parquet({hf_urls})
-WHERE ({filter_clauses}) AND body NOT IN ('[deleted]', '[removed]', '') AND length(body) BETWEEN 10 AND 1000
+WHERE LOWER(subreddit) IN ({subs_formatted})
+  AND ({filter_clauses}) 
+  AND body NOT IN ('[deleted]', '[removed]', '') 
+  AND length(body) BETWEEN 10 AND 1000
 LIMIT {limit_rows}
 """
 harvest_df = con.query(query).to_df()
-print(f"   ↳ Surgically Extracted Candidates: {len(harvest_df)} rows")
-
-if harvest_df.empty:
-    stop_telemetry.set()
-    print("❌ No matching candidates found across Hugging Face shards. Exiting.")
-    exit(0)
-
-print("   ↳ Top Keyword Attribution (Hit Rates):")
-keyword_hits = {}
-for k in safe_keywords:
-    hits = harvest_df['body'].str.contains(k, case=False, na=False).sum()
-    if hits > 0: keyword_hits[k] = hits
-for k, v in sorted(keyword_hits.items(), key=lambda x: x[1], reverse=True)[:5]:
-    print(f"       - '{k}' triggered {v} rows")
 
 # ==========================================
 # 5. SANITIZATION & AUTONOMOUS LABELING
