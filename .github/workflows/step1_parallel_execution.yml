@@ -1,0 +1,49 @@
+name: "Step 1: Parallel Stratified Extraction"
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_rows:
+        description: 'Number of rows to fetch PER YEAR (e.g., 50 for a test, 12500 for full run)'
+        required: true
+        default: '50'
+
+jobs:
+  run-parallel-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target_year: ["2017", "2018", "2019", "2020"]
+      fail-fast: false 
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas tqdm openai duckdb huggingface_hub psutil clean-text requests
+
+      - name: Execute Parallel Worker Script
+        env:
+          OPENCODE_KEY: ${{ secrets.OPENCODE_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          TARGET_YEAR: ${{ matrix.target_year }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_STARTED_AT: ${{ github.run_started_at }}
+          # Pass the UI input directly into the Python script
+          TARGET_ROWS: ${{ github.event.inputs.target_rows }}
+        run: python step1_parallel_worker.py
+
+      - name: Upload Worker CSV Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-part-${{ matrix.target_year }}
+          path: ./labelled_output/**/*.csv
+          retention-days: 7
