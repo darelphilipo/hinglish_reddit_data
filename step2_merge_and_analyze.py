@@ -4,12 +4,15 @@ import os
 
 print("🔄 Initializing Master Merge & Analysis...")
 
-# 1. Locate all CSVs in the labelled_output directory recursively
 BASE_DIR = './labelled_output/'
+MASTER_PATH = os.path.join(BASE_DIR, 'master_baseline_tier1.csv')
+
+# 1. Locate all CSVs but EXCLUDE the old master file from the merge pool
 all_files = glob.glob(os.path.join(BASE_DIR, '**/*.csv'), recursive=True)
+all_files = [f for f in all_files if os.path.abspath(f) != os.path.abspath(MASTER_PATH)]
 
 if not all_files:
-    print("❌ No CSV files found to merge. Exiting.")
+    print("❌ No CSV chunk files found to merge. Exiting.")
     exit(1)
 
 print(f"📦 Found {len(all_files)} dataset chunks. Merging...")
@@ -22,10 +25,9 @@ master_df = pd.concat(df_list, ignore_index=True)
 initial_len = len(master_df)
 master_df.drop_duplicates(subset=['body'], keep='first', inplace=True)
 dedup_count = initial_len - len(master_df)
-print(f"✂️ Dropped {dedup_count} cross-year duplicate comments.")
+print(f"✂️ Dropped {dedup_count} cross-run duplicate comments.")
 
 # 4. Save Master File
-MASTER_PATH = os.path.join(BASE_DIR, 'master_baseline_tier1.csv')
 master_df.to_csv(MASTER_PATH, index=False)
 
 # 5. Print Distribution Stats
@@ -41,7 +43,6 @@ total_clean = total_rows - total_toxic
 print(f"🟢 Clean Comments  : {total_clean:,} ({(total_clean/total_rows)*100:.1f}%)")
 print(f"🔴 Toxic Comments  : {total_toxic:,} ({(total_toxic/total_rows)*100:.1f}%)\n")
 
-# Target Thresholds for our ultimate 50k goal
 categories = [
     ('caste', 1000), ('communal_religious', 1200), 
     ('regional_xenophobic', 1000), ('misogyny_gender', 1000)
@@ -54,4 +55,4 @@ for col, target in categories:
         print(f"{col:<22}: {count:>5} / {target:>4} target | Shortfall: {shortfall}")
 
 print("\n==================================================")
-print(f"✅ Master dataset successfully saved to: {MASTER_PATH}")
+print(f"✅ Master dataset successfully saved and updated at: {MASTER_PATH}")
