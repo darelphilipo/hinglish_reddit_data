@@ -169,7 +169,8 @@ TARGET_SUBREDDITS = [
 ]
 subs_formatted = ", ".join([f"'{s.lower()}'" for s in TARGET_SUBREDDITS])
 
-safe_keywords = [k.replace("'", "''").lower() for k in final_keywords[:35]]
+# Enforce a >3 character limit to prevent SQL substring hijacking (drops 'wha', 'mai', 'yah')
+safe_keywords = [k.replace("'", "''").lower() for k in final_keywords if len(k) > 3][:35]
 filter_clauses = " OR ".join([f"LOWER(body) LIKE '%{k}%'" for k in safe_keywords if k])
 limit_rows = min(5000, current_shortfall * 5)
 
