@@ -168,16 +168,25 @@ print("\n🧹 Sanitizing text...")
 
 def sanitize_text(text):
     if not isinstance(text, str): return ""
-    # 1. Unescape HTML entities
+    
+    # 1. Unescape HTML entities (&gt; becomes >)
     text = html.unescape(text)
+    
     # 2. Strip actual HTML tags using Regex (Safe)
     text = re.sub(r'<[^>]+>', '', text)
-    # 3. Clean Reddit specific formatting
+    
+    # 3. FIX: Replace newlines and tabs with a SPACE (prevents word-smashing like dinduNo.)
+    text = re.sub(r'[\r\n\t]+', ' ', text)
+    
+    # 4. Clean Reddit specific formatting
     text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
     text = re.sub(r'/?u/[A-Za-z0-9_-]+', '', text) 
     
+    # 5. FIX: Strip out zero-width characters and weird unicode artifacts
+    text = text.replace('\u200b', '').replace('\u200c', '').replace('\u200d', '')
+    
     try:
-        # 4. Use clean() without the invalid 'no_html' argument
+        # 6. Use clean() without the invalid 'no_html' argument
         text = clean(text, 
             fix_unicode=True, 
             to_ascii=False, 
@@ -189,7 +198,9 @@ def sanitize_text(text):
         )
     except Exception:
         pass
-    return re.sub(r'\s+', ' ', text).strip()
+        
+    # 7. Collapse any accidental double/triple spaces into a single space
+    return re.sub(r'\s{2,}', ' ', text).strip()
 
 raw_df['body_clean'] = raw_df['body'].apply(sanitize_text)
 raw_df = raw_df[raw_df['body_clean'].str.len() > 5]
