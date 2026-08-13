@@ -1,4 +1,4 @@
-name: "Step 1: Parallel Stratified Extraction"
+name: "Step 1 & 2: Parallel Extraction, Merge & Commit"
 
 on:
   workflow_dispatch:
@@ -9,6 +9,9 @@ on:
         default: '50'
 
 jobs:
+  # ==========================================
+  # JOB 1: PARALLEL WORKERS
+  # ==========================================
   run-parallel-matrix:
     runs-on: ubuntu-latest
     strategy:
@@ -28,8 +31,8 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas tqdm openai duckdb huggingface_hub psutil clean-text requests
           pip install pandas tqdm openai duckdb huggingface_hub psutil clean-text requests unidecode
+
       - name: Execute Parallel Worker Script
         env:
           PYTHONUNBUFFERED: 1
@@ -38,8 +41,7 @@ jobs:
           TARGET_YEAR: ${{ matrix.target_year }}
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_STARTED_AT: ${{ github.run_started_at }}
-          # Pass the UI input directly into the Python script
-          TARGET_ROWS: ${{ github.event.inputs.target_rows }}
+          TARGET_ROWS: ${{ inputs.target_rows }}
         run: python step1_parallel_worker.py
 
       - name: Upload Worker CSV Artifact
@@ -48,3 +50,45 @@ jobs:
           name: baseline-part-${{ matrix.target_year }}
           path: ./labelled_output/**/*.csv
           retention-days: 7
+
+  # ==========================================
+  # JOB 2: MERGE & PUSH TO REPO
+  # ==========================================
+  merge-and-commit:
+    needs: run-parallel-matrix  # 🚨 Forces this job to wait for all 4 matrix workers to finish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write           # 🚨 Grants GitHub Actions permission to push code
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Pandas
+        run: pip install pandas
+
+      # Downloads all 4 artifacts from Job 1 into the labelled_output folder
+      - name: Download Matrix Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./labelled_output/
+          merge-multiple: true
+
+      - name: Run Master Merge & Analysis
+        env:
+          PYTHONUNBUFFERED: 1
+        run: python step2_merge_and_analyze.py
+
+      # Safely commit and push all newly generated CSVs to the repository
+      - name: Commit and Push Datasets
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add labelled_output/
+          git commit -m "Auto-generated: Merged toxic dataset pipeline run" || echo "No changes to commit"
+          git push
