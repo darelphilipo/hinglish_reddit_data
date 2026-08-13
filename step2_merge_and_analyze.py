@@ -4,18 +4,19 @@ import os
 
 print("🔄 Initializing Master Merge & Analysis...")
 
-BASE_DIR = './labelled_output/'
-MASTER_PATH = os.path.join(BASE_DIR, 'master_baseline_tier1.csv')
+# Define paths
+CHUNKS_DIR = './labelled_output/chunks/'
+MASTER_PATH = './labelled_output/master_baseline_tier1.csv'
 
-# 1. Locate all CSVs but EXCLUDE the old master file from the merge pool
-all_files = glob.glob(os.path.join(BASE_DIR, '**/*.csv'), recursive=True)
-all_files = [f for f in all_files if os.path.abspath(f) != os.path.abspath(MASTER_PATH)]
+# 1. Locate all CSVs ONLY in the chunks directory
+all_files = glob.glob(os.path.join(CHUNKS_DIR, '*.csv'))
 
 if not all_files:
-    print("❌ No CSV chunk files found to merge. Exiting.")
+    print("❌ No CSV chunk files found in ./labelled_output/chunks/. Exiting.")
     exit(1)
 
 print(f"📦 Found {len(all_files)} dataset chunks. Merging...")
+
 
 # 2. Merge all chunks
 df_list = [pd.read_csv(file) for file in all_files]
