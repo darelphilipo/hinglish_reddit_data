@@ -146,7 +146,7 @@ except Exception as e:
 
 final_keywords = list(dict.fromkeys(seed_words_only + llm_keywords))
 print(f"   ↳ Generated Keywords : {len(llm_keywords)}")
-print(f"   ↳ Final Deduplicated Lexicon : {len(final_keywords)} target parameters")
+print(f"   ↳ Final Deduplicated Lexicon ({len(final_keywords)} terms): {final_keywords}")
 
 # ==========================================
 # 4. SURGICAL DUCKDB EXTRACTION & ATTRIBUTION
