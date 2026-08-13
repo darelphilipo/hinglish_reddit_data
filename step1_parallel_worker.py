@@ -54,10 +54,11 @@ else:
     safe_timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 
 BASE_OUTPUT_DIR = './labelled_output/'
-TIMESTAMP_DIR = os.path.join(BASE_OUTPUT_DIR, safe_timestamp)
-os.makedirs(TIMESTAMP_DIR, exist_ok=True)
+CHUNKS_DIR = os.path.join(BASE_OUTPUT_DIR, 'chunks/')
+os.makedirs(CHUNKS_DIR, exist_ok=True) # Ensure chunks folder exists
 
-FINAL_CSV_PATH = os.path.join(TIMESTAMP_DIR, f'baseline_tier1_{TARGET_YEAR}.csv')
+# All yearly chunks go into the chunks subfolder
+FINAL_CSV_PATH = os.path.join(CHUNKS_DIR, f'baseline_tier1_{TARGET_YEAR}.csv')
 LEDGER_PATH = os.path.join(BASE_OUTPUT_DIR, 'seen_ids_ledger.txt')
 
 SEED_VALUE = int(RUN_ID) % 100000 
