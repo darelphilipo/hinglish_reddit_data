@@ -94,7 +94,7 @@ except Exception as e:
 perf_metrics['prompt_fetch_time'] = time.time() - prompt_start
 
 # ==========================================
-# 3. DUCKDB EXTRACTION
+# 3. DUCKDB EXTRACTION (WITH HEARTBEAT SPINNER)
 # ==========================================
 db_start = time.time()
 print(f"\n🦆 [Worker {TARGET_YEAR}] Initializing DuckDB (Dynamic Seed: {SEED_VALUE})...")
@@ -128,6 +128,22 @@ WHERE LOWER(subreddit) IN ({subs_formatted})
 """
 
 print(f"⏳ Extracting candidate records for {TARGET_YEAR} across {len(selected_shards)} shards...")
+
+# --- NEW HEARTBEAT DAEMON ---
+duckdb_running = True
+def duckdb_heartbeat():
+    start = time.time()
+    while duckdb_running:
+        elapsed = int(time.time() - start)
+        mins, secs = divmod(elapsed, 60)
+        if elapsed > 0:
+            print(f"   ⏳ [DuckDB Network Scan] Still working... Elapsed: {mins}m {secs}s")
+        time.sleep(15) # Print an update every 15 seconds
+
+heartbeat_thread = threading.Thread(target=duckdb_heartbeat, daemon=True)
+heartbeat_thread.start()
+# -----------------------------
+
 try:
     raw_df = con.query(query).to_df()
     perf_metrics['duckdb_extract_time'] = time.time() - db_start
@@ -135,6 +151,10 @@ try:
 except Exception as e:
     stop_telemetry.set()
     raise RuntimeError(f"❌ DuckDB Extraction crashed: {e}")
+finally:
+    # Kill the heartbeat spinner the moment DuckDB finishes
+    duckdb_running = False
+    heartbeat_thread.join()
 
 # ==========================================
 # 4. ADVANCED SANITIZATION & DEDUPLICATION
