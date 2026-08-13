@@ -69,16 +69,36 @@ current_shortfall = shortfalls[priority_cat]
 print(f"🎯 Harvester Target Identified: {priority_cat.upper()} | Shortfall: {current_shortfall} rows")
 
 # ==========================================
-# 2. ZERO-BLOAT TF-IDF SEED EXTRACTION
+# 2. DYNAMIC THRESHOLDING & TF-IDF SEED EXTRACTION
 # ==========================================
-print("\n📊 [DIAGNOSTIC] Phase 1: Statistical Seed Generation")
+print("\n📊 [DIAGNOSTIC] Phase 1: Dynamic Thresholding & Statistical Seed Generation")
 STOPWORDS_URL = "https://raw.githubusercontent.com/darelphilipo/hinglish_reddit_data/main/prompt/hinglish_stopwords.txt"
 try:
     resp = requests.get(STOPWORDS_URL, timeout=10)
     resp.raise_for_status()
-    stopwords = set(line.strip().lower() for line in resp.text.splitlines() if line.strip())
+    static_stopwords = set(line.strip().lower() for line in resp.text.splitlines() if line.strip())
 except Exception:
-    stopwords = {'hai', 'ki', 'aur', 'mein', 'se', 'ko', 'ka', 'ke', 'ye', 'wo', 'the', 'is', 'a', 'to'}
+    static_stopwords = {'hai', 'ki', 'aur', 'mein', 'se', 'ko', 'ka', 'ke', 'ye', 'wo', 'the', 'is', 'a', 'to'}
+
+def basic_tokenize(text):
+    return re.findall(r'\b[a-z0-9]+\b', str(text).lower())
+
+total_docs = len(df)
+max_doc_threshold = int(total_docs * 0.15) # 15% Ceiling
+
+print(f"   ↳ Analyzing global corpus ({total_docs} rows) to establish dynamic baselines...")
+global_df_freq = collections.Counter()
+for doc in df['body'].tolist():
+    for word in set(basic_tokenize(doc)):
+        global_df_freq[word] += 1
+
+dynamic_stopwords = {w for w, count in global_df_freq.items() if count > max_doc_threshold}
+effective_stopwords = static_stopwords.union(dynamic_stopwords)
+
+print(f"   ↳ Dynamic Threshold Triggered: Auto-purged {len(dynamic_stopwords)} filler words appearing in >15% of comments.")
+if dynamic_stopwords:
+    top_purged = sorted(dynamic_stopwords, key=lambda w: global_df_freq[w], reverse=True)[:5]
+    print(f"       - Top purged terms: {top_purged}")
 
 target_df = df[df[priority_cat] == 1]
 bg_df = df[df[priority_cat] == 0]
@@ -86,8 +106,8 @@ bg_df = df[df[priority_cat] == 0]
 print(f"   ↳ Target Corpus: {len(target_df)} rows | Background Corpus: {len(bg_df)} rows")
 
 def get_tokens(text):
-    words = re.findall(r'\b[a-z0-9]+\b', str(text).lower())
-    return [w for w in words if w not in stopwords and len(w) > 2]
+    words = basic_tokenize(text)
+    return [w for w in words if w not in effective_stopwords and len(w) > 2]
 
 target_tf, bg_df_freq = collections.Counter(), collections.Counter()
 for doc in target_df['body'].tolist(): target_tf.update(get_tokens(doc))
@@ -138,10 +158,9 @@ if HF_TOKEN: con.execute(f"CREATE SECRET hf_auth (TYPE HUGGINGFACE, TOKEN '{HF_T
 
 api = HfApi(token=HF_TOKEN)
 parquet_files = [f for f in api.list_repo_files("open-index/arctic", repo_type="dataset") if f.endswith('.parquet') and 'data/comments/' in f]
-selected_shards = random.sample(parquet_files, min(40, len(parquet_files))) # Bumped to 40 shards since we are filtering by subreddit
+selected_shards = random.sample(parquet_files, min(40, len(parquet_files))) # Bumped up shards for targeted subreddits
 hf_urls = [f"hf://datasets/open-index/arctic/{f}" for f in selected_shards]
 
-# 🔒 NEW: Lock down the extraction to your specific target communities
 TARGET_SUBREDDITS = [
     'chodi', 'bakchodi', 'sham_sharma_show', 'desimeta',
     'indiandankmemes', 'dankinindia', 'saimansays', 'librandu',
@@ -152,9 +171,8 @@ subs_formatted = ", ".join([f"'{s.lower()}'" for s in TARGET_SUBREDDITS])
 
 safe_keywords = [k.replace("'", "''").lower() for k in final_keywords[:35]]
 filter_clauses = " OR ".join([f"LOWER(body) LIKE '%{k}%'" for k in safe_keywords if k])
-limit_rows = min(5000, current_shortfall * 5) 
+limit_rows = min(5000, current_shortfall * 5)
 
-# 🔒 NEW: Added the subreddit filter to the WHERE clause
 query = f"""
 SELECT id, body, LOWER(subreddit) as subreddit, created_utc, strftime(epoch_ms(created_utc * 1000), '%Y-%m') as year_month
 FROM read_parquet({hf_urls})
@@ -165,6 +183,24 @@ WHERE LOWER(subreddit) IN ({subs_formatted})
 LIMIT {limit_rows}
 """
 harvest_df = con.query(query).to_df()
+print(f"   ↳ Surgically Extracted Candidates: {len(harvest_df)} rows")
+
+if harvest_df.empty:
+    stop_telemetry.set()
+    print("❌ No matching candidates found across Hugging Face shards. Exiting.")
+    exit(0)
+
+print("   ↳ Top Keyword Attribution (Hit Rates):")
+keyword_hits = {}
+for k in safe_keywords:
+    hits = harvest_df['body'].str.contains(k, case=False, na=False).sum()
+    if hits > 0: keyword_hits[k] = hits
+for k, v in sorted(keyword_hits.items(), key=lambda x: x[1], reverse=True)[:5]:
+    print(f"       - '{k}' triggered {v} rows")
+
+print("   ↳ Subreddit Distribution of Candidates:")
+sub_dist = harvest_df['subreddit'].value_counts().head(5)
+for sub, count in sub_dist.items(): print(f"       - r/{sub}: {count} rows")
 
 # ==========================================
 # 5. SANITIZATION & AUTONOMOUS LABELING
@@ -173,38 +209,19 @@ print("\n🛡️ [DIAGNOSTIC] Phase 4: Verification & Autonomous Labeling")
 
 def sanitize_text(text):
     if not isinstance(text, str): return ""
-    
-    # 1. Unescape HTML entities (&gt; becomes >)
     text = html.unescape(text)
-    
-    # 2. Strip actual HTML tags using Regex (Safe)
     text = re.sub(r'<[^>]+>', '', text)
-    
-    # 3. FIX: Replace newlines and tabs with a SPACE (prevents word-smashing like dinduNo.)
     text = re.sub(r'[\r\n\t]+', ' ', text)
-    
-    # 4. Clean Reddit specific formatting
     text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
     text = re.sub(r'/?u/[A-Za-z0-9_-]+', '', text) 
-    
-    # 5. FIX: Strip out zero-width characters and weird unicode artifacts
     text = text.replace('\u200b', '').replace('\u200c', '').replace('\u200d', '')
     
     try:
-        # 6. Use clean() without the invalid 'no_html' argument
-        text = clean(text, 
-            fix_unicode=True, 
-            to_ascii=False, 
-            lower=False, 
-            no_line_breaks=True, 
-            no_urls=True, replace_with_url="",
-            no_emails=True, replace_with_email="",
-            no_phone_numbers=True, replace_with_phone_number=""
-        )
+        text = clean(text, fix_unicode=True, to_ascii=False, lower=False, no_line_breaks=True, 
+                     no_urls=True, replace_with_url="", no_emails=True, replace_with_email="", 
+                     no_phone_numbers=True, replace_with_phone_number="")
     except Exception:
         pass
-        
-    # 7. Collapse any accidental double/triple spaces into a single space
     return re.sub(r'\s{2,}', ' ', text).strip()
 
 harvest_df['body_clean'] = harvest_df['body'].apply(sanitize_text)
