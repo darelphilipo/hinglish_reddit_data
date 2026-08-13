@@ -94,14 +94,15 @@ except Exception as e:
 perf_metrics['prompt_fetch_time'] = time.time() - prompt_start
 
 # ==========================================
-# 3. DUCKDB EXTRACTION (WITH HEARTBEAT SPINNER)
+# 3. OPTIMIZED DUCKDB EXTRACTION
 # ==========================================
 db_start = time.time()
 print(f"\n🦆 [Worker {TARGET_YEAR}] Initializing DuckDB (Dynamic Seed: {SEED_VALUE})...")
 con = duckdb.connect()
 
-con.execute("PRAGMA memory_limit='5GB';")
-con.execute("PRAGMA threads=2;") 
+# 1. OPTIMIZATION: More threads = faster parallel network downloads
+con.execute("PRAGMA memory_limit='6GB';") # Safely bumped to 6GB
+con.execute("PRAGMA threads=8;")          # Force 8 parallel network connections
 con.execute("INSTALL httpfs; LOAD httpfs;")
 
 if HF_TOKEN:
@@ -115,10 +116,20 @@ if not year_files:
     stop_telemetry.set()
     raise ValueError(f"❌ No Parquet shards found for year {TARGET_YEAR}.")
 
-selected_shards = random.sample(year_files, min(200, len(year_files)))
+# 2. OPTIMIZATION: Dynamic Shard Scaling
+target_rows = int(os.environ.get("TARGET_ROWS", 12500))
+if target_rows < 1000:
+    max_shards = 10  # Super fast test run
+elif target_rows < 5000:
+    max_shards = 50  # Medium run
+else:
+    max_shards = 200 # Full production run
+
+selected_shards = random.sample(year_files, min(max_shards, len(year_files)))
 hf_urls = [f"hf://datasets/open-index/arctic/{f}" for f in selected_shards]
 subs_formatted = ", ".join([f"'{s.lower()}'" for s in TARGET_SUBREDDITS])
 
+# 3. OPTIMIZATION: Push filtering deeper into DuckDB to save RAM
 query = f"""
 SELECT id, body, LOWER(subreddit) as subreddit, created_utc, strftime(epoch_ms(created_utc * 1000), '%Y-%m') as year_month
 FROM read_parquet({hf_urls})
@@ -129,7 +140,6 @@ WHERE LOWER(subreddit) IN ({subs_formatted})
 
 print(f"⏳ Extracting candidate records for {TARGET_YEAR} across {len(selected_shards)} shards...")
 
-# --- NEW HEARTBEAT DAEMON ---
 duckdb_running = True
 def duckdb_heartbeat():
     start = time.time()
@@ -137,12 +147,11 @@ def duckdb_heartbeat():
         elapsed = int(time.time() - start)
         mins, secs = divmod(elapsed, 60)
         if elapsed > 0:
-            print(f"   ⏳ [DuckDB Network Scan] Still working... Elapsed: {mins}m {secs}s")
-        time.sleep(15) # Print an update every 15 seconds
+            print(f"   ⏳ [DuckDB Network Scan] Threads active... Elapsed: {mins}m {secs}s")
+        time.sleep(15) 
 
 heartbeat_thread = threading.Thread(target=duckdb_heartbeat, daemon=True)
 heartbeat_thread.start()
-# -----------------------------
 
 try:
     raw_df = con.query(query).to_df()
@@ -152,7 +161,6 @@ except Exception as e:
     stop_telemetry.set()
     raise RuntimeError(f"❌ DuckDB Extraction crashed: {e}")
 finally:
-    # Kill the heartbeat spinner the moment DuckDB finishes
     duckdb_running = False
     heartbeat_thread.join()
 
