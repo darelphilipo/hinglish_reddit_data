@@ -89,6 +89,14 @@ print(f"✂️ Dropped {dedup_count} cross-run duplicate comments.")
 # ==========================================
 master_df.to_csv(MASTER_PATH, index=False)
 
+# NEW CLEANUP CODE: Delete the chunks now that they are safely in the Master file
+for file in all_files:
+    try:
+        os.remove(file)
+    except Exception as e:
+        pass
+print("🧹 Cleaned up all processed chunk files.")
+
 total_rows = len(master_df)
 print("\n==================================================")
 print(f" 📊 FINAL MASTER DISTRIBUTION REPORT ({total_rows:,} Rows)")
