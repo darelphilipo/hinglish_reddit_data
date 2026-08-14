@@ -96,14 +96,9 @@ dynamic_stopwords = {w for w, count in global_df_freq.items() if count > max_doc
 effective_stopwords = static_stopwords.union(dynamic_stopwords)
 
 print(f"   ↳ Dynamic Threshold Triggered: Auto-purged {len(dynamic_stopwords)} filler words appearing in >15% of comments.")
-if dynamic_stopwords:
-    top_purged = sorted(dynamic_stopwords, key=lambda w: global_df_freq[w], reverse=True)[:5]
-    print(f"       - Top purged terms: {top_purged}")
 
 target_df = df[df[priority_cat] == 1]
 bg_df = df[df[priority_cat] == 0]
-
-print(f"   ↳ Target Corpus: {len(target_df)} rows | Background Corpus: {len(bg_df)} rows")
 
 def get_tokens(text):
     words = basic_tokenize(text)
@@ -118,8 +113,6 @@ total_bg_docs = max(len(bg_df), 1)
 tfidf_scores = {w: tf * math.log(total_bg_docs / (bg_df_freq.get(w, 0) + 1)) for w, tf in target_tf.items()}
 seed_keywords = sorted(tfidf_scores.items(), key=lambda x: x[1], reverse=True)[:10]
 
-print(f"   ↳ Top 5 Seeds by TF-IDF Score:")
-for w, score in seed_keywords[:5]: print(f"       - '{w}' (Score: {score:.2f})")
 seed_words_only = [w for w, _ in seed_keywords]
 
 # ==========================================
@@ -145,63 +138,107 @@ except Exception as e:
     llm_keywords = []
 
 final_keywords = list(dict.fromkeys(seed_words_only + llm_keywords))
-print(f"   ↳ Generated Keywords : {len(llm_keywords)}")
 print(f"   ↳ Final Deduplicated Lexicon ({len(final_keywords)} terms): {final_keywords}")
 
 # ==========================================
-# 4. SURGICAL DUCKDB EXTRACTION & ATTRIBUTION
+# 4. SURGICAL DUCKDB EXTRACTION (TIME TRAVEL & TIERS)
 # ==========================================
-print("\n🦆 [DIAGNOSTIC] Phase 3: Targeted Hugging Face Extraction")
+print("\n🦆 [DIAGNOSTIC] Phase 3: Targeted Hugging Face Extraction (Multi-Tier)")
 con = duckdb.connect()
 con.execute("PRAGMA memory_limit='6GB'; PRAGMA threads=8; INSTALL httpfs; LOAD httpfs;")
 if HF_TOKEN: con.execute(f"CREATE SECRET hf_auth (TYPE HUGGINGFACE, TOKEN '{HF_TOKEN}');")
 
 api = HfApi(token=HF_TOKEN)
-parquet_files = [f for f in api.list_repo_files("open-index/arctic", repo_type="dataset") if f.endswith('.parquet') and 'data/comments/' in f]
-selected_shards = random.sample(parquet_files, min(40, len(parquet_files))) # Bumped up shards for targeted subreddits
-hf_urls = [f"hf://datasets/open-index/arctic/{f}" for f in selected_shards]
+all_files = api.list_repo_files("open-index/arctic", repo_type="dataset")
 
-TARGET_SUBREDDITS = [
-    'chodi', 'bakchodi', 'sham_sharma_show', 'desimeta',
-    'indiandankmemes', 'dankinindia', 'saimansays', 'librandu',
-    'unitedstatesofindia', 'indiadiscussion', 'canconfirmiamindian',
+# --- SUBREDDIT TIER CONFIGURATION ---
+TIER_1_SUBS = [
+    'chodi', 'bakchodi', 'sham_sharma_show', 'desimeta', 'indiandankmemes', 'dankinindia', 
+    'saimansays', 'librandu', 'unitedstatesofindia', 'indiadiscussion', 'canconfirmiamindian', 
     'arrangedmarriage', 'bollyblindsngossip'
 ]
-subs_formatted = ", ".join([f"'{s.lower()}'" for s in TARGET_SUBREDDITS])
 
-# Enforce a >3 character limit to prevent SQL substring hijacking (drops 'wha', 'mai', 'yah')
+EXPANSION_DICT = {
+    "heavy_1": ["IndiaSpeaks", "india", "indiameme", "funnyIndia", "IndianDankMemes", "CarryMinati", "ipl", "IndianGaming"],
+    "heavy_2": ["bollywood", "developersIndia", "UPSC", "IndianStockMarket", "JEENEETards", "Btechtards", "StartUpIndia", "AskIndia"],
+    "medium_1": ["indianews", "indiadiscussion", "CriticalThinkingIndia", "unitedstatesofindia", "bihar", "uttarpradesh", "delhi", "karnataka", "TamilNadu", "Maharashtra", "gujarat", "Rajasthan", "bangalore", "mumbai", "chennai", "hyderabad", "kolkata"],
+    "medium_2": ["pune", "ahmedabad", "lucknow", "Arrangedmarriage", "RelationshipIndia", "TwoXIndia", "AskIndianWomen", "AskIndianMen", "OffMyChestIndia", "TeenIndia", "IndianTeenagers", "Indiangirlsontinder", "DesiWeddings", "TwentiesIndia", "CricketShitpost", "IndiaCricket", "IndianFootball"],
+    "medium_3": ["indiansports", "RCB", "csk", "chessindia", "SaimanSays", "ShahRukhKhan", "SamayRaina", "thugeshh", "beastboyshub", "sunraybee", "FingMemes", "dankrishu", "ViratKohli", "BollyBlindsNGossip", "InstaCelebsGossip", "bollywoodmemes", "BollywoodFashion"],
+    "medium_4": ["sharktankindia", "biggboss", "IndianTellyTalk", "DHHMemes", "punjabimusic", "kollywood", "tollywood", "IndianCinema", "BollywoodRealism", "IndianOTTbestof", "AnimeMirchi", "animeindian", "BollywoodMusic", "MalayalamMovies", "IndianHipHopHeads", "IndianStreetBets", "IndiaInvestments"],
+    "medium_5": ["personalfinanceindia", "CreditCardsIndia", "CryptoIndia", "mutualfunds", "IndiaTax", "BitcoinIndia", "StockMarketIndia", "FIREIndia", "FatFIREIndia", "IndianStocks", "beermoneyindia", "Frugal_Ind", "CATpreparation", "Indian_Academia", "JEE", "IndiaCareers", "BITSPilani"],
+    "medium_6": ["Indians_StudyAbroad", "IndianWorkplace", "ICSE", "CharteredAccountants", "IndiaBusiness", "smallbusinessindia", "CBSE", "indianmedschool", "CarsIndia", "indianrailways", "indianbikes", "AirTravelIndia", "Indianbooks", "IndianArtAndThinking", "indiafood", "IndianArtAI", "hindi"],
+    "medium_7": ["IndianFoodPhotos", "IndiaCoffee", "PhotographyIndia", "IndiansRead", "IndiaTech", "GadgetsIndia", "Indiangamers", "XboxIndia", "IndiaPS5", "DesiVideoMemes", "indianmemer", "IndianMeyMeys", "IndianMemeTemplates", "desimemes"],
+    "tiny_1": ["AajMaineJana", "Chandigarh", "DesiFragranceAddicts", "DesiKeto", "Fitness_India", "Goa", "HimachalPradesh", "IncredibleIndia", "IndiaNostalgia", "IndiaTrending", "IndianFashionAddicts", "IndianHistory", "IndianMakeupAddicts", "IndianSkincareAddicts", "Indian_flex", "Kerala", "Northeastindia", "Odisha", "SneakersIndia", "SoloTravel_India", "Uttarakhand", "ZyadaKuchNai", "assam", "desitravellers", "gurgaon", "india_tourism", "indiafitcheck", "indianbeautyhauls", "indianfitness", "indiasocial", "watchesindia"]
+}
+
+TIER_2_SUBS = list(TIER_1_SUBS)
+for cat, subs in EXPANSION_DICT.items(): TIER_2_SUBS.extend(subs)
+TIER_2_SUBS = list(set([s.lower() for s in TIER_2_SUBS])) # Deduplicate and lowercase
+
 safe_keywords = [k.replace("'", "''").lower() for k in final_keywords if len(k) > 3][:35]
 filter_clauses = " OR ".join([f"LOWER(body) LIKE '%{k}%'" for k in safe_keywords if k])
 limit_rows = min(5000, current_shortfall * 5)
+CANDIDATE_THRESHOLD = 500
 
-query = f"""
-SELECT id, body, LOWER(subreddit) as subreddit, created_utc, strftime(epoch_ms(created_utc * 1000), '%Y-%m') as year_month
-FROM read_parquet({hf_urls})
-WHERE LOWER(subreddit) IN ({subs_formatted})
-  AND ({filter_clauses}) 
-  AND body NOT IN ('[deleted]', '[removed]', '') 
-  AND length(body) BETWEEN 10 AND 1000
-LIMIT {limit_rows}
-"""
-harvest_df = con.query(query).to_df()
-print(f"   ↳ Surgically Extracted Candidates: {len(harvest_df)} rows")
+# --- TIME TRAVEL & TIER LOOP ---
+start_year = int(os.environ.get("TARGET_YEAR", 2017))
+current_year = start_year
+harvest_df = pd.DataFrame()
+
+while current_year <= 2024 and len(harvest_df) < CANDIDATE_THRESHOLD:
+    print(f"\n   ⏳ Scanning Year: {current_year}")
+    year_files = [f for f in all_files if f.endswith('.parquet') and f'data/comments/{current_year}' in f]
+    
+    if not year_files:
+        print(f"      ⚠️ No data found for {current_year}. Skipping...")
+        current_year += 1
+        continue
+        
+    selected_shards = random.sample(year_files, min(40, len(year_files)))
+    hf_urls = [f"hf://datasets/open-index/arctic/{f}" for f in selected_shards]
+
+    tiers_to_try = [
+        (1, "Core Targeting", TIER_1_SUBS),
+        (2, "Expanded Targeting", TIER_2_SUBS),
+        (3, "Global Wildcard", None)
+    ]
+
+    for tier_num, tier_name, sub_list in tiers_to_try:
+        print(f"      -> Attempting Tier {tier_num} ({tier_name})...")
+        
+        sub_clause = ""
+        if sub_list:
+            subs_formatted = ", ".join([f"'{s}'" for s in sub_list])
+            sub_clause = f"AND LOWER(subreddit) IN ({subs_formatted})"
+            
+        query = f"""
+        SELECT id, body, LOWER(subreddit) as subreddit, created_utc, strftime(epoch_ms(created_utc * 1000), '%Y-%m') as year_month
+        FROM read_parquet({hf_urls})
+        WHERE ({filter_clauses}) 
+          {sub_clause}
+          AND body NOT IN ('[deleted]', '[removed]', '') 
+          AND length(body) BETWEEN 10 AND 1000
+        LIMIT {limit_rows}
+        """
+        
+        temp_df = con.query(query).to_df()
+        
+        if len(temp_df) > len(harvest_df):
+            harvest_df = temp_df
+            
+        print(f"         Yield: {len(temp_df)} candidates.")
+        
+        if len(harvest_df) >= CANDIDATE_THRESHOLD:
+            print("         ✅ Threshold met. Proceeding to verification.")
+            break
+            
+    if len(harvest_df) < CANDIDATE_THRESHOLD:
+        current_year += 1
 
 if harvest_df.empty:
     stop_telemetry.set()
-    print("❌ No matching candidates found across Hugging Face shards. Exiting.")
+    print("❌ Exhausted all Tiers and Years. No matching candidates found.")
     exit(0)
-
-print("   ↳ Top Keyword Attribution (Hit Rates):")
-keyword_hits = {}
-for k in safe_keywords:
-    hits = harvest_df['body'].str.contains(k, case=False, na=False).sum()
-    if hits > 0: keyword_hits[k] = hits
-for k, v in sorted(keyword_hits.items(), key=lambda x: x[1], reverse=True)[:5]:
-    print(f"       - '{k}' triggered {v} rows")
-
-print("   ↳ Subreddit Distribution of Candidates:")
-sub_dist = harvest_df['subreddit'].value_counts().head(5)
-for sub, count in sub_dist.items(): print(f"       - r/{sub}: {count} rows")
 
 # ==========================================
 # 5. SANITIZATION & AUTONOMOUS LABELING
@@ -280,7 +317,7 @@ def label_batch(comments_batch, attempt=1):
 batches = [list(zip(harvest_df["temp_id"], harvest_df["body_clean"]))[i:i + 20] for i in range(0, len(harvest_df), 20)]
 all_labels = []
 
-print(f"🚀 Running Parallel Inference Engine ({MAX_WORKERS} Workers)...")
+print(f"\n🚀 Running Parallel Inference Engine ({MAX_WORKERS} Workers)...")
 with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
     for result in tqdm(executor.map(label_batch, batches), total=len(batches), desc="Labeling Candidates"): 
         all_labels.extend(result)
