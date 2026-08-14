@@ -613,7 +613,7 @@ while current_year <= 2024 and len(harvest_df) < CANDIDATE_THRESHOLD:
         # Create a 20% grace margin (e.g., accepts 400+ instead of strictly 500+)
         SOFT_THRESHOLD = int(CANDIDATE_THRESHOLD * 0.8)
 
-        if len(candidates_df) >= SOFT_THRESHOLD:
+        if len(harvest_df) >= SOFT_THRESHOLD:
             print(f"      ✅ Yielded {len(candidates_df)} candidates. (Passed soft threshold of {SOFT_THRESHOLD}). Proceeding to verification.")
             break
             
