@@ -67,8 +67,14 @@ for file in all_files:
 
 master_df = pd.concat(df_list, ignore_index=True)
 
-# Safety Net: If any duplicate columns somehow survived, merge them by taking the max value (1 overrides 0)
-master_df = master_df.groupby(master_df.columns, axis=1).max()
+# Fix: Rename columns BEFORE concatenating to prevent column duplication
+df_list = []
+for file in all_files:
+    temp_df = pd.read_csv(file)
+    temp_df.rename(columns=rename_mapping, inplace=True)
+    df_list.append(temp_df)
+
+master_df = pd.concat(df_list, ignore_index=True)
 
 # ==========================================
 # 3. DEDUPLICATION
