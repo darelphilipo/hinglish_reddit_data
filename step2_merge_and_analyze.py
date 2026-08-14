@@ -38,7 +38,7 @@ print(f"   ↳ Target: {CLEAN_GOAL:,} Clean Rows | {CATEGORY_GOAL:,} per Toxic C
 print(f"   ↳ Saved to {TARGETS_PATH}")
 
 # ==========================================
-# 2. LOCATE & MERGE CHUNKS
+# 2. LOCATE & MERGE CHUNKS (NOW INCREMENTAL)
 # ==========================================
 all_files = glob.glob(os.path.join(CHUNKS_DIR, '*.csv'))
 
@@ -58,24 +58,21 @@ rename_mapping = {
     "mg": "misogyny_gender"
 }
 
-# Fix: Rename columns BEFORE concatenating to prevent column duplication
 df_list = []
+
+# 🛡️ THE FIX: Load the existing master file so we append to it instead of wiping it
+if os.path.exists(MASTER_PATH):
+    existing_master = pd.read_csv(MASTER_PATH)
+    df_list.append(existing_master)
+    print(f"   ↳ Loaded existing Master Dataset ({len(existing_master)} rows) to preserve history.")
+
+# Load the new chunks
 for file in all_files:
     temp_df = pd.read_csv(file)
     temp_df.rename(columns=rename_mapping, inplace=True)
     df_list.append(temp_df)
 
 master_df = pd.concat(df_list, ignore_index=True)
-
-# Fix: Rename columns BEFORE concatenating to prevent column duplication
-df_list = []
-for file in all_files:
-    temp_df = pd.read_csv(file)
-    temp_df.rename(columns=rename_mapping, inplace=True)
-    df_list.append(temp_df)
-
-master_df = pd.concat(df_list, ignore_index=True)
-
 # ==========================================
 # 3. DEDUPLICATION
 # ==========================================
