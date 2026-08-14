@@ -378,7 +378,8 @@ print(f"LLM Generator Tokens     : {perf_metrics['generator_tokens']:,}")
 print(f"Inference Prompt Tokens  : {perf_metrics['total_prompt_tokens']:,} (Cache Hit: {hit_rate:.1f}%)")
 print(f"Inference Output Tokens  : {perf_metrics['total_completion_tokens']:,}")
 print("==================================================")
-print(f"✅ Verified data committed to: {FINAL_PATH}")import pandas as pd
+print(f"✅ Verified data committed to: {FINAL_PATH}")
+import pandas as pd
 import duckdb
 import os
 import math
