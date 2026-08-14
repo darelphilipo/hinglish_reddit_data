@@ -614,7 +614,7 @@ while current_year <= 2024 and len(harvest_df) < CANDIDATE_THRESHOLD:
         SOFT_THRESHOLD = int(CANDIDATE_THRESHOLD * 0.8)
 
         if len(harvest_df) >= SOFT_THRESHOLD:
-            print(f"      ✅ Yielded {len(candidates_df)} candidates. (Passed soft threshold of {SOFT_THRESHOLD}). Proceeding to verification.")
+            print(f"      ✅ Yielded {len(harvest_df)} candidates. (Passed soft threshold of {SOFT_THRESHOLD}). Proceeding to verification.")
             break
             
     if len(harvest_df) < CANDIDATE_THRESHOLD:
