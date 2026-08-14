@@ -7,6 +7,10 @@ on:
         description: 'Number of rows to fetch PER YEAR (e.g., 50 for a test, 12500 for full run)'
         required: true
         default: '50'
+      global_goal:
+        description: 'Target Total Dataset Size (e.g. 50000)'
+        required: true
+        default: '50000'
 
 jobs:
   # ==========================================
@@ -51,7 +55,7 @@ jobs:
           path: ./labelled_output/chunks/*.csv
           retention-days: 7
 
- # ==========================================
+  # ==========================================
   # JOB 2: MERGE & PUSH TO REPO
   # ==========================================
   merge-and-commit:
@@ -69,7 +73,6 @@ jobs:
         with:
           python-version: '3.12'
 
-      # 🚨 THE MISSING FIX: Install Pandas on the new VM 🚨
       - name: Install Dependencies
         run: pip install pandas
 
@@ -79,9 +82,10 @@ jobs:
           path: ./labelled_output/chunks/
           merge-multiple: true
 
-      - name: Run Master Merge & Analysis
+      - name: Run Master Merge & Analysis (Step 2)
         env:
           PYTHONUNBUFFERED: 1
+          GLOBAL_DATASET_GOAL: ${{ inputs.global_goal }}
         run: python step2_merge_and_analyze.py
 
       - name: Commit and Push Datasets
@@ -89,5 +93,5 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add labelled_output/
-          git commit -m "Auto-generated: Updated master dataset and chunks" || echo "No changes to commit"
+          git commit -m "Auto-generated: Updated master dataset and JSON blueprint" || echo "No changes to commit"
           git push
