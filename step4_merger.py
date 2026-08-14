@@ -4,6 +4,7 @@ import sys
 import glob
 import time
 import re
+import json
 
 print("🔗 Initializing Master Merger & Audit Engine...")
 script_start = time.time()
@@ -14,24 +15,33 @@ script_start = time.time()
 BASE_OUTPUT_DIR = './labelled_output/'
 CHUNKS_DIR = os.path.join(BASE_OUTPUT_DIR, 'chunks/')
 MASTER_PATH = os.path.join(BASE_OUTPUT_DIR, 'master_baseline_tier1.csv')
+TARGETS_PATH = os.path.join(BASE_OUTPUT_DIR, 'pipeline_targets.json')
 
-# The Ultimate Dataset Goals
-TARGETS = {
-    'caste': 1000, 
-    'communal_religious': 1200, 
-    'regional_xenophobic': 1000, 
-    'misogyny_gender': 1000
-}
+if not os.path.exists(MASTER_PATH) or not os.path.exists(TARGETS_PATH):
+    print("❌ CRITICAL ERROR: Master file or Blueprint JSON not found. Run Step 1 & 2 first.")
+    sys.exit(1)
+
+with open(TARGETS_PATH, 'r') as f:
+    blueprint = json.load(f)
+
+TARGETS = blueprint.get("categories", {})
+CLEAN_GOAL = blueprint.get("clean_data", 0)
+GLOBAL_GOAL = blueprint.get("global_goal", 0)
 
 # ==========================================
 # 2. LOAD MASTER & CALCULATE INITIAL STATE
 # ==========================================
-if not os.path.exists(MASTER_PATH):
-    print(f"❌ CRITICAL ERROR: Master file not found at {MASTER_PATH}")
-    sys.exit(1)
-
 master_df = pd.read_csv(MASTER_PATH)
 initial_master_len = len(master_df)
+
+# Safely check for columns
+core_toxic_cols = ['profanity_vulgarity', 'targeted_abuse_harassment', 'discriminatory_hate_speech']
+for col in core_toxic_cols:
+    if col not in master_df.columns:
+        master_df[col] = 0
+
+initial_toxic_mask = master_df[core_toxic_cols].max(axis=1) == 1
+initial_clean_count = initial_master_len - initial_toxic_mask.sum()
 initial_counts = {cat: master_df.get(cat, pd.Series([0])).sum() for cat in TARGETS}
 
 print(f"   ↳ Loaded Master Dataset: {initial_master_len:,} rows.")
@@ -97,23 +107,41 @@ print(" 📊 MASTER DATASET AUDIT & BALANCING REPORT")
 print("==================================================")
 
 final_counts = {cat: merged_df.get(cat, pd.Series([0])).sum() for cat in TARGETS}
-all_targets_met = True
+toxic_targets_met = True
 
-print(f"{'CATEGORY':<25} | {'CURRENT':<8} | {'GOAL':<6} | {'STATUS'}")
-print("-" * 60)
+print(f"{'METRIC':<25} | {'CURRENT':<8} | {'GOAL':<8} | {'STATUS'}")
+print("-" * 65)
 
+# 1. Audit Toxic Categories
 for cat, goal in TARGETS.items():
     current = int(final_counts[cat])
-    growth = int(current - initial_counts[cat])
+    growth = int(current - initial_counts.get(cat, 0))
     growth_str = f"(+{growth})" if growth > 0 else ""
     
     if current >= goal:
         status = "✅ MET"
     else:
         status = f"❌ SHORT ({goal - current} needed)"
-        all_targets_met = False
+        toxic_targets_met = False
 
-    print(f"{cat.upper():<25} | {current:<8} | {goal:<6} | {status} {growth_str}")
+    print(f"{cat.upper():<25} | {current:<8,} | {goal:<8,} | {status} {growth_str}")
+
+print("-" * 65)
+
+# 2. Audit Clean Data
+for col in core_toxic_cols:
+    if col not in merged_df.columns:
+        merged_df[col] = 0
+final_toxic_mask = merged_df[core_toxic_cols].max(axis=1) == 1
+current_clean = len(merged_df) - final_toxic_mask.sum()
+
+clean_growth = int(current_clean - initial_clean_count)
+clean_growth_str = f"(+{clean_growth})" if clean_growth > 0 else ""
+
+clean_target_met = current_clean >= CLEAN_GOAL
+clean_status = "✅ MET" if clean_target_met else f"❌ SHORT ({CLEAN_GOAL - current_clean} needed)"
+
+print(f"{'CLEAN_BACKGROUND_DATA':<25} | {current_clean:<8,} | {CLEAN_GOAL:<8,} | {clean_status} {clean_growth_str}")
 
 print("==================================================")
 print(f"Total Master Rows        : {len(merged_df):,}")
@@ -124,10 +152,14 @@ print("==================================================")
 # ==========================================
 # 6. PIPELINE LOOP TRIGGER
 # ==========================================
-if all_targets_met:
-    print("🎉 SUCCESS: All dataset category goals have been met!")
+if toxic_targets_met and clean_target_met:
+    print("🎉 SUCCESS: All toxic and clean dataset goals have been met!")
     print("Exiting with Code 0. The autonomous pipeline will now hibernate.")
     sys.exit(0)
-else:
-    print("🔄 DEFICIT DETECTED: Returning Exit Code 2 to trigger the Harvester loop.")
+elif not toxic_targets_met:
+    print("🔄 DEFICIT DETECTED (TOXIC): Returning Exit Code 2 to trigger the Harvester loop.")
     sys.exit(2)
+else:
+    print("🔄 DEFICIT DETECTED (CLEAN): Toxic goals met, but clean buffer is short.")
+    print("Returning Exit Code 3 to trigger Step 1 buffer scraper.")
+    sys.exit(3)
