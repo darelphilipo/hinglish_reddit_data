@@ -137,7 +137,8 @@ except Exception as e:
     print(f"   ⚠️ LLM failed: {e}. Using statistical seeds only.")
     llm_keywords = []
 
-final_keywords = list(dict.fromkeys(seed_words_only + llm_keywords))
+# Globally purge any word 3 characters or shorter from the entire lexicon
+final_keywords = list(dict.fromkeys([k for k in (seed_words_only + llm_keywords) if len(k) > 3]))
 print(f"   ↳ Final Deduplicated Lexicon ({len(final_keywords)} terms): {final_keywords}")
 
 # ==========================================
