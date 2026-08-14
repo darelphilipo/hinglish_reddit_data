@@ -95,7 +95,7 @@ except Exception as e:
 perf_metrics['prompt_fetch_time'] = time.time() - prompt_start
 
 # ==========================================
-# 3. DUCKDB EXTRACTION (WITH NET STATS)
+# 3. DUCKDB EXTRACTION (WITH BATCHED RATE-LIMIT SAFETY)
 # ==========================================
 db_start = time.time()
 print(f"\n🦆 [Worker {TARGET_YEAR}] Initializing DuckDB (Dynamic Seed: {SEED_VALUE})...")
@@ -119,18 +119,9 @@ if not year_files:
 # Dynamic shard sampling
 max_shards = 10 if TARGET_ROWS_PER_JOB < 1000 else 200
 selected_shards = random.sample(year_files, min(max_shards, len(year_files)))
-hf_urls = [f"hf://datasets/open-index/arctic/{f}" for f in selected_shards]
 subs_formatted = ", ".join([f"'{s.lower()}'" for s in TARGET_SUBREDDITS])
 
-query = f"""
-SELECT id, body, LOWER(subreddit) as subreddit, created_utc, strftime(epoch_ms(created_utc * 1000), '%Y-%m') as year_month
-FROM read_parquet({hf_urls})
-WHERE LOWER(subreddit) IN ({subs_formatted})
-  AND body NOT IN ('[deleted]', '[removed]', '')
-  AND length(body) BETWEEN 10 AND 1000
-"""
-
-print(f"⏳ Extracting candidate records for {TARGET_YEAR} across {len(selected_shards)} shards...")
+print(f"⏳ Extracting candidate records for {TARGET_YEAR} across {len(selected_shards)} shards (Batched to prevent 429)...")
 
 duckdb_running = True
 def duckdb_heartbeat():
@@ -149,10 +140,39 @@ def duckdb_heartbeat():
 heartbeat_thread = threading.Thread(target=duckdb_heartbeat, daemon=True)
 heartbeat_thread.start()
 
+raw_df_list = []
+chunk_size = 25 # Safe limit to prevent Hugging Face HTTP 429 errors
+
 try:
-    raw_df = con.query(query).to_df()
+    for i in range(0, len(selected_shards), chunk_size):
+        shard_chunk = selected_shards[i:i + chunk_size]
+        hf_urls = [f"hf://datasets/open-index/arctic/{f}" for f in shard_chunk]
+        
+        query = f"""
+        SELECT id, body, LOWER(subreddit) as subreddit, created_utc, strftime(epoch_ms(created_utc * 1000), '%Y-%m') as year_month
+        FROM read_parquet({hf_urls})
+        WHERE LOWER(subreddit) IN ({subs_formatted})
+          AND body NOT IN ('[deleted]', '[removed]', '')
+          AND length(body) BETWEEN 10 AND 1000
+        """
+        
+        try:
+            temp_df = con.query(query).to_df()
+            raw_df_list.append(temp_df)
+        except Exception as e:
+            print(f"   ⚠️ Rate Limit Hit on batch {i//chunk_size + 1}: {e}. Skipping chunk.")
+            time.sleep(5) # Heavy backoff if HF gets mad
+            
+        # 1-second breather between successful queries
+        time.sleep(1)
+
+    raw_df = pd.concat(raw_df_list, ignore_index=True) if raw_df_list else pd.DataFrame()
     perf_metrics['duckdb_extract_time'] = time.time() - db_start
-    print(f"📦 Pulled {len(raw_df)} raw comments.")
+    print(f"📦 Pulled {len(raw_df)} raw comments successfully.")
+    
+    if raw_df.empty:
+        raise ValueError("All extraction batches failed due to rate limits.")
+
 except Exception as e:
     stop_telemetry.set()
     raise RuntimeError(f"❌ DuckDB Extraction crashed: {e}")
