@@ -48,10 +48,6 @@ if not all_files:
 
 print(f"\n📦 Found {len(all_files)} dataset chunks. Merging...")
 
-df_list = [pd.read_csv(file) for file in all_files]
-master_df = pd.concat(df_list, ignore_index=True)
-
-# 🐛 FIX: Expand short JSON keys back to full column names
 rename_mapping = {
     "pv": "profanity_vulgarity",
     "tah": "targeted_abuse_harassment",
@@ -61,7 +57,18 @@ rename_mapping = {
     "rx": "regional_xenophobic",
     "mg": "misogyny_gender"
 }
-master_df.rename(columns=rename_mapping, inplace=True)
+
+# Fix: Rename columns BEFORE concatenating to prevent column duplication
+df_list = []
+for file in all_files:
+    temp_df = pd.read_csv(file)
+    temp_df.rename(columns=rename_mapping, inplace=True)
+    df_list.append(temp_df)
+
+master_df = pd.concat(df_list, ignore_index=True)
+
+# Safety Net: If any duplicate columns somehow survived, merge them by taking the max value (1 overrides 0)
+master_df = master_df.groupby(master_df.columns, axis=1).max()
 
 # ==========================================
 # 3. DEDUPLICATION
