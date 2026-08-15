@@ -121,11 +121,13 @@ except Exception:
 def basic_tokenize(text): return re.findall(r'\b[a-z0-9]+\b', str(text).lower())
 
 global_df_freq = collections.Counter()
-for doc in df['body'].tolist():
+# Added Progress Bar for Global Corpus Analysis
+for doc in tqdm(df['body'].tolist(), desc="   ↳ Analyzing Global Corpus", leave=False):
     for word in set(basic_tokenize(doc)): global_df_freq[word] += 1
 
 dynamic_stopwords = {w for w, count in global_df_freq.items() if count > int(len(df) * 0.15)}
 effective_stopwords = static_stopwords.union(dynamic_stopwords)
+print(f"   ↳ Dynamic Threshold Triggered: Auto-purged {len(dynamic_stopwords)} highly frequent filler words.")
 
 target_tf, bg_df_freq = collections.Counter(), collections.Counter()
 for doc in df[df[priority_cat] == 1]['body'].tolist(): target_tf.update([w for w in basic_tokenize(doc) if w not in effective_stopwords and len(w)>2])
@@ -134,6 +136,7 @@ for doc in df[df[priority_cat] == 0]['body'].tolist():
 
 tfidf_scores = {w: tf * math.log(max(len(bg_df_freq), 1) / (bg_df_freq.get(w, 0) + 1)) for w, tf in target_tf.items()}
 seed_words_only = [w for w, _ in sorted(tfidf_scores.items(), key=lambda x: x[1], reverse=True)[:10]]
+print(f"   ↳ Statistical Seeds Extracted: {seed_words_only}")
 
 # ==========================================
 # 3. LLM MULTIPLIER (SEED EXPANSION)
@@ -150,12 +153,13 @@ try:
     res = client.chat.completions.create(model=MODEL_NAME, messages=[{"role": "user", "content": prompt}], response_format={"type": "json_object"})
     perf_metrics['generator_tokens'] = res.usage.total_tokens
     llm_keywords = json.loads(res.choices[0].message.content.strip()).get("keywords", [])
+    print(f"   ↳ LLM Generated Terms: {llm_keywords}")
 except Exception as e:
     print(f"   ⚠️ LLM failed: {e}. Using statistical seeds only.")
     llm_keywords = []
 
 final_keywords = list(dict.fromkeys([k for k in (cached_terms + seed_words_only + llm_keywords) if len(k) > 3]))
-print(f"   ↳ Final Deduplicated Lexicon ({len(final_keywords)} terms)")
+print(f"   ↳ Final Deduplicated Lexicon ({len(final_keywords)} terms): {final_keywords}")
 
 # Persist to cache
 master_lexicon[priority_cat.upper()] = final_keywords
@@ -177,13 +181,22 @@ T2_QUOTA = max(1, int(SOFT_THRESHOLD * 0.55))
 T3_QUOTA = max(1, int(SOFT_THRESHOLD * 0.25))
 T4_QUOTA = max(1, int(SOFT_THRESHOLD * 0.05))
 
+print(f"   ↳ Target Candidates: {SOFT_THRESHOLD} | Quotas -> T1: {T1_QUOTA} | T2: {T2_QUOTA} | T3: {T3_QUOTA} | T4: {T4_QUOTA}")
+
 harvest_df = pd.DataFrame()
 safe_keywords = [k.replace("'", "''").lower() for k in final_keywords][:35]
 filter_clauses = " OR ".join([f"LOWER(body) LIKE '%{k}%'" for k in safe_keywords if k])
 
+# Statistics Tracker
+extraction_stats = {
+    "Tier 1 (Core)": collections.defaultdict(int),
+    "Tier 2 (Expanded)": collections.defaultdict(int),
+    "Tier 3 (Live API)": collections.defaultdict(int),
+    "Tier 4 (Wildcard)": collections.defaultdict(int)
+}
+
 # --- TIER 3: LIVE ARCTIC API (2025+) ---
 def fetch_tier3_live(subreddits, lexicon, max_rows, time_budget=45):
-    print(f"      -> [Tier 3] Arctic API Live Search (Budget: {time_budget}s, Quota: {max_rows})...")
     session = requests.Session()
     start_time = time.time()
     collected = []
@@ -195,26 +208,32 @@ def fetch_tier3_live(subreddits, lexicon, max_rows, time_budget=45):
     sampled_subs = random.sample(subreddits, min(len(subreddits), 15))
     sampled_terms = random.sample(lexicon, min(len(lexicon), 10))
     
-    for sub in sampled_subs:
-        if len(collected) >= max_rows or (time.time() - start_time) > time_budget: break
-        for term in sampled_terms:
+    total_iters = len(sampled_subs) * len(sampled_terms)
+    
+    # Progress bar for Tier 3 API Calls
+    with tqdm(total=total_iters, desc="      -> [Tier 3] Arctic API Live Search", leave=False) as pbar:
+        for sub in sampled_subs:
             if len(collected) >= max_rows or (time.time() - start_time) > time_budget: break
-            
-            params = {"subreddit": sub, "q": term, "after": AFTER_2025, "limit": 100, "sort": "desc"}
-            try:
-                resp = session.get("https://arctic-shift.photon-reddit.com/api/comments/search", params=params, timeout=10)
-                if resp.status_code == 429:
-                    print("         ⚠️ Arctic API 429 Rate Limit. Backing off Tier 3.")
-                    return pd.DataFrame(collected).drop_duplicates(subset=["id"]) if collected else pd.DataFrame()
-                resp.raise_for_status()
+            for term in sampled_terms:
+                if len(collected) >= max_rows or (time.time() - start_time) > time_budget: break
                 
-                for item in resp.json().get("data", []):
-                    body = item.get("body", "")
-                    if body and body not in ["[removed]", "[deleted]"]:
-                        collected.append({"id": item.get("id"), "body": body, "subreddit": sub, "created_utc": item.get("created_utc")})
-                time.sleep(1.0)  # Throttling to protect rate limits
-            except Exception:
-                continue
+                params = {"subreddit": sub, "q": term, "after": AFTER_2025, "limit": 100, "sort": "desc"}
+                try:
+                    resp = session.get("https://arctic-shift.photon-reddit.com/api/comments/search", params=params, timeout=10)
+                    if resp.status_code == 429:
+                        return pd.DataFrame(collected).drop_duplicates(subset=["id"]) if collected else pd.DataFrame()
+                    resp.raise_for_status()
+                    
+                    for item in resp.json().get("data", []):
+                        body = item.get("body", "")
+                        if body and body not in ["[removed]", "[deleted]"]:
+                            collected.append({"id": item.get("id"), "body": body, "subreddit": sub, "created_utc": item.get("created_utc")})
+                    time.sleep(1.0)
+                except Exception:
+                    pass
+                finally:
+                    pbar.update(1)
+                    
     df = pd.DataFrame(collected)
     if not df.empty:
         df = df.drop_duplicates(subset=["id"])
@@ -224,7 +243,7 @@ def fetch_tier3_live(subreddits, lexicon, max_rows, time_budget=45):
 t3_df = fetch_tier3_live(TIER2_SUBS, final_keywords, T3_QUOTA)
 if not t3_df.empty:
     harvest_df = pd.concat([harvest_df, t3_df], ignore_index=True)
-    print(f"         Yield: {len(t3_df)} candidates from Live API.")
+    extraction_stats["Tier 3 (Live API)"]["2025+"] = len(t3_df)
 
 # --- TIER 1, 2, & 4: DUCKDB ARCHIVE (2017-2024) ---
 con = duckdb.connect()
@@ -236,66 +255,93 @@ all_files = api.list_repo_files("open-index/arctic", repo_type="dataset")
 t1_df, t2_df, t4_df = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 current_year = int(os.environ.get("TARGET_YEAR", 2017))
 
-while current_year <= 2024 and (len(t1_df) < T1_QUOTA or len(t2_df) < T2_QUOTA):
-    year_files = [f for f in all_files if f.endswith('.parquet') and f'data/comments/{current_year}' in f]
-    if not year_files:
-        current_year += 1; continue
-        
-    hf_urls = [f"hf://datasets/open-index/arctic/{f}" for f in random.sample(year_files, min(40, len(year_files)))]
-
-    def duckdb_extract(sub_list, quota, limit=5000):
-        if not sub_list:
-            sub_clause = ""
-        else:
-            subs_formatted = ", ".join([f"'{s.replace(chr(39), chr(39)+chr(39))}'" for s in sub_list])
-            sub_clause = f"AND LOWER(subreddit) IN ({subs_formatted})"
+# Progress bar for DuckDB Time Travel
+with tqdm(total=(2024 - current_year + 1), desc="      -> [Tier 1 & 2] DuckDB Time Travel", leave=False) as pbar:
+    while current_year <= 2024 and (len(t1_df) < T1_QUOTA or len(t2_df) < T2_QUOTA):
+        year_files = [f for f in all_files if f.endswith('.parquet') and f'data/comments/{current_year}' in f]
+        if not year_files:
+            current_year += 1; pbar.update(1); continue
             
-        query = f"""
-        SELECT id, body, LOWER(subreddit) as subreddit 
-        FROM read_parquet({hf_urls}) 
-        WHERE ({filter_clauses}) {sub_clause} AND body NOT IN ('[deleted]', '[removed]', '') 
-        LIMIT {limit}
-        """
-        res_df = con.query(query).to_df()
-        if len(res_df) > quota: res_df = res_df.sample(quota)
-        return res_df
+        hf_urls = [f"hf://datasets/open-index/arctic/{f}" for f in random.sample(year_files, min(40, len(year_files)))]
 
-    # Tier 1
-    if len(t1_df) < T1_QUOTA:
-        t1_new = duckdb_extract(TIER1_SUBS, T1_QUOTA - len(t1_df))
-        if not t1_new.empty:
-            t1_df = pd.concat([t1_df, t1_new]).drop_duplicates(subset=['id'])
-    
-    # Tier 2
-    if len(t2_df) < T2_QUOTA:
-        t2_new = duckdb_extract(TIER2_SUBS, T2_QUOTA - len(t2_df))
-        if not t2_new.empty:
-            t2_df = pd.concat([t2_df, t2_new]).drop_duplicates(subset=['id'])
+        def duckdb_extract(sub_list, quota, limit=5000):
+            if not sub_list:
+                sub_clause = ""
+            else:
+                subs_formatted = ", ".join([f"'{s.replace(chr(39), chr(39)+chr(39))}'" for s in sub_list])
+                sub_clause = f"AND LOWER(subreddit) IN ({subs_formatted})"
+                
+            query = f"""
+            SELECT id, body, LOWER(subreddit) as subreddit 
+            FROM read_parquet({hf_urls}) 
+            WHERE ({filter_clauses}) {sub_clause} AND body NOT IN ('[deleted]', '[removed]', '') 
+            LIMIT {limit}
+            """
+            res_df = con.query(query).to_df()
+            if len(res_df) > quota: res_df = res_df.sample(quota)
+            return res_df
+
+        # Tier 1
+        if len(t1_df) < T1_QUOTA:
+            t1_new = duckdb_extract(TIER1_SUBS, T1_QUOTA - len(t1_df))
+            if not t1_new.empty:
+                t1_df = pd.concat([t1_df, t1_new]).drop_duplicates(subset=['id'])
+                extraction_stats["Tier 1 (Core)"][current_year] += len(t1_new)
         
-    current_year += 1
+        # Tier 2
+        if len(t2_df) < T2_QUOTA:
+            t2_new = duckdb_extract(TIER2_SUBS, T2_QUOTA - len(t2_df))
+            if not t2_new.empty:
+                t2_df = pd.concat([t2_df, t2_new]).drop_duplicates(subset=['id'])
+                extraction_stats["Tier 2 (Expanded)"][current_year] += len(t2_new)
+            
+        current_year += 1
+        pbar.update(1)
 
 if not t1_df.empty or not t2_df.empty:
     harvest_df = pd.concat([harvest_df, t1_df, t2_df]).drop_duplicates(subset=['id'])
-print(f"      -> DuckDB Yield: Tier 1 ({len(t1_df)}), Tier 2 ({len(t2_df)}). Total gathered: {len(harvest_df)}")
 
 # --- TIER 4: GLOBAL WILDCARD FALLBACK ---
 if len(harvest_df) < SOFT_THRESHOLD:
     deficit = SOFT_THRESHOLD - len(harvest_df)
-    print(f"      -> [Tier 4] Global Fallback. Deficit: {deficit}...")
-    t4_df = duckdb_extract([], deficit)
-    if not t4_df.empty:
-        harvest_df = pd.concat([harvest_df, t4_df]).drop_duplicates(subset=['id'])
-        print(f"         Yield: {len(t4_df)} candidates.")
+    t4_year = 2024
+    print(f"      -> [Tier 4] Global Fallback Activated. Hunting for {deficit} rows in {t4_year}...")
+    t4_files = [f for f in all_files if f.endswith('.parquet') and f'data/comments/{t4_year}' in f]
+    if t4_files:
+        hf_urls = [f"hf://datasets/open-index/arctic/{f}" for f in random.sample(t4_files, min(40, len(t4_files)))]
+        
+        query = f"""
+        SELECT id, body, LOWER(subreddit) as subreddit 
+        FROM read_parquet({hf_urls}) 
+        WHERE ({filter_clauses}) AND body NOT IN ('[deleted]', '[removed]', '') 
+        LIMIT 5000
+        """
+        t4_df = con.query(query).to_df()
+        if len(t4_df) > deficit: t4_df = t4_df.sample(deficit)
+        
+        if not t4_df.empty:
+            harvest_df = pd.concat([harvest_df, t4_df]).drop_duplicates(subset=['id'])
+            extraction_stats["Tier 4 (Wildcard)"][t4_year] += len(t4_df)
 
 if harvest_df.empty:
     stop_telemetry.set()
     print("❌ Exhausted all Tiers. No matching candidates found.")
     exit(0)
 
+# --- PRINT STATISTICAL BREAKDOWN ---
+print("\n📈 [EXTRACTION YIELD STATISTICS]")
+for tier, year_data in extraction_stats.items():
+    total_rows = sum(year_data.values())
+    if total_rows > 0:
+        year_breakdown = " | ".join([f"{y}: {count} rows" for y, count in sorted(year_data.items())])
+        print(f"   ✅ {tier}: {total_rows} total rows -> ({year_breakdown})")
+print(f"   -------------------------------------------------")
+print(f"   🚀 Total Harvested Pool: {len(harvest_df)} Candidates")
+
 # ==========================================
 # 5. SANITIZATION & AUTONOMOUS LABELING
 # ==========================================
-print(f"\n🛡️ [DIAGNOSTIC] Phase 4: Verification of {len(harvest_df)} Candidates")
+print(f"\n🛡️ [DIAGNOSTIC] Phase 4: Verification of Candidates")
 
 def sanitize_text(text):
     if not isinstance(text, str): return ""
@@ -307,7 +353,9 @@ def sanitize_text(text):
     except Exception: pass
     return re.sub(r'\s{2,}', ' ', text).strip()
 
-harvest_df['body_clean'] = harvest_df['body'].apply(sanitize_text)
+# Progress bar for sanitization
+tqdm.pandas(desc="   ↳ Sanitizing text data", leave=False)
+harvest_df['body_clean'] = harvest_df['body'].progress_apply(sanitize_text)
 harvest_df['temp_id'] = harvest_df.index.astype(str)
 
 try: SYSTEM_PROMPT = requests.get("https://raw.githubusercontent.com/darelphilipo/hinglish_reddit_data/main/prompt/System_Prompt", timeout=10).text.strip()
