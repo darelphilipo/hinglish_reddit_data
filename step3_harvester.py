@@ -12,7 +12,7 @@ import threading
 import psutil
 import html
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from openai import OpenAI
 from huggingface_hub import HfApi
@@ -37,7 +37,8 @@ def resource_monitor():
         ram = psutil.virtual_memory()
         cpu = psutil.cpu_percent(interval=None)
         print(f"   [⚙️ SYSTEM] RAM: {ram.used / (1024**3):.2f}GB ({ram.percent}%) | CPU: {cpu}%")
-        time.sleep(30) 
+        # Reduced memory logging to exactly 1 minute intervals
+        time.sleep(60) 
 
 monitor_thread = threading.Thread(target=resource_monitor, daemon=True)
 monitor_thread.start()
@@ -121,11 +122,14 @@ except Exception:
 def basic_tokenize(text): return re.findall(r'\b[a-z0-9]+\b', str(text).lower())
 
 global_df_freq = collections.Counter()
-# Added Progress Bar for Global Corpus Analysis
-for doc in tqdm(df['body'].tolist(), desc="   ↳ Analyzing Global Corpus", leave=False):
+corpus_list = df['body'].tolist()
+total_corpus = len(corpus_list)
+
+# Progress Bar forced to 10% increments
+for doc in tqdm(corpus_list, desc="   ↳ Analyzing Global Corpus", miniters=max(1, total_corpus//10), maxinterval=float('inf'), leave=False):
     for word in set(basic_tokenize(doc)): global_df_freq[word] += 1
 
-dynamic_stopwords = {w for w, count in global_df_freq.items() if count > int(len(df) * 0.15)}
+dynamic_stopwords = {w for w, count in global_df_freq.items() if count > int(total_corpus * 0.15)}
 effective_stopwords = static_stopwords.union(dynamic_stopwords)
 print(f"   ↳ Dynamic Threshold Triggered: Auto-purged {len(dynamic_stopwords)} highly frequent filler words.")
 
@@ -161,7 +165,6 @@ except Exception as e:
 final_keywords = list(dict.fromkeys([k for k in (cached_terms + seed_words_only + llm_keywords) if len(k) > 3]))
 print(f"   ↳ Final Deduplicated Lexicon ({len(final_keywords)} terms): {final_keywords}")
 
-# Persist to cache
 master_lexicon[priority_cat.upper()] = final_keywords
 try:
     with open(LEXICON_CONFIG_PATH, "w", encoding="utf-8") as f:
@@ -175,7 +178,6 @@ print("\n🦆 [DIAGNOSTIC] Phase 3: Quota-Controlled Extraction")
 CANDIDATE_THRESHOLD = 500
 SOFT_THRESHOLD = int(CANDIDATE_THRESHOLD * 0.8)
 
-# Fractional Quotas
 T1_QUOTA = max(1, int(SOFT_THRESHOLD * 0.15))
 T2_QUOTA = max(1, int(SOFT_THRESHOLD * 0.55))
 T3_QUOTA = max(1, int(SOFT_THRESHOLD * 0.25))
@@ -187,7 +189,6 @@ harvest_df = pd.DataFrame()
 safe_keywords = [k.replace("'", "''").lower() for k in final_keywords][:35]
 filter_clauses = " OR ".join([f"LOWER(body) LIKE '%{k}%'" for k in safe_keywords if k])
 
-# Statistics Tracker
 extraction_stats = {
     "Tier 1 (Core)": collections.defaultdict(int),
     "Tier 2 (Expanded)": collections.defaultdict(int),
@@ -197,6 +198,7 @@ extraction_stats = {
 
 # --- TIER 3: LIVE ARCTIC API (2025+) ---
 def fetch_tier3_live(subreddits, lexicon, max_rows, time_budget=45):
+    print(f"      -> [Tier 3] Arctic API Live Search (Target: {max_rows} rows | Budget: {time_budget}s)...")
     session = requests.Session()
     start_time = time.time()
     collected = []
@@ -207,11 +209,10 @@ def fetch_tier3_live(subreddits, lexicon, max_rows, time_budget=45):
 
     sampled_subs = random.sample(subreddits, min(len(subreddits), 15))
     sampled_terms = random.sample(lexicon, min(len(lexicon), 10))
-    
     total_iters = len(sampled_subs) * len(sampled_terms)
     
-    # Progress bar for Tier 3 API Calls
-    with tqdm(total=total_iters, desc="      -> [Tier 3] Arctic API Live Search", leave=False) as pbar:
+    # Progress Bar forced to 10% increments
+    with tqdm(total=total_iters, desc="         ↳ Scraping API", miniters=max(1, total_iters//10), maxinterval=float('inf'), leave=False) as pbar:
         for sub in sampled_subs:
             if len(collected) >= max_rows or (time.time() - start_time) > time_budget: break
             for term in sampled_terms:
@@ -244,8 +245,10 @@ t3_df = fetch_tier3_live(TIER2_SUBS, final_keywords, T3_QUOTA)
 if not t3_df.empty:
     harvest_df = pd.concat([harvest_df, t3_df], ignore_index=True)
     extraction_stats["Tier 3 (Live API)"]["2025+"] = len(t3_df)
+print(f"         ✅ Yield: {len(t3_df)} candidates from Live API.")
 
 # --- TIER 1, 2, & 4: DUCKDB ARCHIVE (2017-2024) ---
+print(f"      -> Searching DuckDB Archives (2017-2024)")
 con = duckdb.connect()
 con.execute("PRAGMA memory_limit='6GB'; PRAGMA threads=8; INSTALL httpfs; LOAD httpfs;")
 if HF_TOKEN: con.execute(f"CREATE SECRET hf_auth (TYPE HUGGINGFACE, TOKEN '{HF_TOKEN}');")
@@ -255,48 +258,49 @@ all_files = api.list_repo_files("open-index/arctic", repo_type="dataset")
 t1_df, t2_df, t4_df = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 current_year = int(os.environ.get("TARGET_YEAR", 2017))
 
-# Progress bar for DuckDB Time Travel
-with tqdm(total=(2024 - current_year + 1), desc="      -> [Tier 1 & 2] DuckDB Time Travel", leave=False) as pbar:
-    while current_year <= 2024 and (len(t1_df) < T1_QUOTA or len(t2_df) < T2_QUOTA):
-        year_files = [f for f in all_files if f.endswith('.parquet') and f'data/comments/{current_year}' in f]
-        if not year_files:
-            current_year += 1; pbar.update(1); continue
-            
-        hf_urls = [f"hf://datasets/open-index/arctic/{f}" for f in random.sample(year_files, min(40, len(year_files)))]
-
-        def duckdb_extract(sub_list, quota, limit=5000):
-            if not sub_list:
-                sub_clause = ""
-            else:
-                subs_formatted = ", ".join([f"'{s.replace(chr(39), chr(39)+chr(39))}'" for s in sub_list])
-                sub_clause = f"AND LOWER(subreddit) IN ({subs_formatted})"
-                
-            query = f"""
-            SELECT id, body, LOWER(subreddit) as subreddit 
-            FROM read_parquet({hf_urls}) 
-            WHERE ({filter_clauses}) {sub_clause} AND body NOT IN ('[deleted]', '[removed]', '') 
-            LIMIT {limit}
-            """
-            res_df = con.query(query).to_df()
-            if len(res_df) > quota: res_df = res_df.sample(quota)
-            return res_df
-
-        # Tier 1
-        if len(t1_df) < T1_QUOTA:
-            t1_new = duckdb_extract(TIER1_SUBS, T1_QUOTA - len(t1_df))
-            if not t1_new.empty:
-                t1_df = pd.concat([t1_df, t1_new]).drop_duplicates(subset=['id'])
-                extraction_stats["Tier 1 (Core)"][current_year] += len(t1_new)
+def duckdb_extract(sub_list, hf_urls_list, quota, limit=5000):
+    if not sub_list:
+        sub_clause = ""
+    else:
+        subs_formatted = ", ".join([f"'{s.replace(chr(39), chr(39)+chr(39))}'" for s in sub_list])
+        sub_clause = f"AND LOWER(subreddit) IN ({subs_formatted})"
         
-        # Tier 2
-        if len(t2_df) < T2_QUOTA:
-            t2_new = duckdb_extract(TIER2_SUBS, T2_QUOTA - len(t2_df))
-            if not t2_new.empty:
-                t2_df = pd.concat([t2_df, t2_new]).drop_duplicates(subset=['id'])
-                extraction_stats["Tier 2 (Expanded)"][current_year] += len(t2_new)
-            
-        current_year += 1
-        pbar.update(1)
+    query = f"""
+    SELECT id, body, LOWER(subreddit) as subreddit 
+    FROM read_parquet({hf_urls_list}) 
+    WHERE ({filter_clauses}) {sub_clause} AND body NOT IN ('[deleted]', '[removed]', '') 
+    LIMIT {limit}
+    """
+    res_df = con.query(query).to_df()
+    if len(res_df) > quota: res_df = res_df.sample(quota)
+    return res_df
+
+while current_year <= 2024 and (len(t1_df) < T1_QUOTA or len(t2_df) < T2_QUOTA):
+    print(f"         ⏳ [Year {current_year}]")
+    year_files = [f for f in all_files if f.endswith('.parquet') and f'data/comments/{current_year}' in f]
+    if not year_files:
+        print("            ⚠️ No data found. Skipping.")
+        current_year += 1; continue
+        
+    hf_urls = [f"hf://datasets/open-index/arctic/{f}" for f in random.sample(year_files, min(40, len(year_files)))]
+
+    # Tier 1 Explicit Search
+    if len(t1_df) < T1_QUOTA:
+        t1_new = duckdb_extract(TIER1_SUBS, hf_urls, T1_QUOTA - len(t1_df))
+        if not t1_new.empty:
+            t1_df = pd.concat([t1_df, t1_new]).drop_duplicates(subset=['id'])
+            extraction_stats["Tier 1 (Core)"][current_year] += len(t1_new)
+        print(f"            ↳ Tier 1 Yield: {len(t1_new)} (Running Total: {len(t1_df)}/{T1_QUOTA})")
+    
+    # Tier 2 Explicit Search
+    if len(t2_df) < T2_QUOTA:
+        t2_new = duckdb_extract(TIER2_SUBS, hf_urls, T2_QUOTA - len(t2_df))
+        if not t2_new.empty:
+            t2_df = pd.concat([t2_df, t2_new]).drop_duplicates(subset=['id'])
+            extraction_stats["Tier 2 (Expanded)"][current_year] += len(t2_new)
+        print(f"            ↳ Tier 2 Yield: {len(t2_new)} (Running Total: {len(t2_df)}/{T2_QUOTA})")
+        
+    current_year += 1
 
 if not t1_df.empty or not t2_df.empty:
     harvest_df = pd.concat([harvest_df, t1_df, t2_df]).drop_duplicates(subset=['id'])
@@ -305,30 +309,22 @@ if not t1_df.empty or not t2_df.empty:
 if len(harvest_df) < SOFT_THRESHOLD:
     deficit = SOFT_THRESHOLD - len(harvest_df)
     t4_year = 2024
-    print(f"      -> [Tier 4] Global Fallback Activated. Hunting for {deficit} rows in {t4_year}...")
+    print(f"      -> [Tier 4] Global Fallback Activated. Hunting for Deficit: {deficit} rows...")
     t4_files = [f for f in all_files if f.endswith('.parquet') and f'data/comments/{t4_year}' in f]
     if t4_files:
         hf_urls = [f"hf://datasets/open-index/arctic/{f}" for f in random.sample(t4_files, min(40, len(t4_files)))]
-        
-        query = f"""
-        SELECT id, body, LOWER(subreddit) as subreddit 
-        FROM read_parquet({hf_urls}) 
-        WHERE ({filter_clauses}) AND body NOT IN ('[deleted]', '[removed]', '') 
-        LIMIT 5000
-        """
-        t4_df = con.query(query).to_df()
-        if len(t4_df) > deficit: t4_df = t4_df.sample(deficit)
+        t4_df = duckdb_extract([], hf_urls, deficit)
         
         if not t4_df.empty:
             harvest_df = pd.concat([harvest_df, t4_df]).drop_duplicates(subset=['id'])
             extraction_stats["Tier 4 (Wildcard)"][t4_year] += len(t4_df)
+            print(f"         ✅ Tier 4 Yield: {len(t4_df)} candidates.")
 
 if harvest_df.empty:
     stop_telemetry.set()
     print("❌ Exhausted all Tiers. No matching candidates found.")
     exit(0)
 
-# --- PRINT STATISTICAL BREAKDOWN ---
 print("\n📈 [EXTRACTION YIELD STATISTICS]")
 for tier, year_data in extraction_stats.items():
     total_rows = sum(year_data.values())
@@ -353,9 +349,9 @@ def sanitize_text(text):
     except Exception: pass
     return re.sub(r'\s{2,}', ' ', text).strip()
 
-# Progress bar for sanitization
-tqdm.pandas(desc="   ↳ Sanitizing text data", leave=False)
-harvest_df['body_clean'] = harvest_df['body'].progress_apply(sanitize_text)
+total_pool = len(harvest_df)
+# Progress Bar forced to 10% increments
+harvest_df['body_clean'] = [sanitize_text(text) for text in tqdm(harvest_df['body'], desc="   ↳ Sanitizing text data", miniters=max(1, total_pool//10), maxinterval=float('inf'), leave=False)]
 harvest_df['temp_id'] = harvest_df.index.astype(str)
 
 try: SYSTEM_PROMPT = requests.get("https://raw.githubusercontent.com/darelphilipo/hinglish_reddit_data/main/prompt/System_Prompt", timeout=10).text.strip()
@@ -388,10 +384,12 @@ def label_batch(comments_batch, attempt=1):
 batches = [list(zip(harvest_df["temp_id"], harvest_df["body_clean"]))[i:i + 20] for i in range(0, len(harvest_df), 20)]
 all_labels = []
 
-print(f"\n🚀 Running Parallel Inference Engine ({MAX_WORKERS} Workers)...")
+print(f"\n🚀 Running Asynchronous Inference Engine ({MAX_WORKERS} Workers)...")
 with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-    for result in tqdm(executor.map(label_batch, batches), total=len(batches), desc="Labeling Candidates"): 
-        all_labels.extend(result)
+    futures = [executor.submit(label_batch, b) for b in batches]
+    # As_completed ensures smooth updates without freezing, forced to 10% increments
+    for future in tqdm(as_completed(futures), total=len(batches), desc="   ↳ Labeling Candidates", miniters=max(1, len(batches)//10), maxinterval=float('inf')):
+        all_labels.extend(future.result())
 
 labels_df = pd.DataFrame(all_labels)
 if 'id' in labels_df.columns: labels_df.drop(columns=["id"], inplace=True)
