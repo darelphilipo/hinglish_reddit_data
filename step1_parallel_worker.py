@@ -9,7 +9,7 @@ import re
 import requests
 import psutil
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 from openai import OpenAI
 from huggingface_hub import HfApi
@@ -25,7 +25,12 @@ perf_metrics = {
     'total_completion_tokens': 0,
     'total_combined_tokens': 0,
     'total_cache_hits': 0,
-    'total_cache_misses': 0
+    'total_cache_misses': 0,
+    'prompt_fetch_time': 0.0,
+    'duckdb_extract_time': 0.0,
+    'sanitization_and_balancing_time': 0.0,
+    'api_inference_time': 0.0,
+    'total_script_time': 0.0
 }
 token_lock = threading.Lock()
 stop_telemetry = threading.Event()
@@ -50,21 +55,15 @@ GITHUB_STARTED_AT = os.environ.get("GITHUB_RUN_STARTED_AT")
 
 BASE_OUTPUT_DIR = './labelled_output/'
 CHUNKS_DIR = os.path.join(BASE_OUTPUT_DIR, 'chunks/')
-os.makedirs(CHUNKS_DIR, exist_ok=True) # Ensure chunks folder exists
+os.makedirs(CHUNKS_DIR, exist_ok=True)
 
-# All yearly chunks go into the chunks subfolder
 FINAL_CSV_PATH = os.path.join(CHUNKS_DIR, f'baseline_tier1_{TARGET_YEAR}.csv')
 LEDGER_PATH = os.path.join(BASE_OUTPUT_DIR, 'seen_ids_ledger.txt')
+SUBREDDIT_CONFIG_PATH = "prompt/subreddits.json"
+SUBREDDIT_URL = "https://raw.githubusercontent.com/darelphilipo/hinglish_reddit_data/main/prompt/subreddits.json"
 
 SEED_VALUE = int(RUN_ID) % 100000 
 random.seed(SEED_VALUE)
-
-TARGET_SUBREDDITS = [
-    'chodi', 'bakchodi', 'sham_sharma_show', 'desimeta',
-    'indiandankmemes', 'dankinindia', 'saimansays', 'librandu',
-    'unitedstatesofindia', 'indiadiscussion', 'canconfirmiamindian',
-    'arrangedmarriage', 'bollyblindsngossip'
-]
 
 TARGET_ROWS_PER_JOB = int(os.environ.get("TARGET_ROWS", 12500))
 MAX_WORKERS = 10 
@@ -79,8 +78,52 @@ client = OpenAI(api_key=OPENCODE_KEY, base_url="https://opencode.ai/zen/go/v1")
 MODEL_NAME = "deepseek-v4-flash"
 
 # ==========================================
-# 2. DYNAMIC SYSTEM PROMPT FETCH
+# 2. LOAD SUBREDDITS & DYNAMIC SYSTEM PROMPT
 # ==========================================
+print(f"\n🔧 Loading Subreddit Configurations (80/20 Target Split)...")
+TIER1_SUBS, TIER2_SUBS = [], []
+seen_tier2 = set()
+
+# Load subreddits from local file or remote fallback
+sub_data = None
+if os.path.exists(SUBREDDIT_CONFIG_PATH):
+    try:
+        with open(SUBREDDIT_CONFIG_PATH, "r", encoding="utf-8") as f:
+            sub_data = json.load(f)
+    except Exception as e:
+        print(f"⚠️ Failed reading local {SUBREDDIT_CONFIG_PATH}: {e}")
+
+if not sub_data:
+    try:
+        resp = requests.get(SUBREDDIT_URL, timeout=10)
+        resp.raise_for_status()
+        sub_data = resp.json()
+    except Exception as e:
+        stop_telemetry.set()
+        raise RuntimeError(f"❌ Failed to fetch subreddits.json from GitHub: {e}")
+
+config_toggles = sub_data.get("config", {})
+categories = sub_data.get("categories", {})
+
+# Tier 1 = toxicity_focused (80% target)
+if config_toggles.get("toxicity_focused", 1) == 1:
+    TIER1_SUBS = [s.lower() for s in categories.get("toxicity_focused", [])]
+
+# Tier 2 = all other active categories (20% target)
+for cat_name, sub_list in categories.items():
+    if cat_name != "toxicity_focused" and config_toggles.get(cat_name, 1) == 1:
+        for s in sub_list:
+            s_clean = s.lower()
+            if s_clean not in seen_tier2 and s_clean not in TIER1_SUBS:
+                seen_tier2.add(s_clean)
+                TIER2_SUBS.append(s_clean)
+
+T1_QUOTA = max(1, int(TARGET_ROWS_PER_JOB * 0.80))
+T2_QUOTA = max(1, TARGET_ROWS_PER_JOB - T1_QUOTA)
+
+print(f"   ↳ Tier 1 (Toxicity Focused): {len(TIER1_SUBS)} subreddits | Quota: {T1_QUOTA:,} rows")
+print(f"   ↳ Tier 2 (General / Regional): {len(TIER2_SUBS)} subreddits | Quota: {T2_QUOTA:,} rows")
+
 PROMPT_URL = "https://raw.githubusercontent.com/darelphilipo/hinglish_reddit_data/main/prompt/System_Prompt"
 prompt_start = time.time()
 try:
@@ -116,12 +159,10 @@ if not year_files:
     stop_telemetry.set()
     raise ValueError(f"❌ No Parquet shards found for year {TARGET_YEAR}.")
 
-# Dynamic shard sampling
 max_shards = 10 if TARGET_ROWS_PER_JOB < 1000 else 200
 selected_shards = random.sample(year_files, min(max_shards, len(year_files)))
-subs_formatted = ", ".join([f"'{s.lower()}'" for s in TARGET_SUBREDDITS])
 
-print(f"⏳ Extracting candidate records for {TARGET_YEAR} across {len(selected_shards)} shards (Batched to prevent 429)...")
+print(f"⏳ Extracting records for {TARGET_YEAR} across {len(selected_shards)} shards (Batched to prevent 429)...")
 
 duckdb_running = True
 def duckdb_heartbeat():
@@ -140,35 +181,41 @@ def duckdb_heartbeat():
 heartbeat_thread = threading.Thread(target=duckdb_heartbeat, daemon=True)
 heartbeat_thread.start()
 
-raw_df_list = []
-chunk_size = 25 # Safe limit to prevent Hugging Face HTTP 429 errors
-
-try:
+def extract_subreddits(sub_list, tier_name):
+    if not sub_list:
+        return pd.DataFrame()
+    subs_formatted = ", ".join([f"'{s.replace(chr(39), chr(39)+chr(39))}'" for s in sub_list])
+    raw_list = []
+    chunk_size = 25
+    
     for i in range(0, len(selected_shards), chunk_size):
         shard_chunk = selected_shards[i:i + chunk_size]
         hf_urls = [f"hf://datasets/open-index/arctic/{f}" for f in shard_chunk]
         
         query = f"""
-        SELECT id, body, LOWER(subreddit) as subreddit, created_utc, strftime(epoch_ms(created_utc * 1000), '%Y-%m') as year_month
+        SELECT id, body, LOWER(subreddit) as subreddit, created_utc, strftime(epoch_ms(created_utc * 1000), '%Y-%m') as year_month, '{tier_name}' as tier_label
         FROM read_parquet({hf_urls})
         WHERE LOWER(subreddit) IN ({subs_formatted})
           AND body NOT IN ('[deleted]', '[removed]', '')
           AND length(body) BETWEEN 10 AND 1000
         """
-        
         try:
             temp_df = con.query(query).to_df()
-            raw_df_list.append(temp_df)
+            raw_list.append(temp_df)
         except Exception as e:
-            print(f"   ⚠️ Rate Limit Hit on batch {i//chunk_size + 1}: {e}. Skipping chunk.")
-            time.sleep(5) # Heavy backoff if HF gets mad
+            print(f"   ⚠️ [{tier_name}] Rate Limit on batch {i//chunk_size + 1}: {e}. Skipping chunk.")
+            time.sleep(5)
             
-        # 1-second breather between successful queries
         time.sleep(1)
+        
+    return pd.concat(raw_list, ignore_index=True) if raw_list else pd.DataFrame()
 
-    raw_df = pd.concat(raw_df_list, ignore_index=True) if raw_df_list else pd.DataFrame()
+try:
+    t1_raw_df = extract_subreddits(TIER1_SUBS, "Tier 1")
+    t2_raw_df = extract_subreddits(TIER2_SUBS, "Tier 2")
+    raw_df = pd.concat([t1_raw_df, t2_raw_df], ignore_index=True)
     perf_metrics['duckdb_extract_time'] = time.time() - db_start
-    print(f"📦 Pulled {len(raw_df)} raw comments successfully.")
+    print(f"📦 Pulled raw comments: Tier 1 = {len(t1_raw_df):,} | Tier 2 = {len(t2_raw_df):,} | Total = {len(raw_df):,}")
     
     if raw_df.empty:
         raise ValueError("All extraction batches failed due to rate limits.")
@@ -195,18 +242,18 @@ def sanitize_text(text):
     # 2. Strip actual HTML tags using Regex (Safe)
     text = re.sub(r'<[^>]+>', '', text)
     
-    # 3. FIX: Replace newlines and tabs with a SPACE (prevents word-smashing like dinduNo.)
+    # 3. Replace newlines and tabs with a space
     text = re.sub(r'[\r\n\t]+', ' ', text)
     
     # 4. Clean Reddit specific formatting
     text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
     text = re.sub(r'/?u/[A-Za-z0-9_-]+', '', text) 
     
-    # 5. FIX: Strip out zero-width characters and weird unicode artifacts
+    # 5. Strip zero-width characters
     text = text.replace('\u200b', '').replace('\u200c', '').replace('\u200d', '')
     
     try:
-        # 6. Use clean() without the invalid 'no_html' argument
+        # 6. Clean text normalization
         text = clean(text, 
             fix_unicode=True, 
             to_ascii=False, 
@@ -219,7 +266,7 @@ def sanitize_text(text):
     except Exception:
         pass
         
-    # 7. Collapse any accidental double/triple spaces into a single space
+    # 7. Collapse multi-spaces into single space
     return re.sub(r'\s{2,}', ' ', text).strip()
 
 raw_df['body_clean'] = raw_df['body'].apply(sanitize_text)
@@ -240,33 +287,51 @@ if os.path.exists(LEDGER_PATH):
     print(f"🛡️ Filtered out {prev_len - len(raw_df)} comments processed in previous workflow runs.")
 
 # ==========================================
-# 5. BULLETPROOF STRATIFIED BALANCING
+# 5. STRATIFIED 80/20 BALANCING
 # ==========================================
-print("\n⚖️ Balancing sampling evenly across Subreddits & Months...")
-raw_df['bucket'] = raw_df['subreddit'].astype(str) + "_" + raw_df['year_month'].astype(str)
-groups = raw_df['bucket'].unique()
+print("\n⚖️ Balancing sampling evenly across Subreddits, Months, and Tiers...")
 
-sampled_indices = []
-if len(groups) > 0:
-    samples_per_bucket = max(1, TARGET_ROWS_PER_JOB // len(groups))
-    for bucket in groups:
-        b_rows = raw_df[raw_df['bucket'] == bucket]
-        sampled_indices.extend(b_rows.sample(n=min(len(b_rows), samples_per_bucket), random_state=SEED_VALUE).index.tolist())
+def balance_tier_pool(tier_df, quota):
+    if tier_df.empty:
+        return pd.DataFrame()
+    tier_df = tier_df.copy()
+    tier_df['bucket'] = tier_df['subreddit'].astype(str) + "_" + tier_df['year_month'].astype(str)
+    groups = tier_df['bucket'].unique()
+    sampled_indices = []
+    
+    if len(groups) > 0:
+        samples_per_bucket = max(1, quota // len(groups))
+        for bucket in groups:
+            b_rows = tier_df[tier_df['bucket'] == bucket]
+            sampled_indices.extend(b_rows.sample(n=min(len(b_rows), samples_per_bucket), random_state=SEED_VALUE).index.tolist())
+            
+    balanced = tier_df.loc[sampled_indices].reset_index(drop=True)
+    
+    if len(balanced) < quota:
+        needed = quota - len(balanced)
+        remaining = tier_df.index.difference(balanced.index)
+        if not remaining.empty:
+            balanced = pd.concat([balanced, tier_df.loc[remaining].sample(n=min(len(remaining), needed), random_state=SEED_VALUE)], ignore_index=True)
+            
+    return balanced
 
-df = raw_df.loc[sampled_indices].reset_index(drop=True)
+t1_balanced = balance_tier_pool(raw_df[raw_df['tier_label'] == "Tier 1"], T1_QUOTA)
+t2_balanced = balance_tier_pool(raw_df[raw_df['tier_label'] == "Tier 2"], T2_QUOTA)
+
+# Combine tiers and handle surplus/deficit to match TARGET_ROWS_PER_JOB
+df = pd.concat([t1_balanced, t2_balanced], ignore_index=True)
 
 if len(df) < TARGET_ROWS_PER_JOB:
-    needed = TARGET_ROWS_PER_JOB - len(df)
-    remaining = raw_df.index.difference(df.index)
-    if not remaining.empty:
-        df = pd.concat([df, raw_df.loc[remaining].sample(n=min(len(remaining), needed), random_state=SEED_VALUE)], ignore_index=True)
+    deficit = TARGET_ROWS_PER_JOB - len(df)
+    remaining_raw = raw_df.index.difference(df.index)
+    if not remaining_raw.empty:
+        df = pd.concat([df, raw_df.loc[remaining_raw].sample(n=min(len(remaining_raw), deficit), random_state=SEED_VALUE)], ignore_index=True)
 
-df.drop(columns=['bucket'], inplace=True, errors='ignore')
-df.drop(columns=['index'], inplace=True, errors='ignore')
-
+df.drop(columns=['bucket', 'index', 'tier_label'], inplace=True, errors='ignore')
 df['temp_id'] = df.index.astype(str)
 perf_metrics['sanitization_and_balancing_time'] = time.time() - sanitize_start
-print(f"🎯 Final Balanced Pool for {TARGET_YEAR}: {len(df)} rows.")
+
+print(f"🎯 Final Balanced Pool for {TARGET_YEAR}: {len(df):,} rows (Tier 1: {len(t1_balanced):,} | Tier 2: {len(t2_balanced):,}).")
 
 with open(LEDGER_PATH, 'a') as f:
     for cid in df['id'].tolist(): f.write(f"{cid}\n")
@@ -329,14 +394,13 @@ if df.empty:
 batches = [list(zip(df["temp_id"], df["body_clean"]))[i:i + 20] for i in range(0, len(df), 20)]
 all_labels = []
 
-print(f"\n🚀 Running Parallel Inference on {len(df)} rows across {len(batches)} batches...")
+print(f"\n🚀 Running Parallel Inference on {len(df):,} rows across {len(batches):,} batches...")
 with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
     for result in tqdm(executor.map(label_batch, batches), total=len(batches), desc=f"Labeling {TARGET_YEAR}"): 
         all_labels.extend(result)
 
 labels_df = pd.DataFrame(all_labels)
 
-# 🐛 FIX: Force drop the dummy 'id' returned by the LLM
 if 'id' in labels_df.columns: 
     labels_df.drop(columns=["id"], inplace=True)
 labels_df["temp_id"] = labels_df["temp_id"].astype(str)
@@ -351,7 +415,7 @@ stop_telemetry.set()
 monitor_thread.join()
 
 # ==========================================
-# 7. PERFORMANCE LOG
+# 7. COMPLETE PERFORMANCE & RESOURCE LOG
 # ==========================================
 total_lbl = len(final_df)
 p_tokens = perf_metrics['total_prompt_tokens']
