@@ -118,7 +118,7 @@ for cat_name, sub_list in categories.items():
                 seen_tier2.add(s_clean)
                 TIER2_SUBS.append(s_clean)
 
-T1_QUOTA = max(1, int(TARGET_ROWS_PER_JOB * 0.80))
+T1_QUOTA = max(1, int(TARGET_ROWS_PER_JOB * 0.70))
 T2_QUOTA = max(1, TARGET_ROWS_PER_JOB - T1_QUOTA)
 
 print(f"   ↳ Tier 1 (Toxicity Focused): {len(TIER1_SUBS)} subreddits | Quota: {T1_QUOTA:,} rows")
