@@ -3,24 +3,54 @@ name: "Step 1 & 2: Parallel Extraction, Merge & Commit"
 on:
   workflow_dispatch:
     inputs:
-      target_rows:
-        description: 'Number of rows to fetch PER YEAR (e.g., 50 for a test, 12500 for full run)'
-        required: true
-        default: '50'
-      global_goal:
-        description: 'Target Total Dataset Size (e.g. 50000)'
+      total_rows:
+        description: 'Target Total Dataset Size (e.g., 50000)'
         required: true
         default: '50000'
+      start_year:
+        description: 'Start Year (e.g., 2017)'
+        required: true
+        default: '2017'
+      end_year:
+        description: 'End Year (e.g., 2020)'
+        required: true
+        default: '2020'
 
 jobs:
   # ==========================================
-  # JOB 1: PARALLEL WORKERS
+  # JOB 1: DYNAMIC MATH & MATRIX SETUP
+  # ==========================================
+  setup-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix_years: ${{ steps.generate.outputs.matrix_years }}
+      rows_per_year: ${{ steps.generate.outputs.rows_per_year }}
+    steps:
+      - name: Calculate Quotas and Year Array
+        id: generate
+        run: |
+          START=${{ inputs.start_year }}
+          END=${{ inputs.end_year }}
+          TOTAL=${{ inputs.total_rows }}
+          
+          # Dynamically build the JSON array of years (e.g., ["2017", "2018"])
+          YEARS_JSON=$(python -c "import json; print(json.dumps([str(y) for y in range($START, $END + 1)]))")
+          echo "matrix_years=$YEARS_JSON" >> $GITHUB_OUTPUT
+          
+          # Calculate the exact row quota per worker
+          NUM_YEARS=$(( END - START + 1 ))
+          ROWS_PER_YEAR=$(( TOTAL / NUM_YEARS ))
+          echo "rows_per_year=$ROWS_PER_YEAR" >> $GITHUB_OUTPUT
+
+  # ==========================================
+  # JOB 2: PARALLEL WORKERS
   # ==========================================
   run-parallel-matrix:
+    needs: setup-matrix
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        target_year: ["2017", "2018", "2019", "2020"]
+        target_year: ${{ fromJson(needs.setup-matrix.outputs.matrix_years) }}
       fail-fast: false 
 
     steps:
@@ -45,7 +75,7 @@ jobs:
           TARGET_YEAR: ${{ matrix.target_year }}
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_STARTED_AT: ${{ github.run_started_at }}
-          TARGET_ROWS: ${{ inputs.target_rows }}
+          TARGET_ROWS: ${{ needs.setup-matrix.outputs.rows_per_year }}
         run: python step1_parallel_worker.py
 
       - name: Upload Worker CSV Artifact
@@ -56,7 +86,7 @@ jobs:
           retention-days: 7
 
   # ==========================================
-  # JOB 2: MERGE & PUSH TO REPO
+  # JOB 3: MERGE & PUSH TO REPO
   # ==========================================
   merge-and-commit:
     needs: run-parallel-matrix
@@ -85,7 +115,7 @@ jobs:
       - name: Run Master Merge & Analysis (Step 2)
         env:
           PYTHONUNBUFFERED: 1
-          GLOBAL_DATASET_GOAL: ${{ inputs.global_goal }}
+          GLOBAL_DATASET_GOAL: ${{ inputs.total_rows }}
         run: python step2_merge_and_analyze.py
 
       - name: Commit and Push Datasets
