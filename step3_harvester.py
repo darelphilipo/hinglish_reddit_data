@@ -18,7 +18,7 @@ from openai import OpenAI
 from huggingface_hub import HfApi
 from cleantext import clean
 
-print("🌾 Initializing Autonomous Harvester: 4-Tier Hybrid Engine...")
+print("🌾 Initializing Autonomous Harvester: Regional-Strict 3-Tier Engine...")
 
 # ==========================================
 # 0. TELEMETRY & PROFILER SETUP
@@ -37,7 +37,6 @@ def resource_monitor():
         ram = psutil.virtual_memory()
         cpu = psutil.cpu_percent(interval=None)
         print(f"   [⚙️ SYSTEM] RAM: {ram.used / (1024**3):.2f}GB ({ram.percent}%) | CPU: {cpu}%")
-        # Reduced memory logging to exactly 1 minute intervals
         time.sleep(60) 
 
 monitor_thread = threading.Thread(target=resource_monitor, daemon=True)
@@ -93,7 +92,7 @@ try:
                         seen_tier2.add(s.lower())
                         TIER2_SUBS.append(s)
     TIER1_SUBS = list(set(TIER1_SUBS))
-    print(f"🔧 Loaded Config: Tier 1 ({len(TIER1_SUBS)} subs), Tier 2/3 ({len(TIER2_SUBS)} subs)")
+    print(f"🔧 Loaded Config: Tier 1 ({len(TIER1_SUBS)} subs), Tier 2 Archive ({len(TIER2_SUBS)} subs)")
 except Exception as e:
     print(f"⚠️ Failed to load {SUBREDDIT_CONFIG_PATH}: {e}. Falling back to default list.")
     TIER1_SUBS = ['chodi', 'bakchodi', 'IndiaSpeaks']
@@ -125,13 +124,12 @@ global_df_freq = collections.Counter()
 corpus_list = df['body'].tolist()
 total_corpus = len(corpus_list)
 
-# Progress Bar forced to 10% increments
 for doc in tqdm(corpus_list, desc="   ↳ Analyzing Global Corpus", miniters=max(1, total_corpus//10), maxinterval=float('inf'), leave=False):
     for word in set(basic_tokenize(doc)): global_df_freq[word] += 1
 
 dynamic_stopwords = {w for w, count in global_df_freq.items() if count > int(total_corpus * 0.15)}
 effective_stopwords = static_stopwords.union(dynamic_stopwords)
-print(f"   ↳ Dynamic Threshold Triggered: Auto-purged {len(dynamic_stopwords)} highly frequent filler words.")
+print(f"   ↳ Dynamic Threshold Triggered: Auto-purged {len(dynamic_stopwords)} filler words.")
 
 target_tf, bg_df_freq = collections.Counter(), collections.Counter()
 for doc in df[df[priority_cat] == 1]['body'].tolist(): target_tf.update([w for w in basic_tokenize(doc) if w not in effective_stopwords and len(w)>2])
@@ -154,8 +152,14 @@ MODEL_NAME = "deepseek-v4-flash"
 prompt = f"Target category: '{priority_cat}'. We already know these cached terms: {cached_terms[:20]}. Statistically dominant new terms: {seed_words_only}. Generate a JSON object containing a 'keywords' array of 30 completely NEW, highly specific spelling variations, slurs, and slang that users type to bypass filters. Do not repeat known terms. Output strictly JSON: {{\"keywords\": [\"word1\", ...]}}"
 
 try:
-    res = client.chat.completions.create(model=MODEL_NAME, messages=[{"role": "user", "content": prompt}], response_format={"type": "json_object"})
-    perf_metrics['generator_tokens'] = res.usage.total_tokens
+    res = client.chat.completions.create(
+        model=MODEL_NAME, 
+        messages=[{"role": "user", "content": prompt}], 
+        response_format={"type": "json_object"},
+        extra_body={"thinking": {"type": "disabled"}}
+    )
+    usage_dict = res.usage.model_dump() if hasattr(res.usage, 'model_dump') else vars(res.usage)
+    perf_metrics['generator_tokens'] = usage_dict.get('total_tokens', 0)
     llm_keywords = json.loads(res.choices[0].message.content.strip()).get("keywords", [])
     print(f"   ↳ LLM Generated Terms: {llm_keywords}")
 except Exception as e:
@@ -172,98 +176,88 @@ try:
 except Exception: pass
 
 # ==========================================
-# 4. 4-TIER QUOTA EXTRACTION ENGINE
+# 4. STRICT 3-TIER REGIONAL EXTRACTION ENGINE
 # ==========================================
-print("\n🦆 [DIAGNOSTIC] Phase 3: Quota-Controlled Extraction")
+print("\n🦆 [DIAGNOSTIC] Phase 3: Regional-Strict Quota Extraction")
 CANDIDATE_THRESHOLD = 500
 SOFT_THRESHOLD = int(CANDIDATE_THRESHOLD * 0.8)
 
+# Strict Regional Quotas (15% Tier 1 | 80% Tier 2 Archive | 5% Tier 3 Live API)
 T1_QUOTA = max(1, int(SOFT_THRESHOLD * 0.15))
-T2_QUOTA = max(1, int(SOFT_THRESHOLD * 0.55))
-T3_QUOTA = max(1, int(SOFT_THRESHOLD * 0.25))
-T4_QUOTA = max(1, int(SOFT_THRESHOLD * 0.05))
+T2_QUOTA = max(1, int(SOFT_THRESHOLD * 0.80))
+T3_QUOTA = max(1, int(SOFT_THRESHOLD * 0.05))
 
-print(f"   ↳ Target Candidates: {SOFT_THRESHOLD} | Quotas -> T1: {T1_QUOTA} | T2: {T2_QUOTA} | T3: {T3_QUOTA} | T4: {T4_QUOTA}")
+print(f"   ↳ Target Candidates: {SOFT_THRESHOLD} | Quotas -> Tier 1: {T1_QUOTA} | Tier 2: {T2_QUOTA} | Tier 3 (5% API): {T3_QUOTA}")
 
 harvest_df = pd.DataFrame()
 safe_keywords = [k.replace("'", "''").lower() for k in final_keywords][:35]
 filter_clauses = " OR ".join([f"LOWER(body) LIKE '%{k}%'" for k in safe_keywords if k])
 
 extraction_stats = {
-    "Tier 1 (Core)": collections.defaultdict(int),
-    "Tier 2 (Expanded)": collections.defaultdict(int),
-    "Tier 3 (Live API)": collections.defaultdict(int),
-    "Tier 4 (Wildcard)": collections.defaultdict(int)
+    "Tier 1 (Core Echo)": collections.defaultdict(int),
+    "Tier 2 (Expanded Archive)": collections.defaultdict(int),
+    "Tier 3 (Targeted Live API)": collections.defaultdict(int)
 }
 
-# --- TIER 3: LIVE ARCTIC API (2025+) ---
-def fetch_tier3_live(subreddits, lexicon, max_rows, time_budget=45):
-    print(f"      -> [Tier 3] Arctic API Live Search (Target: {max_rows} rows | Budget: {time_budget}s)...")
+# --- TIER 3: TARGETED LIVE API (5% Quota / Strict Regional Subs) ---
+def fetch_tier3_live(subreddits, lexicon, max_rows, time_budget=15):
+    print(f"      -> [Tier 3] Targeted Arctic API Search (Target: {max_rows} rows | Budget: {time_budget}s)...")
     session = requests.Session()
     start_time = time.time()
     collected = []
     AFTER_2025 = 1735689600 
     
-    if not subreddits or not lexicon:
-        return pd.DataFrame()
+    if not subreddits or not lexicon: return pd.DataFrame()
 
-    sampled_subs = random.sample(subreddits, min(len(subreddits), 15))
-    sampled_terms = random.sample(lexicon, min(len(lexicon), 10))
-    total_iters = len(sampled_subs) * len(sampled_terms)
+    sampled_subs = random.sample(subreddits, min(len(subreddits), 10))
+    sampled_terms = random.sample(lexicon, min(len(lexicon), 5))
     
-    # Progress Bar forced to 10% increments
-    with tqdm(total=total_iters, desc="         ↳ Scraping API", miniters=max(1, total_iters//10), maxinterval=float('inf'), leave=False) as pbar:
-        for sub in sampled_subs:
+    for sub in sampled_subs:
+        if len(collected) >= max_rows or (time.time() - start_time) > time_budget: break
+        for term in sampled_terms:
             if len(collected) >= max_rows or (time.time() - start_time) > time_budget: break
-            for term in sampled_terms:
-                if len(collected) >= max_rows or (time.time() - start_time) > time_budget: break
+            
+            params = {"subreddit": sub, "q": term, "after": AFTER_2025, "limit": 50, "sort": "desc"}
+            try:
+                resp = session.get("https://arctic-shift.photon-reddit.com/api/comments/search", params=params, timeout=5)
+                if resp.status_code == 429: break
+                resp.raise_for_status()
                 
-                params = {"subreddit": sub, "q": term, "after": AFTER_2025, "limit": 100, "sort": "desc"}
-                try:
-                    resp = session.get("https://arctic-shift.photon-reddit.com/api/comments/search", params=params, timeout=10)
-                    if resp.status_code == 429:
-                        return pd.DataFrame(collected).drop_duplicates(subset=["id"]) if collected else pd.DataFrame()
-                    resp.raise_for_status()
-                    
-                    for item in resp.json().get("data", []):
-                        body = item.get("body", "")
-                        if body and body not in ["[removed]", "[deleted]"]:
-                            collected.append({"id": item.get("id"), "body": body, "subreddit": sub, "created_utc": item.get("created_utc")})
-                    time.sleep(1.0)
-                except Exception:
-                    pass
-                finally:
-                    pbar.update(1)
-                    
+                for item in resp.json().get("data", []):
+                    body = item.get("body", "")
+                    if body and body not in ["[removed]", "[deleted]"]:
+                        collected.append({"id": item.get("id"), "body": body, "subreddit": sub, "created_utc": item.get("created_utc")})
+                time.sleep(0.5)
+            except Exception:
+                continue
+                
     df = pd.DataFrame(collected)
     if not df.empty:
         df = df.drop_duplicates(subset=["id"])
         if len(df) > max_rows: df = df.sample(max_rows)
     return df
 
-t3_df = fetch_tier3_live(TIER2_SUBS, final_keywords, T3_QUOTA)
+t3_df = fetch_tier3_live(TIER1_SUBS + TIER2_SUBS[:20], final_keywords, T3_QUOTA)
 if not t3_df.empty:
     harvest_df = pd.concat([harvest_df, t3_df], ignore_index=True)
-    extraction_stats["Tier 3 (Live API)"]["2025+"] = len(t3_df)
+    extraction_stats["Tier 3 (Targeted Live API)"]["2025+"] = len(t3_df)
 print(f"         ✅ Yield: {len(t3_df)} candidates from Live API.")
 
-# --- TIER 1, 2, & 4: DUCKDB ARCHIVE (2017-2024) ---
-print(f"      -> Searching DuckDB Archives (2017-2024)")
+# --- TIER 1 & 2: DUCKDB REGIONAL ARCHIVES (2017-2024) ---
+print(f"      -> Searching Regional DuckDB Archives (2017-2024)")
 con = duckdb.connect()
 con.execute("PRAGMA memory_limit='6GB'; PRAGMA threads=8; INSTALL httpfs; LOAD httpfs;")
 if HF_TOKEN: con.execute(f"CREATE SECRET hf_auth (TYPE HUGGINGFACE, TOKEN '{HF_TOKEN}');")
 api = HfApi(token=HF_TOKEN)
 all_files = api.list_repo_files("open-index/arctic", repo_type="dataset")
 
-t1_df, t2_df, t4_df = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+t1_df, t2_df = pd.DataFrame(), pd.DataFrame()
 current_year = int(os.environ.get("TARGET_YEAR", 2017))
 
 def duckdb_extract(sub_list, hf_urls_list, quota, limit=5000):
-    if not sub_list:
-        sub_clause = ""
-    else:
-        subs_formatted = ", ".join([f"'{s.replace(chr(39), chr(39)+chr(39))}'" for s in sub_list])
-        sub_clause = f"AND LOWER(subreddit) IN ({subs_formatted})"
+    if not sub_list: return pd.DataFrame()
+    subs_formatted = ", ".join([f"'{s.replace(chr(39), chr(39)+chr(39))}'" for s in sub_list])
+    sub_clause = f"AND LOWER(subreddit) IN ({subs_formatted})"
         
     query = f"""
     SELECT id, body, LOWER(subreddit) as subreddit 
@@ -275,54 +269,36 @@ def duckdb_extract(sub_list, hf_urls_list, quota, limit=5000):
     if len(res_df) > quota: res_df = res_df.sample(quota)
     return res_df
 
-while current_year <= 2024 and (len(t1_df) < T1_QUOTA or len(t2_df) < T2_QUOTA):
-    print(f"         ⏳ [Year {current_year}]")
-    year_files = [f for f in all_files if f.endswith('.parquet') and f'data/comments/{current_year}' in f]
-    if not year_files:
-        print("            ⚠️ No data found. Skipping.")
-        current_year += 1; continue
-        
-    hf_urls = [f"hf://datasets/open-index/arctic/{f}" for f in random.sample(year_files, min(40, len(year_files)))]
+# Progress bar for DuckDB Time Travel
+with tqdm(total=(2024 - current_year + 1), desc="      -> [DuckDB Regional Scan]", leave=False) as pbar:
+    while current_year <= 2024 and len(harvest_df) < SOFT_THRESHOLD:
+        year_files = [f for f in all_files if f.endswith('.parquet') and f'data/comments/{current_year}' in f]
+        if not year_files:
+            current_year += 1; pbar.update(1); continue
+            
+        hf_urls = [f"hf://datasets/open-index/arctic/{f}" for f in random.sample(year_files, min(40, len(year_files)))]
 
-    # Tier 1 Explicit Search
-    if len(t1_df) < T1_QUOTA:
-        t1_new = duckdb_extract(TIER1_SUBS, hf_urls, T1_QUOTA - len(t1_df))
-        if not t1_new.empty:
-            t1_df = pd.concat([t1_df, t1_new]).drop_duplicates(subset=['id'])
-            extraction_stats["Tier 1 (Core)"][current_year] += len(t1_new)
-        print(f"            ↳ Tier 1 Yield: {len(t1_new)} (Running Total: {len(t1_df)}/{T1_QUOTA})")
-    
-    # Tier 2 Explicit Search
-    if len(t2_df) < T2_QUOTA:
-        t2_new = duckdb_extract(TIER2_SUBS, hf_urls, T2_QUOTA - len(t2_df))
-        if not t2_new.empty:
-            t2_df = pd.concat([t2_df, t2_new]).drop_duplicates(subset=['id'])
-            extraction_stats["Tier 2 (Expanded)"][current_year] += len(t2_new)
-        print(f"            ↳ Tier 2 Yield: {len(t2_new)} (Running Total: {len(t2_df)}/{T2_QUOTA})")
+        # Tier 1 Extraction
+        if len(t1_df) < T1_QUOTA:
+            t1_new = duckdb_extract(TIER1_SUBS, hf_urls, T1_QUOTA - len(t1_df))
+            if not t1_new.empty:
+                t1_df = pd.concat([t1_df, t1_new]).drop_duplicates(subset=['id'])
+                extraction_stats["Tier 1 (Core Echo)"][current_year] += len(t1_new)
         
-    current_year += 1
-
-if not t1_df.empty or not t2_df.empty:
-    harvest_df = pd.concat([harvest_df, t1_df, t2_df]).drop_duplicates(subset=['id'])
-
-# --- TIER 4: GLOBAL WILDCARD FALLBACK ---
-if len(harvest_df) < SOFT_THRESHOLD:
-    deficit = SOFT_THRESHOLD - len(harvest_df)
-    t4_year = 2024
-    print(f"      -> [Tier 4] Global Fallback Activated. Hunting for Deficit: {deficit} rows...")
-    t4_files = [f for f in all_files if f.endswith('.parquet') and f'data/comments/{t4_year}' in f]
-    if t4_files:
-        hf_urls = [f"hf://datasets/open-index/arctic/{f}" for f in random.sample(t4_files, min(40, len(t4_files)))]
-        t4_df = duckdb_extract([], hf_urls, deficit)
-        
-        if not t4_df.empty:
-            harvest_df = pd.concat([harvest_df, t4_df]).drop_duplicates(subset=['id'])
-            extraction_stats["Tier 4 (Wildcard)"][t4_year] += len(t4_df)
-            print(f"         ✅ Tier 4 Yield: {len(t4_df)} candidates.")
+        # Tier 2 Extraction
+        if len(t2_df) < T2_QUOTA:
+            t2_new = duckdb_extract(TIER2_SUBS, hf_urls, T2_QUOTA - len(t2_df))
+            if not t2_new.empty:
+                t2_df = pd.concat([t2_df, t2_new]).drop_duplicates(subset=['id'])
+                extraction_stats["Tier 2 (Expanded Archive)"][current_year] += len(t2_new)
+            
+        harvest_df = pd.concat([t3_df, t1_df, t2_df]).drop_duplicates(subset=['id'])
+        current_year += 1
+        pbar.update(1)
 
 if harvest_df.empty:
     stop_telemetry.set()
-    print("❌ Exhausted all Tiers. No matching candidates found.")
+    print("❌ Exhausted regional tiers. No matching candidates found.")
     exit(0)
 
 print("\n📈 [EXTRACTION YIELD STATISTICS]")
@@ -332,7 +308,7 @@ for tier, year_data in extraction_stats.items():
         year_breakdown = " | ".join([f"{y}: {count} rows" for y, count in sorted(year_data.items())])
         print(f"   ✅ {tier}: {total_rows} total rows -> ({year_breakdown})")
 print(f"   -------------------------------------------------")
-print(f"   🚀 Total Harvested Pool: {len(harvest_df)} Candidates")
+print(f"   🚀 Total Regional Pool: {len(harvest_df)} Candidates")
 
 # ==========================================
 # 5. SANITIZATION & AUTONOMOUS LABELING
@@ -350,7 +326,6 @@ def sanitize_text(text):
     return re.sub(r'\s{2,}', ' ', text).strip()
 
 total_pool = len(harvest_df)
-# Progress Bar forced to 10% increments
 harvest_df['body_clean'] = [sanitize_text(text) for text in tqdm(harvest_df['body'], desc="   ↳ Sanitizing text data", miniters=max(1, total_pool//10), maxinterval=float('inf'), leave=False)]
 harvest_df['temp_id'] = harvest_df.index.astype(str)
 
@@ -361,13 +336,27 @@ def label_batch(comments_batch, attempt=1):
     numbered = "\n".join(f'ID: {cid} | Comment: {body}' for cid, body in comments_batch)
     try:
         res = client.chat.completions.create(
-            model=MODEL_NAME, messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": f"Label these comments:\n{numbered}"}],
-            temperature=0.1, response_format={"type": "json_object"}
+            model=MODEL_NAME, 
+            messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": f"Label these comments:\n{numbered}"}],
+            temperature=0.1, 
+            response_format={"type": "json_object"},
+            extra_body={"thinking": {"type": "disabled"}}
         )
         
+        usage_dict = res.usage.model_dump() if hasattr(res.usage, 'model_dump') else vars(res.usage)
+        token_details = usage_dict.get('prompt_tokens_details', {}) or {}
+        p_tokens = usage_dict.get('prompt_tokens', 0)
+        c_tokens = usage_dict.get('completion_tokens', 0)
+        t_tokens = usage_dict.get('total_tokens', p_tokens + c_tokens)
+        c_hits = usage_dict.get('prompt_cache_hit_tokens', token_details.get('cached_tokens', 0))
+        c_misses = usage_dict.get('prompt_cache_miss_tokens', p_tokens - c_hits)
+
         with token_lock:
-            perf_metrics['total_prompt_tokens'] += res.usage.prompt_tokens
-            perf_metrics['total_completion_tokens'] += res.usage.completion_tokens
+            perf_metrics['total_prompt_tokens'] += p_tokens
+            perf_metrics['total_completion_tokens'] += c_tokens
+            perf_metrics['total_combined_tokens'] += t_tokens
+            perf_metrics['total_cache_hits'] += c_hits
+            perf_metrics['total_cache_misses'] += c_misses
 
         raw_content = re.sub(r"^```(?:json)?\n?|\n?```$", "", res.choices[0].message.content.strip())
         results = json.loads(raw_content).get("results", [])
@@ -387,7 +376,6 @@ all_labels = []
 print(f"\n🚀 Running Asynchronous Inference Engine ({MAX_WORKERS} Workers)...")
 with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
     futures = [executor.submit(label_batch, b) for b in batches]
-    # As_completed ensures smooth updates without freezing, forced to 10% increments
     for future in tqdm(as_completed(futures), total=len(batches), desc="   ↳ Labeling Candidates", miniters=max(1, len(batches)//10), maxinterval=float('inf')):
         all_labels.extend(future.result())
 
@@ -408,4 +396,10 @@ monitor_thread.join()
 
 print("\n==================================================")
 print(" 🏁 HARVESTER YIELD & TELEMETRY REPORT")
+print("==================================================")
+hit_rate = (perf_metrics['total_cache_hits'] / perf_metrics['total_prompt_tokens'] * 100) if perf_metrics['total_prompt_tokens'] > 0 else 0
+print(f"Total Workflow Time      : {time.time() - script_start_time:.2f}s")
+print(f"LLM Generator Tokens     : {perf_metrics['generator_tokens']:,}")
+print(f"Inference Prompt Tokens  : {perf_metrics['total_prompt_tokens']:,} (Cache Hit: {hit_rate:.1f}%)")
+print(f"Inference Output Tokens  : {perf_metrics['total_completion_tokens']:,}")
 print(f"✅ Verified data committed to: {FINAL_PATH}")
