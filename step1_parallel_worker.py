@@ -145,16 +145,19 @@ print(f"\n🦆 [Worker {TARGET_YEAR}] Initializing DuckDB (Dynamic Seed: {SEED_V
 con = duckdb.connect()
 
 con.execute("PRAGMA memory_limit='6GB';") 
-con.execute("PRAGMA threads=8;")          
+con.execute("PRAGMA threads=4;")          # ⬇️ Lowered from 8 to 4        
 con.execute("INSTALL httpfs; LOAD httpfs;")
 
 if HF_TOKEN:
     con.execute(f"CREATE SECRET hf_auth (TYPE HUGGINGFACE, TOKEN '{HF_TOKEN}');")
 
 api = HfApi(token=HF_TOKEN)
-all_files = api.list_repo_files("open-index/arctic", repo_type="dataset")
 
-year_files = [f for f in all_files if f.endswith('.parquet') and f'data/comments/{TARGET_YEAR}' in f]
+print(f"🔍 Querying Hugging Face explicitly for {TARGET_YEAR} shards...")
+# Target the specific year folder recursively to bypass global API truncation limits
+tree = api.list_repo_tree("open-index/arctic", repo_type="dataset", path_in_repo=f"data/comments/{TARGET_YEAR}", recursive=True)
+
+year_files = [f.path for f in tree if f.path.endswith('.parquet')]
 if not year_files:
     stop_telemetry.set()
     raise ValueError(f"❌ No Parquet shards found for year {TARGET_YEAR}.")
@@ -186,7 +189,7 @@ def extract_subreddits(sub_list, tier_name):
         return pd.DataFrame()
     subs_formatted = ", ".join([f"'{s.replace(chr(39), chr(39)+chr(39))}'" for s in sub_list])
     raw_list = []
-    chunk_size = 25
+    chunk_size = 10  # ⬇️ Lowered from 25 to prevent HTTP 429 Too Many Requests
     
     for i in range(0, len(selected_shards), chunk_size):
         shard_chunk = selected_shards[i:i + chunk_size]
