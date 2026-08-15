@@ -1,0 +1,18 @@
+{
+  "CASTE": [
+    "dalit", "brahmins", "brahmin", "dalits", "caste", "saini", "chamar", "shudra",
+    "d4lit", "chamaar", "bhangi", "pandit", "bhumihar", "jaati", "varna", "achoot"
+  ],
+  "COMMUNAL_RELIGIOUS": [
+    "muslim", "hindu", "jihadi", "kattar", "mulla", "sanghi", "kafir", "chaddi", "bhakt", "peaceful"
+  ],
+  "REGIONAL_XENOPHOBIC": [
+    "bihari", "bhaiyya", "southie", "madrasi", "pajeet", "bimaru", "khalistani", "bong", "marathi"
+  ],
+  "MISOGYNY_GENDER": [
+    "randi", "whore", "slut", "chinal", "femoid", "kuttiya", "bitch", "thot", "faggot", "wimmin"
+  ],
+  "ABUSE": [
+    "chutiya", "gandu", "bhosdike", "harami", "lode", "lawde", "bsdk", "mc", "bc", "fuck", "asshole", "motherfucker", "kamina", "kaminey"
+  ]
+}
