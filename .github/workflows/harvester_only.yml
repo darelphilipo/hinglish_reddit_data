@@ -48,7 +48,7 @@ jobs:
             exit $EXIT_CODE
           fi
 
-     - name: Commit Harvester Results & Updated Master
+      - name: Commit Harvester Results & Updated Master
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
