@@ -21,7 +21,7 @@ from cleantext import clean
 print("🌾 Initializing Autonomous Harvester: 4-Tier Hybrid Engine...")
 
 # ==========================================
-# 0. TELEMETRY & PROFILER SETUP[cite: 1]
+# 0. TELEMETRY & PROFILER SETUP
 # ==========================================
 MAX_WORKERS = 10
 perf_metrics = {
@@ -62,16 +62,16 @@ with open(TARGETS_PATH, 'r') as f:
 TARGETS = blueprint.get("categories", {})
 
 df = pd.read_csv(MASTER_PATH)
-shortfalls = {cat: max(0, TARGETS[cat] - df.get(cat, pd.Series([0])).sum()) for cat in TARGETS}[cite: 1]
+shortfalls = {cat: max(0, TARGETS[cat] - df.get(cat, pd.Series([0])).sum()) for cat in TARGETS}
 
 if all(s <= 0 for s in shortfalls.values()):
     stop_telemetry.set()
-    print("✅ All toxic target categories met. No harvesting needed.")[cite: 1]
+    print("✅ All toxic target categories met. No harvesting needed.")
     exit(0)
 
-priority_cat = max(shortfalls, key=shortfalls.get)[cite: 1]
+priority_cat = max(shortfalls, key=shortfalls.get)
 current_shortfall = shortfalls[priority_cat]
-print(f"🎯 Harvester Target Identified: {priority_cat.upper()} | Shortfall: {current_shortfall:,} rows")[cite: 1]
+print(f"🎯 Harvester Target Identified: {priority_cat.upper()} | Shortfall: {current_shortfall:,} rows")
 
 # --- LOAD SUBREDDITS & APPLY TOGGLES ---
 TIER1_SUBS, TIER2_SUBS = [], []
@@ -114,47 +114,47 @@ print("\n📊 [DIAGNOSTIC] Phase 1: Dynamic Thresholding & Statistical Seed Gene
 STOPWORDS_URL = "https://raw.githubusercontent.com/darelphilipo/hinglish_reddit_data/main/prompt/hinglish_stopwords.txt"
 try:
     resp = requests.get(STOPWORDS_URL, timeout=10)
-    static_stopwords = set(line.strip().lower() for line in resp.text.splitlines() if line.strip())[cite: 1]
+    static_stopwords = set(line.strip().lower() for line in resp.text.splitlines() if line.strip())
 except Exception:
     static_stopwords = {'hai', 'ki', 'aur', 'mein'}
 
-def basic_tokenize(text): return re.findall(r'\b[a-z0-9]+\b', str(text).lower())[cite: 1]
+def basic_tokenize(text): return re.findall(r'\b[a-z0-9]+\b', str(text).lower())
 
 global_df_freq = collections.Counter()
 for doc in df['body'].tolist():
-    for word in set(basic_tokenize(doc)): global_df_freq[word] += 1[cite: 1]
+    for word in set(basic_tokenize(doc)): global_df_freq[word] += 1
 
-dynamic_stopwords = {w for w, count in global_df_freq.items() if count > int(len(df) * 0.15)}[cite: 1]
+dynamic_stopwords = {w for w, count in global_df_freq.items() if count > int(len(df) * 0.15)}
 effective_stopwords = static_stopwords.union(dynamic_stopwords)
 
 target_tf, bg_df_freq = collections.Counter(), collections.Counter()
-for doc in df[df[priority_cat] == 1]['body'].tolist(): target_tf.update([w for w in basic_tokenize(doc) if w not in effective_stopwords and len(w)>2])[cite: 1]
+for doc in df[df[priority_cat] == 1]['body'].tolist(): target_tf.update([w for w in basic_tokenize(doc) if w not in effective_stopwords and len(w)>2])
 for doc in df[df[priority_cat] == 0]['body'].tolist():
-    for word in set([w for w in basic_tokenize(doc) if w not in effective_stopwords and len(w)>2]): bg_df_freq[word] += 1[cite: 1]
+    for word in set([w for w in basic_tokenize(doc) if w not in effective_stopwords and len(w)>2]): bg_df_freq[word] += 1
 
-tfidf_scores = {w: tf * math.log(max(len(bg_df_freq), 1) / (bg_df_freq.get(w, 0) + 1)) for w, tf in target_tf.items()}[cite: 1]
-seed_words_only = [w for w, _ in sorted(tfidf_scores.items(), key=lambda x: x[1], reverse=True)[:10]][cite: 1]
+tfidf_scores = {w: tf * math.log(max(len(bg_df_freq), 1) / (bg_df_freq.get(w, 0) + 1)) for w, tf in target_tf.items()}
+seed_words_only = [w for w, _ in sorted(tfidf_scores.items(), key=lambda x: x[1], reverse=True)[:10]]
 
 # ==========================================
-# 3. LLM MULTIPLIER (SEED EXPANSION)[cite: 1]
+# 3. LLM MULTIPLIER (SEED EXPANSION)
 # ==========================================
 print("\n🧠 [DIAGNOSTIC] Phase 2: Stateful Semantic Expansion")
 OPENCODE_KEY = os.environ.get("OPENCODE_KEY")
 HF_TOKEN = os.environ.get("HF_TOKEN")
-client = OpenAI(api_key=OPENCODE_KEY, base_url="https://opencode.ai/zen/go/v1")[cite: 1]
+client = OpenAI(api_key=OPENCODE_KEY, base_url="https://opencode.ai/zen/go/v1")
 MODEL_NAME = "deepseek-v4-flash"
 
 prompt = f"Target category: '{priority_cat}'. We already know these cached terms: {cached_terms[:20]}. Statistically dominant new terms: {seed_words_only}. Generate a JSON object containing a 'keywords' array of 30 completely NEW, highly specific spelling variations, slurs, and slang that users type to bypass filters. Do not repeat known terms. Output strictly JSON: {{\"keywords\": [\"word1\", ...]}}"
 
 try:
-    res = client.chat.completions.create(model=MODEL_NAME, messages=[{"role": "user", "content": prompt}], response_format={"type": "json_object"})[cite: 1]
-    perf_metrics['generator_tokens'] = res.usage.total_tokens[cite: 1]
-    llm_keywords = json.loads(res.choices[0].message.content.strip()).get("keywords", [])[cite: 1]
+    res = client.chat.completions.create(model=MODEL_NAME, messages=[{"role": "user", "content": prompt}], response_format={"type": "json_object"})
+    perf_metrics['generator_tokens'] = res.usage.total_tokens
+    llm_keywords = json.loads(res.choices[0].message.content.strip()).get("keywords", [])
 except Exception as e:
     print(f"   ⚠️ LLM failed: {e}. Using statistical seeds only.")
     llm_keywords = []
 
-final_keywords = list(dict.fromkeys([k for k in (cached_terms + seed_words_only + llm_keywords) if len(k) > 3]))[cite: 1]
+final_keywords = list(dict.fromkeys([k for k in (cached_terms + seed_words_only + llm_keywords) if len(k) > 3]))
 print(f"   ↳ Final Deduplicated Lexicon ({len(final_keywords)} terms)")
 
 # Persist to cache
@@ -184,11 +184,14 @@ filter_clauses = " OR ".join([f"LOWER(body) LIKE '%{k}%'" for k in safe_keywords
 # --- TIER 3: LIVE ARCTIC API (2025+) ---
 def fetch_tier3_live(subreddits, lexicon, max_rows, time_budget=45):
     print(f"      -> [Tier 3] Arctic API Live Search (Budget: {time_budget}s, Quota: {max_rows})...")
-    session = requests.Session()[cite: 2]
+    session = requests.Session()
     start_time = time.time()
     collected = []
     AFTER_2025 = 1735689600 
     
+    if not subreddits or not lexicon:
+        return pd.DataFrame()
+
     sampled_subs = random.sample(subreddits, min(len(subreddits), 15))
     sampled_terms = random.sample(lexicon, min(len(lexicon), 10))
     
@@ -197,19 +200,19 @@ def fetch_tier3_live(subreddits, lexicon, max_rows, time_budget=45):
         for term in sampled_terms:
             if len(collected) >= max_rows or (time.time() - start_time) > time_budget: break
             
-            params = {"subreddit": sub, "q": term, "after": AFTER_2025, "limit": 100, "sort": "desc"}[cite: 2]
+            params = {"subreddit": sub, "q": term, "after": AFTER_2025, "limit": 100, "sort": "desc"}
             try:
-                resp = session.get("https://arctic-shift.photon-reddit.com/api/comments/search", params=params, timeout=10)[cite: 2]
+                resp = session.get("https://arctic-shift.photon-reddit.com/api/comments/search", params=params, timeout=10)
                 if resp.status_code == 429:
                     print("         ⚠️ Arctic API 429 Rate Limit. Backing off Tier 3.")
                     return pd.DataFrame(collected).drop_duplicates(subset=["id"]) if collected else pd.DataFrame()
-                resp.raise_for_status()[cite: 2]
+                resp.raise_for_status()
                 
-                for item in resp.json().get("data", []):[cite: 2]
+                for item in resp.json().get("data", []):
                     body = item.get("body", "")
-                    if body and body not in ["[removed]", "[deleted]"]:[cite: 2]
-                        collected.append({"id": item.get("id"), "body": body, "subreddit": sub})[cite: 2]
-                time.sleep(1.0)  # Throttling to protect rate limits[cite: 2]
+                    if body and body not in ["[removed]", "[deleted]"]:
+                        collected.append({"id": item.get("id"), "body": body, "subreddit": sub, "created_utc": item.get("created_utc")})
+                time.sleep(1.0)  # Throttling to protect rate limits
             except Exception:
                 continue
     df = pd.DataFrame(collected)
@@ -224,21 +227,21 @@ if not t3_df.empty:
     print(f"         Yield: {len(t3_df)} candidates from Live API.")
 
 # --- TIER 1, 2, & 4: DUCKDB ARCHIVE (2017-2024) ---
-con = duckdb.connect()[cite: 1]
-con.execute("PRAGMA memory_limit='6GB'; PRAGMA threads=8; INSTALL httpfs; LOAD httpfs;")[cite: 1]
-if HF_TOKEN: con.execute(f"CREATE SECRET hf_auth (TYPE HUGGINGFACE, TOKEN '{HF_TOKEN}');")[cite: 1]
-api = HfApi(token=HF_TOKEN)[cite: 1]
-all_files = api.list_repo_files("open-index/arctic", repo_type="dataset")[cite: 1]
+con = duckdb.connect()
+con.execute("PRAGMA memory_limit='6GB'; PRAGMA threads=8; INSTALL httpfs; LOAD httpfs;")
+if HF_TOKEN: con.execute(f"CREATE SECRET hf_auth (TYPE HUGGINGFACE, TOKEN '{HF_TOKEN}');")
+api = HfApi(token=HF_TOKEN)
+all_files = api.list_repo_files("open-index/arctic", repo_type="dataset")
 
 t1_df, t2_df, t4_df = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-current_year = int(os.environ.get("TARGET_YEAR", 2017))[cite: 1]
+current_year = int(os.environ.get("TARGET_YEAR", 2017))
 
 while current_year <= 2024 and (len(t1_df) < T1_QUOTA or len(t2_df) < T2_QUOTA):
-    year_files = [f for f in all_files if f.endswith('.parquet') and f'data/comments/{current_year}' in f][cite: 1]
+    year_files = [f for f in all_files if f.endswith('.parquet') and f'data/comments/{current_year}' in f]
     if not year_files:
         current_year += 1; continue
         
-    hf_urls = [f"hf://datasets/open-index/arctic/{f}" for f in random.sample(year_files, min(40, len(year_files)))][cite: 1]
+    hf_urls = [f"hf://datasets/open-index/arctic/{f}" for f in random.sample(year_files, min(40, len(year_files)))]
 
     def duckdb_extract(sub_list, quota, limit=5000):
         if not sub_list:
@@ -260,16 +263,19 @@ while current_year <= 2024 and (len(t1_df) < T1_QUOTA or len(t2_df) < T2_QUOTA):
     # Tier 1
     if len(t1_df) < T1_QUOTA:
         t1_new = duckdb_extract(TIER1_SUBS, T1_QUOTA - len(t1_df))
-        t1_df = pd.concat([t1_df, t1_new]).drop_duplicates(subset=['id'])
+        if not t1_new.empty:
+            t1_df = pd.concat([t1_df, t1_new]).drop_duplicates(subset=['id'])
     
     # Tier 2
     if len(t2_df) < T2_QUOTA:
         t2_new = duckdb_extract(TIER2_SUBS, T2_QUOTA - len(t2_df))
-        t2_df = pd.concat([t2_df, t2_new]).drop_duplicates(subset=['id'])
+        if not t2_new.empty:
+            t2_df = pd.concat([t2_df, t2_new]).drop_duplicates(subset=['id'])
         
     current_year += 1
 
-harvest_df = pd.concat([harvest_df, t1_df, t2_df]).drop_duplicates(subset=['id'])
+if not t1_df.empty or not t2_df.empty:
+    harvest_df = pd.concat([harvest_df, t1_df, t2_df]).drop_duplicates(subset=['id'])
 print(f"      -> DuckDB Yield: Tier 1 ({len(t1_df)}), Tier 2 ({len(t2_df)}). Total gathered: {len(harvest_df)}")
 
 # --- TIER 4: GLOBAL WILDCARD FALLBACK ---
@@ -277,8 +283,9 @@ if len(harvest_df) < SOFT_THRESHOLD:
     deficit = SOFT_THRESHOLD - len(harvest_df)
     print(f"      -> [Tier 4] Global Fallback. Deficit: {deficit}...")
     t4_df = duckdb_extract([], deficit)
-    harvest_df = pd.concat([harvest_df, t4_df]).drop_duplicates(subset=['id'])
-    print(f"         Yield: {len(t4_df)} candidates.")
+    if not t4_df.empty:
+        harvest_df = pd.concat([harvest_df, t4_df]).drop_duplicates(subset=['id'])
+        print(f"         Yield: {len(t4_df)} candidates.")
 
 if harvest_df.empty:
     stop_telemetry.set()
@@ -286,7 +293,7 @@ if harvest_df.empty:
     exit(0)
 
 # ==========================================
-# 5. SANITIZATION & AUTONOMOUS LABELING[cite: 1]
+# 5. SANITIZATION & AUTONOMOUS LABELING
 # ==========================================
 print(f"\n🛡️ [DIAGNOSTIC] Phase 4: Verification of {len(harvest_df)} Candidates")
 
@@ -296,63 +303,63 @@ def sanitize_text(text):
     text = re.sub(r'<[^>]+>', '', text)
     text = re.sub(r'[\r\n\t]+', ' ', text)
     text = re.sub(r'/?u/[A-Za-z0-9_-]+', '', text) 
-    try: text = clean(text, fix_unicode=True, to_ascii=False, lower=False, no_urls=True, no_emails=True)[cite: 1]
+    try: text = clean(text, fix_unicode=True, to_ascii=False, lower=False, no_urls=True, no_emails=True)
     except Exception: pass
     return re.sub(r'\s{2,}', ' ', text).strip()
 
-harvest_df['body_clean'] = harvest_df['body'].apply(sanitize_text)[cite: 1]
-harvest_df['temp_id'] = harvest_df.index.astype(str)[cite: 1]
+harvest_df['body_clean'] = harvest_df['body'].apply(sanitize_text)
+harvest_df['temp_id'] = harvest_df.index.astype(str)
 
-try: SYSTEM_PROMPT = requests.get("https://raw.githubusercontent.com/darelphilipo/hinglish_reddit_data/main/prompt/System_Prompt", timeout=10).text.strip()[cite: 1]
-except Exception as e: stop_telemetry.set(); raise RuntimeError(f"❌ Failed to fetch System Prompt: {e}")[cite: 1]
+try: SYSTEM_PROMPT = requests.get("https://raw.githubusercontent.com/darelphilipo/hinglish_reddit_data/main/prompt/System_Prompt", timeout=10).text.strip()
+except Exception as e: stop_telemetry.set(); raise RuntimeError(f"❌ Failed to fetch System Prompt: {e}")
 
 def label_batch(comments_batch, attempt=1):
-    numbered = "\n".join(f'ID: {cid} | Comment: {body}' for cid, body in comments_batch)[cite: 1]
+    numbered = "\n".join(f'ID: {cid} | Comment: {body}' for cid, body in comments_batch)
     try:
         res = client.chat.completions.create(
             model=MODEL_NAME, messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": f"Label these comments:\n{numbered}"}],
             temperature=0.1, response_format={"type": "json_object"}
-        )[cite: 1]
+        )
         
         with token_lock:
-            perf_metrics['total_prompt_tokens'] += res.usage.prompt_tokens[cite: 1]
-            perf_metrics['total_completion_tokens'] += res.usage.completion_tokens[cite: 1]
+            perf_metrics['total_prompt_tokens'] += res.usage.prompt_tokens
+            perf_metrics['total_completion_tokens'] += res.usage.completion_tokens
 
-        raw_content = re.sub(r"^```(?:json)?\n?|\n?```$", "", res.choices[0].message.content.strip())[cite: 1]
-        results = json.loads(raw_content).get("results", [])[cite: 1]
+        raw_content = re.sub(r"^```(?:json)?\n?|\n?```$", "", res.choices[0].message.content.strip())
+        results = json.loads(raw_content).get("results", [])
         if len(results) == len(comments_batch):
-            for idx, item in enumerate(results): item["temp_id"] = str(comments_batch[idx][0])[cite: 1]
+            for idx, item in enumerate(results): item["temp_id"] = str(comments_batch[idx][0])
             return results
-        raise ValueError("Batch size mismatch")[cite: 1]
+        raise ValueError("Batch size mismatch")
     except Exception:
         if attempt <= 3:
-            time.sleep(min(2 ** attempt, 10))[cite: 1]
-            return label_batch(comments_batch, attempt + 1)[cite: 1]
+            time.sleep(min(2 ** attempt, 10))
+            return label_batch(comments_batch, attempt + 1)
         return []
 
-batches = [list(zip(harvest_df["temp_id"], harvest_df["body_clean"]))[i:i + 20] for i in range(0, len(harvest_df), 20)][cite: 1]
+batches = [list(zip(harvest_df["temp_id"], harvest_df["body_clean"]))[i:i + 20] for i in range(0, len(harvest_df), 20)]
 all_labels = []
 
-print(f"\n🚀 Running Parallel Inference Engine ({MAX_WORKERS} Workers)...")[cite: 1]
-with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:[cite: 1]
-    for result in tqdm(executor.map(label_batch, batches), total=len(batches), desc="Labeling Candidates"): [cite: 1]
-        all_labels.extend(result)[cite: 1]
+print(f"\n🚀 Running Parallel Inference Engine ({MAX_WORKERS} Workers)...")
+with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    for result in tqdm(executor.map(label_batch, batches), total=len(batches), desc="Labeling Candidates"): 
+        all_labels.extend(result)
 
-labels_df = pd.DataFrame(all_labels)[cite: 1]
-if 'id' in labels_df.columns: labels_df.drop(columns=["id"], inplace=True)[cite: 1]
-labels_df["temp_id"] = labels_df["temp_id"].astype(str)[cite: 1]
-labels_df.rename(columns={"pv": "profanity_vulgarity", "tah": "targeted_abuse_harassment", "dhs": "discriminatory_hate_speech", "cst": "caste", "cr": "communal_religious", "rx": "regional_xenophobic", "mg": "misogyny_gender"}, inplace=True)[cite: 1]
+labels_df = pd.DataFrame(all_labels)
+if 'id' in labels_df.columns: labels_df.drop(columns=["id"], inplace=True)
+labels_df["temp_id"] = labels_df["temp_id"].astype(str)
+labels_df.rename(columns={"pv": "profanity_vulgarity", "tah": "targeted_abuse_harassment", "dhs": "discriminatory_hate_speech", "cst": "caste", "cr": "communal_religious", "rx": "regional_xenophobic", "mg": "misogyny_gender"}, inplace=True)
 
-final_df = harvest_df.merge(labels_df, on="temp_id", how="inner").drop(columns=["temp_id", "body_clean"], errors='ignore')[cite: 1]
-final_df = final_df[final_df[priority_cat].notna()][cite: 1]
+final_df = harvest_df.merge(labels_df, on="temp_id", how="inner").drop(columns=["temp_id", "body_clean"], errors='ignore')
+final_df = final_df[final_df[priority_cat].notna()]
 
-timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')[cite: 1]
-FINAL_PATH = os.path.join(CHUNKS_DIR, f'harvested_tier1_{priority_cat}_{timestamp}.csv')[cite: 1]
-final_df.to_csv(FINAL_PATH, index=False)[cite: 1]
+timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+FINAL_PATH = os.path.join(CHUNKS_DIR, f'harvested_tier1_{priority_cat}_{timestamp}.csv')
+final_df.to_csv(FINAL_PATH, index=False)
 
-stop_telemetry.set()[cite: 1]
-monitor_thread.join()[cite: 1]
+stop_telemetry.set()
+monitor_thread.join()
 
 print("\n==================================================")
 print(" 🏁 HARVESTER YIELD & TELEMETRY REPORT")
-print(f"✅ Verified data committed to: {FINAL_PATH}")[cite: 1]
+print(f"✅ Verified data committed to: {FINAL_PATH}")
