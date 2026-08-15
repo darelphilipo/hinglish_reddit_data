@@ -137,19 +137,51 @@ for doc in df[df[priority_cat] == 0]['body'].tolist():
     for word in set([w for w in basic_tokenize(doc) if w not in effective_stopwords and len(w)>2]): bg_df_freq[word] += 1
 
 tfidf_scores = {w: tf * math.log(max(len(bg_df_freq), 1) / (bg_df_freq.get(w, 0) + 1)) for w, tf in target_tf.items()}
-seed_words_only = [w for w, _ in sorted(tfidf_scores.items(), key=lambda x: x[1], reverse=True)[:10]]
-print(f"   ↳ Statistical Seeds Extracted: {seed_words_only}")
+raw_seed_words = [w for w, _ in sorted(tfidf_scores.items(), key=lambda x: x[1], reverse=True)[:10]]
+print(f"   ↳ Raw Statistical Seeds: {raw_seed_words}")
 
 # ==========================================
-# 3. LLM MULTIPLIER (SEED EXPANSION)
+# 2.5. LLM DYNAMIC SAFETY NET
 # ==========================================
-print("\n🧠 [DIAGNOSTIC] Phase 2: Stateful Semantic Expansion")
+print("\n🛡️ [DIAGNOSTIC] Phase 1.5: Dynamic LLM Safety Net")
 OPENCODE_KEY = os.environ.get("OPENCODE_KEY")
 HF_TOKEN = os.environ.get("HF_TOKEN")
 client = OpenAI(api_key=OPENCODE_KEY, base_url="https://opencode.ai/zen/go/v1")
 MODEL_NAME = "deepseek-v4-flash"
 
-prompt = f"Target category: '{priority_cat}'. We already know these cached terms: {cached_terms[:20]}. Statistically dominant new terms: {seed_words_only}. Generate a JSON object containing a 'keywords' array of 30 completely NEW, highly specific spelling variations, slurs, and slang that users type to bypass filters. Do not repeat known terms. Output strictly JSON: {{\"keywords\": [\"word1\", ...]}}"
+filter_prompt = f"Target category: '{priority_cat}'. We extracted these raw statistical words: {raw_seed_words}. Filter this list. Remove harmless conversational words (like 'lol', 'fake', 'problem') and purely neutral demographic/identity terms (like 'india', 'brahmin', 'dalit', 'women') IF they are not inherently abusive. Keep ONLY actual slurs, highly toxic slang, and explicitly hostile modifiers. Output strictly JSON: {{\"toxic_seeds\": [\"word1\", ...]}}"
+
+try:
+    filter_res = client.chat.completions.create(
+        model=MODEL_NAME, 
+        messages=[{"role": "user", "content": filter_prompt}], 
+        response_format={"type": "json_object"},
+        extra_body={"thinking": {"type": "disabled"}}
+    )
+    
+    # Audit token usage for the safety net call
+    f_usage = filter_res.usage.model_dump() if hasattr(filter_res.usage, 'model_dump') else vars(filter_res.usage)
+    perf_metrics['total_prompt_tokens'] += f_usage.get('prompt_tokens', 0)
+    perf_metrics['total_completion_tokens'] += f_usage.get('completion_tokens', 0)
+    perf_metrics['generator_tokens'] += f_usage.get('total_tokens', 0)
+
+    toxic_seeds = json.loads(filter_res.choices[0].message.content.strip()).get("toxic_seeds", [])
+    
+    # Fallback if the LLM over-corrected and wiped the entire list
+    if not toxic_seeds:
+        toxic_seeds = raw_seed_words[:3]
+        
+    print(f"   ↳ Sanitized Toxic Seeds: {toxic_seeds}")
+except Exception as e:
+    print(f"   ⚠️ LLM filter failed: {e}. Using raw seeds.")
+    toxic_seeds = raw_seed_words
+
+# ==========================================
+# 3. LLM MULTIPLIER (SEED EXPANSION)
+# ==========================================
+print("\n🧠 [DIAGNOSTIC] Phase 2: Stateful Semantic Expansion")
+
+prompt = f"Target category: '{priority_cat}'. We already know these cached terms: {cached_terms[:20]}. We isolated these highly toxic root seeds: {toxic_seeds}. Generate a JSON object containing a 'keywords' array of 30 completely NEW, highly specific spelling variations, slurs, and slang that users type to bypass filters. Do not repeat known terms. Output strictly JSON: {{\"keywords\": [\"word1\", ...]}}"
 
 try:
     res = client.chat.completions.create(
@@ -158,15 +190,16 @@ try:
         response_format={"type": "json_object"},
         extra_body={"thinking": {"type": "disabled"}}
     )
+    
     usage_dict = res.usage.model_dump() if hasattr(res.usage, 'model_dump') else vars(res.usage)
-    perf_metrics['generator_tokens'] = usage_dict.get('total_tokens', 0)
+    perf_metrics['generator_tokens'] += usage_dict.get('total_tokens', 0)
     llm_keywords = json.loads(res.choices[0].message.content.strip()).get("keywords", [])
     print(f"   ↳ LLM Generated Terms: {llm_keywords}")
 except Exception as e:
-    print(f"   ⚠️ LLM failed: {e}. Using statistical seeds only.")
+    print(f"   ⚠️ LLM expansion failed: {e}. Using sanitized seeds only.")
     llm_keywords = []
 
-final_keywords = list(dict.fromkeys([k for k in (cached_terms + seed_words_only + llm_keywords) if len(k) > 3]))
+final_keywords = list(dict.fromkeys([k for k in (cached_terms + toxic_seeds + llm_keywords) if len(k) > 3]))
 print(f"   ↳ Final Deduplicated Lexicon ({len(final_keywords)} terms): {final_keywords}")
 
 master_lexicon[priority_cat.upper()] = final_keywords
