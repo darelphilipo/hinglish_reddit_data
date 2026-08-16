@@ -13,7 +13,6 @@ print("🚀 Initializing Hugging Face Dual-Schema Migration Tool...")
 # 1. CONFIGURATION & SECRETS
 # ==========================================
 CSV_PATH = './labelled_output/master_baseline_tier1.csv'
-PROMPT_URL = "https://raw.githubusercontent.com/darelphilipo/hinglish_reddit_data/main/prompt/System_Prompt"
 LEDGER_PATH = './migration_ledger.json'
 CHUNK_SIZE = 2500  # Uploads in batches of 2,500 to create safe checkpoints
 
@@ -39,15 +38,10 @@ except Exception as e:
     print(f"⚠️ Repo check/creation issue: {e}")
 
 # ==========================================
-# 2. LOAD SYSTEM PROMPT (For ChatML)
+# 2. SET SYSTEM PROMPT (For ChatML)
 # ==========================================
-print("\n🌐 Fetching System Prompt...")
-try:
-    SYSTEM_PROMPT = requests.get(PROMPT_URL, timeout=10).text.strip()
-    print("✅ System Prompt loaded.")
-except Exception as e:
-    print(f"❌ Failed to fetch System Prompt: {e}")
-    exit(1)
+print("\n🌐 Setting concise Student Prompt...")
+SYSTEM_PROMPT = "You are an expert Hinglish content moderation AI. Analyze the following comment and output a JSON object containing the toxic classification flags and a brief analysis of the target and intent."
 
 # ==========================================
 # 3. LOAD DATA & LEDGER STATE
