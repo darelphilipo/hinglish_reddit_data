@@ -53,14 +53,25 @@ TARGET_YEAR = os.environ.get("TARGET_YEAR", "2017")
 RUN_ID = os.environ.get("GITHUB_RUN_ID", str(int(time.time())))
 GITHUB_STARTED_AT = os.environ.get("GITHUB_RUN_STARTED_AT")
 
-BASE_OUTPUT_DIR = './labelled_output/'
-CHUNKS_DIR = os.path.join(BASE_OUTPUT_DIR, 'chunks/')
-os.makedirs(CHUNKS_DIR, exist_ok=True)
-
-FINAL_CSV_PATH = os.path.join(CHUNKS_DIR, f'baseline_tier1_{TARGET_YEAR}.csv')
-LEDGER_PATH = os.path.join(BASE_OUTPUT_DIR, 'seen_ids_ledger.txt')
+LEDGER_PATH = './seen_ids_ledger.txt'
 SUBREDDIT_CONFIG_PATH = "prompt/subreddits.json"
 SUBREDDIT_URL = "https://raw.githubusercontent.com/darelphilipo/hinglish_reddit_data/main/prompt/subreddits.json"
+
+HF_REPO_ID = "darelphilip/hinglish-toxicity"
+CHUNK_SIZE = 2500
+
+# Mapping DeepSeek short-keys to Hugging Face schema long-keys
+KEY_MAPPING = {
+    'pv': 'profanity_vulgarity',
+    'tah': 'targeted_abuse_harassment',
+    'dhs': 'discriminatory_hate_speech',
+    'cst': 'caste',
+    'cr': 'communal_religious',
+    'rx': 'regional_xenophobic',
+    'mg': 'misogyny_gender'
+}
+
+STUDENT_PROMPT = "You are an expert Hinglish content moderation AI. Analyze the following comment and output a JSON object containing the toxic classification flags and a brief analysis of the target and intent."
 
 SEED_VALUE = int(RUN_ID) % 100000 
 random.seed(SEED_VALUE)
@@ -73,9 +84,12 @@ HF_TOKEN = os.environ.get("HF_TOKEN")
 
 if not OPENCODE_KEY:
     raise ValueError("❌ OPENCODE_KEY environment variable is missing.")
+if not HF_TOKEN:
+    raise ValueError("❌ HF_TOKEN environment variable is missing.")
 
 client = OpenAI(api_key=OPENCODE_KEY, base_url="https://opencode.ai/zen/go/v1")
 MODEL_NAME = "deepseek-v4-flash"
+api = HfApi(token=HF_TOKEN)
 
 # ==========================================
 # 2. LOAD SUBREDDITS & DYNAMIC SYSTEM PROMPT
@@ -127,7 +141,7 @@ print(f"   ↳ Tier 2 (General / Regional): {len(TIER2_SUBS)} subreddits | Quota
 PROMPT_URL = "https://raw.githubusercontent.com/darelphilipo/hinglish_reddit_data/main/prompt/System_Prompt"
 prompt_start = time.time()
 try:
-    print(f"\n🌐 Fetching latest System Prompt from GitHub...")
+    print(f"\n🌐 Fetching latest System Prompt from GitHub (For DeepSeek Inference)...")
     response = requests.get(PROMPT_URL, timeout=10)
     response.raise_for_status()
     SYSTEM_PROMPT = response.text.strip()
@@ -145,16 +159,11 @@ print(f"\n🦆 [Worker {TARGET_YEAR}] Initializing DuckDB (Dynamic Seed: {SEED_V
 con = duckdb.connect()
 
 con.execute("PRAGMA memory_limit='6GB';") 
-con.execute("PRAGMA threads=4;")          # ⬇️ Lowered from 8 to 4        
+con.execute("PRAGMA threads=4;") 
 con.execute("INSTALL httpfs; LOAD httpfs;")
-
-if HF_TOKEN:
-    con.execute(f"CREATE SECRET hf_auth (TYPE HUGGINGFACE, TOKEN '{HF_TOKEN}');")
-
-api = HfApi(token=HF_TOKEN)
+con.execute(f"CREATE SECRET hf_auth (TYPE HUGGINGFACE, TOKEN '{HF_TOKEN}');")
 
 print(f"🔍 Querying Hugging Face explicitly for {TARGET_YEAR} shards...")
-# Target the specific year folder recursively to bypass global API truncation limits
 tree = api.list_repo_tree("open-index/arctic", repo_type="dataset", path_in_repo=f"data/comments/{TARGET_YEAR}", recursive=True)
 
 year_files = [f.path for f in tree if f.path.endswith('.parquet')]
@@ -189,7 +198,7 @@ def extract_subreddits(sub_list, tier_name):
         return pd.DataFrame()
     subs_formatted = ", ".join([f"'{s.replace(chr(39), chr(39)+chr(39))}'" for s in sub_list])
     raw_list = []
-    chunk_size = 10  # ⬇️ Lowered from 25 to prevent HTTP 429 Too Many Requests
+    chunk_size = 10
     
     for i in range(0, len(selected_shards), chunk_size):
         shard_chunk = selected_shards[i:i + chunk_size]
@@ -238,38 +247,18 @@ print("\n🧹 Sanitizing text...")
 
 def sanitize_text(text):
     if not isinstance(text, str): return ""
-    
-    # 1. Unescape HTML entities (&gt; becomes >)
     text = html.unescape(text)
-    
-    # 2. Strip actual HTML tags using Regex (Safe)
     text = re.sub(r'<[^>]+>', '', text)
-    
-    # 3. Replace newlines and tabs with a space
     text = re.sub(r'[\r\n\t]+', ' ', text)
-    
-    # 4. Clean Reddit specific formatting
     text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
     text = re.sub(r'/?u/[A-Za-z0-9_-]+', '', text) 
-    
-    # 5. Strip zero-width characters
     text = text.replace('\u200b', '').replace('\u200c', '').replace('\u200d', '')
-    
     try:
-        # 6. Clean text normalization
-        text = clean(text, 
-            fix_unicode=True, 
-            to_ascii=False, 
-            lower=False, 
-            no_line_breaks=True, 
-            no_urls=True, replace_with_url="",
-            no_emails=True, replace_with_email="",
-            no_phone_numbers=True, replace_with_phone_number=""
-        )
+        text = clean(text, fix_unicode=True, to_ascii=False, lower=False, no_line_breaks=True, 
+                     no_urls=True, replace_with_url="", no_emails=True, replace_with_email="",
+                     no_phone_numbers=True, replace_with_phone_number="")
     except Exception:
         pass
-        
-    # 7. Collapse multi-spaces into single space
     return re.sub(r'\s{2,}', ' ', text).strip()
 
 raw_df['body_clean'] = raw_df['body'].apply(sanitize_text)
@@ -321,7 +310,6 @@ def balance_tier_pool(tier_df, quota):
 t1_balanced = balance_tier_pool(raw_df[raw_df['tier_label'] == "Tier 1"], T1_QUOTA)
 t2_balanced = balance_tier_pool(raw_df[raw_df['tier_label'] == "Tier 2"], T2_QUOTA)
 
-# Combine tiers and handle surplus/deficit to match TARGET_ROWS_PER_JOB
 df = pd.concat([t1_balanced, t2_balanced], ignore_index=True)
 
 if len(df) < TARGET_ROWS_PER_JOB:
@@ -336,11 +324,8 @@ perf_metrics['sanitization_and_balancing_time'] = time.time() - sanitize_start
 
 print(f"🎯 Final Balanced Pool for {TARGET_YEAR}: {len(df):,} rows (Tier 1: {len(t1_balanced):,} | Tier 2: {len(t2_balanced):,}).")
 
-with open(LEDGER_PATH, 'a') as f:
-    for cid in df['id'].tolist(): f.write(f"{cid}\n")
-
 # ==========================================
-# 6. INFERENCE ENGINE (THREAD-SAFE & FIXED MERGE)
+# 6. INFERENCE ENGINE (THREAD-SAFE)
 # ==========================================
 api_start = time.time()
 
@@ -410,7 +395,90 @@ labels_df["temp_id"] = labels_df["temp_id"].astype(str)
 
 final_df = df.merge(labels_df, on="temp_id", how="left")
 final_df.drop(columns=["temp_id", "body_clean"], errors='ignore', inplace=True)
-final_df.to_csv(FINAL_CSV_PATH, index=False)
+
+# ==========================================
+# 7. DUAL-SCHEMA FORMATTING & HF SHARD UPLOAD
+# ==========================================
+print("\n🛠️ Formatting Dual-Schema (RoBERTa + Sarvam ChatML)...")
+final_df = final_df.dropna(subset=['pv']) # Drop any rows that failed inference completely
+formatted_records = []
+
+for idx, row in final_df.iterrows():
+    try:
+        # 1. Map short API keys to long HF schema keys for binary targets
+        labels = {long_key: int(row.get(short_key, 0)) for short_key, long_key in KEY_MAPPING.items()}
+        
+        # 2. Add Analysis/Reasoning
+        has_analysis = 'analysis' in row and pd.notna(row['analysis'])
+        if has_analysis:
+            labels['analysis'] = str(row['analysis']).strip()
+            
+        # 3. ChatML format (Using concise Student Prompt)
+        chatml_messages = [
+            {"role": "system", "content": STUDENT_PROMPT},
+            {"role": "user", "content": str(row['body']).strip()},
+            {"role": "assistant", "content": json.dumps(labels, ensure_ascii=False)}
+        ]
+        
+        # 4. Construct complete row
+        record = {
+            "id": str(row['id']),
+            "text": str(row['body']).strip(),
+            "subreddit": str(row.get('subreddit', 'unknown')),
+            "created_utc": row.get('created_utc', None),
+            "year_month": str(row['year_month']) if pd.notna(row.get('year_month')) else None
+        }
+        
+        record.update(labels)
+        record["messages"] = chatml_messages
+        
+        if has_analysis:
+             record['analysis'] = str(row['analysis']).strip() 
+             
+        formatted_records.append(record)
+    except Exception as e:
+        print(f"⚠️ Skipped formatting row {row.get('id', 'unknown')} due to error: {e}")
+
+hf_master_df = pd.DataFrame(formatted_records)
+total_lbl = len(hf_master_df)
+
+print(f"\n☁️ Initiating Chunked Upload to Hugging Face ({CHUNK_SIZE} rows/chunk)...")
+timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+chunks = [hf_master_df[i:i + CHUNK_SIZE] for i in range(0, len(hf_master_df), CHUNK_SIZE)]
+
+for chunk_idx, chunk_df in enumerate(chunks):
+    chunk_name = f"worker_{TARGET_YEAR}_{timestamp_str}_part_{chunk_idx:03d}.parquet"
+    hf_path = f"data/{chunk_name}"
+    local_parquet_path = f"./{chunk_name}"
+    
+    print(f"   📤 Uploading {chunk_name} ({len(chunk_df):,} rows)...")
+    chunk_df.to_parquet(local_parquet_path, engine='pyarrow', index=False)
+    
+    max_retries = 5
+    for attempt in range(1, max_retries + 1):
+        try:
+            api.upload_file(
+                path_or_fileobj=local_parquet_path,
+                path_in_repo=hf_path,
+                repo_id=HF_REPO_ID,
+                repo_type="dataset"
+            )
+            print(f"   ✅ Successfully pushed {chunk_name} to HF.")
+            
+            # Secure Ledger Checkpoint only AFTER successful upload
+            with open(LEDGER_PATH, 'a') as f:
+                for cid in chunk_df['id'].tolist():
+                    f.write(f"{cid}\n")
+                    
+            os.remove(local_parquet_path)
+            time.sleep(2)
+            break
+        except Exception as e:
+            print(f"   ⚠️ Upload failed on attempt {attempt}/{max_retries}: {e}")
+            if attempt == max_retries:
+                print(f"❌ Failed to upload {chunk_name}. It will be re-processed next run.")
+                if os.path.exists(local_parquet_path): os.remove(local_parquet_path)
+            time.sleep(min(3 ** attempt, 30))
 
 perf_metrics['api_inference_time'] = time.time() - api_start
 perf_metrics['total_script_time'] = time.time() - script_start_time
@@ -418,9 +486,8 @@ stop_telemetry.set()
 monitor_thread.join()
 
 # ==========================================
-# 7. COMPLETE PERFORMANCE & RESOURCE LOG
+# 8. COMPLETE PERFORMANCE & RESOURCE LOG
 # ==========================================
-total_lbl = len(final_df)
 p_tokens = perf_metrics['total_prompt_tokens']
 c_tokens = perf_metrics['total_completion_tokens']
 comb_tokens = perf_metrics['total_combined_tokens']
@@ -433,11 +500,11 @@ avg_tokens_per_comment = (comb_tokens / total_lbl) if total_lbl > 0 else 0.0
 print("\n==================================================")
 print(" 📈 PIPELINE PERFORMANCE & RESOURCE LOG")
 print("==================================================")
-print(f"Total Rows Labeled       : {total_lbl:,}")
+print(f"Total Rows Labeled & Pushed : {total_lbl:,}")
 print(f"Prompt Fetch Time        : {perf_metrics['prompt_fetch_time']:.2f}s")
 print(f"DuckDB Extract Time      : {perf_metrics['duckdb_extract_time']:.2f}s")
 print(f"Data Prep & Sanitize     : {perf_metrics['sanitization_and_balancing_time']:.2f}s")
-print(f"API Inference Time       : {perf_metrics['api_inference_time']:.2f}s")
+print(f"API Inference & Upload   : {perf_metrics['api_inference_time']:.2f}s")
 print(f"Total Workflow Time      : {perf_metrics['total_script_time']:.2f}s")
 print("\n--- 💳 COMPLETE API TOKEN METRICS ---")
 print(f"Total Input / Prompt Tokens : {p_tokens:,}")
@@ -447,4 +514,4 @@ print(f"Total Output / Completion   : {c_tokens:,}")
 print(f"Total Combined Tokens       : {comb_tokens:,}")
 print(f"Average Tokens / Comment    : {avg_tokens_per_comment:.1f} tokens/comment")
 print("==================================================")
-print(f"✅ Worker {TARGET_YEAR} Complete! Saved to {FINAL_CSV_PATH}")
+print(f"✅ Worker {TARGET_YEAR} Complete! All shards safely secured in Hugging Face.")
