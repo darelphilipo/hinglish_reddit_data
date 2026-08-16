@@ -293,7 +293,7 @@ def duckdb_extract(sub_list, hf_urls_list, quota, limit=5000):
     sub_clause = f"AND LOWER(subreddit) IN ({subs_formatted})"
         
     query = f"""
-    SELECT id, body, LOWER(subreddit) as subreddit 
+    SELECT id, body, LOWER(subreddit) as subreddit, created_utc
     FROM read_parquet({hf_urls_list}) 
     WHERE ({filter_clauses}) {sub_clause} AND body NOT IN ('[deleted]', '[removed]', '') 
     LIMIT {limit}
