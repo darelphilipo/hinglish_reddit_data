@@ -1,14 +1,13 @@
 import pandas as pd
-import glob
 import os
 import json
+from datasets import load_dataset
 
-print("🔄 Initializing Master Merge & Dynamic Target Analysis...")
+print("🔄 Initializing Master Dynamic Target Analysis via Hugging Face...")
 
-BASE_OUTPUT_DIR = './labelled_output/'
-CHUNKS_DIR = os.path.join(BASE_OUTPUT_DIR, 'chunks/')
-MASTER_PATH = os.path.join(BASE_OUTPUT_DIR, 'master_baseline_tier1.csv')
-TARGETS_PATH = os.path.join(BASE_OUTPUT_DIR, 'pipeline_targets.json')
+HF_REPO_ID = "darelphilip/hinglish-toxicity"
+TARGETS_DIR = './prompt/'
+TARGETS_PATH = os.path.join(TARGETS_DIR, 'pipeline_targets.json')
 
 # ==========================================
 # 1. DYNAMIC PIPELINE BLUEPRINT GENERATION
@@ -29,7 +28,7 @@ targets_dict = {
     }
 }
 
-os.makedirs(BASE_OUTPUT_DIR, exist_ok=True)
+os.makedirs(TARGETS_DIR, exist_ok=True)
 with open(TARGETS_PATH, 'w') as f:
     json.dump(targets_dict, f, indent=4)
 
@@ -38,68 +37,36 @@ print(f"   ↳ Target: {CLEAN_GOAL:,} Clean Rows | {CATEGORY_GOAL:,} per Toxic C
 print(f"   ↳ Saved to {TARGETS_PATH}")
 
 # ==========================================
-# 2. LOCATE & MERGE CHUNKS (NOW INCREMENTAL)
+# 2. PULL LIVE DATASET FROM HUGGING FACE
 # ==========================================
-all_files = glob.glob(os.path.join(CHUNKS_DIR, '*.csv'))
-
-if not all_files:
-    print("❌ No CSV chunk files found in ./labelled_output/chunks/. Exiting.")
+print(f"\n📥 Pulling live dataset from Hugging Face: {HF_REPO_ID}...")
+try:
+    ds = load_dataset(HF_REPO_ID, split="train")
+    master_df = ds.to_pandas()
+    print(f"   ↳ Successfully loaded {len(master_df):,} rows from Hugging Face.")
+except Exception as e:
+    print(f"❌ Failed to load dataset from HF: {e}")
     exit(1)
 
-print(f"\n📦 Found {len(all_files)} dataset chunks. Merging...")
-
-rename_mapping = {
-    "pv": "profanity_vulgarity",
-    "tah": "targeted_abuse_harassment",
-    "dhs": "discriminatory_hate_speech",
-    "cst": "caste",
-    "cr": "communal_religious",
-    "rx": "regional_xenophobic",
-    "mg": "misogyny_gender"
-}
-
-df_list = []
-
-# 🛡️ THE FIX: Load the existing master file so we append to it instead of wiping it
-if os.path.exists(MASTER_PATH):
-    existing_master = pd.read_csv(MASTER_PATH)
-    df_list.append(existing_master)
-    print(f"   ↳ Loaded existing Master Dataset ({len(existing_master)} rows) to preserve history.")
-
-# Load the new chunks
-for file in all_files:
-    temp_df = pd.read_csv(file)
-    temp_df.rename(columns=rename_mapping, inplace=True)
-    df_list.append(temp_df)
-
-master_df = pd.concat(df_list, ignore_index=True)
 # ==========================================
-# 3. DEDUPLICATION
+# 3. MEMORY DEDUPLICATION (For Accurate Counting)
 # ==========================================
 initial_len = len(master_df)
-master_df.drop_duplicates(subset=['body'], keep='first', inplace=True)
+# We deduplicate on the 'text' column which holds the comment body
+master_df.drop_duplicates(subset=['text'], keep='first', inplace=True)
 dedup_count = initial_len - len(master_df)
-print(f"✂️ Dropped {dedup_count} cross-run duplicate comments.")
+if dedup_count > 0:
+    print(f"✂️ Found {dedup_count} cross-run duplicate comments in memory.")
 
 # ==========================================
-# 4. SAVE & ANALYZE
+# 4. ANALYZE FINAL DISTRIBUTIONS
 # ==========================================
-master_df.to_csv(MASTER_PATH, index=False)
-
-# NEW CLEANUP CODE: Delete the chunks now that they are safely in the Master file
-for file in all_files:
-    try:
-        os.remove(file)
-    except Exception as e:
-        pass
-print("🧹 Cleaned up all processed chunk files.")
-
 total_rows = len(master_df)
 print("\n==================================================")
 print(f" 📊 FINAL MASTER DISTRIBUTION REPORT ({total_rows:,} Rows)")
 print("==================================================")
 
-# Safely check for columns in case LLM missed any
+# Safely check for columns in case they are missing
 core_toxic_cols = ['profanity_vulgarity', 'targeted_abuse_harassment', 'discriminatory_hate_speech']
 for col in core_toxic_cols:
     if col not in master_df.columns:
@@ -123,4 +90,4 @@ for col, target in targets_dict['categories'].items():
     print(f"{col:<22}: {count:>5} / {target:>4} target | Shortfall: {shortfall:,}")
 
 print("\n==================================================")
-print(f"✅ Master dataset successfully saved and updated at: {MASTER_PATH}")
+print("✅ Blueprint generated and real-time HF distribution analysis complete!")
