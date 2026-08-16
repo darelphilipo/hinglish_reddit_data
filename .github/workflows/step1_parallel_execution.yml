@@ -1,4 +1,4 @@
-name: "Step 1 & 2: Parallel Extraction, Merge & Commit"
+name: "Step 1 & 2: Parallel Extraction & Analysis"
 
 on:
   workflow_dispatch:
@@ -69,7 +69,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas tqdm openai duckdb huggingface_hub psutil clean-text requests unidecode
+          pip install pandas tqdm openai duckdb huggingface_hub psutil clean-text requests unidecode pyarrow
 
       - name: Execute Parallel Worker Script
         env:
@@ -82,17 +82,18 @@ jobs:
           TARGET_ROWS: ${{ needs.setup-matrix.outputs.rows_per_year }}
         run: python step1_parallel_worker.py
 
-      - name: Upload Worker CSV Artifact
+      - name: Upload Worker Ledger Artifact
+        if: always() # Uploads the ledger even if the script hits a rate limit and crashes
         uses: actions/upload-artifact@v4
         with:
-          name: baseline-part-${{ matrix.target_year }}
-          path: ./labelled_output/chunks/*.csv
-          retention-days: 7
+          name: ledger-${{ matrix.target_year }}
+          path: ./seen_ids_ledger.txt
+          retention-days: 1
 
   # ==========================================
-  # JOB 3: MERGE & PUSH TO REPO
+  # JOB 3: ANALYSIS & COMMIT
   # ==========================================
-  merge-and-commit:
+  analyze-and-commit:
     needs: run-parallel-matrix
     runs-on: ubuntu-latest
     permissions:
@@ -108,31 +109,41 @@ jobs:
           python-version: '3.12'
 
       - name: Install Dependencies
-        run: pip install pandas
+        run: pip install pandas huggingface_hub datasets
 
-      - name: Download Matrix Artifacts
+      - name: Download Ledger Artifacts
         uses: actions/download-artifact@v4
         with:
-          path: ./labelled_output/chunks/
-          merge-multiple: true
+          path: ./temp_ledgers/
 
-      - name: Run Master Merge & Analysis (Step 2)
+      - name: Merge Worker Ledgers
+        run: |
+          # Combine all downloaded parallel ledgers into the main repository ledger
+          find ./temp_ledgers/ -name "seen_ids_ledger.txt" -exec cat {} + >> seen_ids_ledger.txt || echo "No new ledgers found."
+          
+          # Deduplicate the merged ledger
+          sort -u seen_ids_ledger.txt -o seen_ids_ledger.txt
+          
+          # Clean up temp dir
+          rm -rf ./temp_ledgers/
+
+      - name: Run Master Analysis (Step 2)
         env:
           PYTHONUNBUFFERED: 1
           GLOBAL_DATASET_GOAL: ${{ inputs.total_rows }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: python step2_merge_and_analyze.py
 
-      - name: Commit and Push Datasets (With Collision Handling)
+      - name: Commit and Push Tracked Data
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           
-          # Add modified files
-          git add -A labelled_output/ prompt/
+          # Only stage the ledger and the analysis targets JSON
+          git add seen_ids_ledger.txt prompt/pipeline_targets.json || echo "Files missing."
           
-          # Only proceed if there are actual stage changes
           if ! git diff --staged --quiet; then
-            git commit -m "Auto-harvested and merged target data [skip ci]"
+            git commit -m "Auto-update ledger and analysis targets [skip ci]"
             
             # Retry loop to handle race conditions
             for i in {1..3}; do
