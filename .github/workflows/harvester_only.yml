@@ -3,6 +3,10 @@ name: Targeted Data Harvester (Step 3 & 4)
 on:
   workflow_dispatch: 
 
+concurrency:
+  group: dataset-pipeline-lock
+  cancel-in-progress: false
+
 jobs:
   harvest-and-merge:
     runs-on: ubuntu-latest
@@ -48,14 +52,30 @@ jobs:
             exit $EXIT_CODE
           fi
 
-      - name: Commit Harvester Results & Updated Master
+      - name: Commit Harvester Results & Updated Master (With Collision Handling)
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Add modified files
           git add -A labelled_output/ prompt/
-          git commit -m "Auto-harvested and merged target data" || echo "No changes to commit"
-          git pull --rebase origin main
-          git push
+          
+          # Only proceed if there are actual stage changes
+          if ! git diff --staged --quiet; then
+            git commit -m "Auto-harvested and merged target data [skip ci]"
+            
+            # Retry loop to handle race conditions
+            for i in {1..3}; do
+              git fetch origin main
+              git rebase origin/main -X ours && git push origin main && break || {
+                echo "⚠️ Push collision detected. Retrying ($i/3)..."
+                git rebase --abort || true
+                sleep 5
+              }
+            done
+          else
+            echo "No changes to commit."
+          fi
 
       - name: The Autonomous Loop Trigger
         env:
@@ -69,7 +89,7 @@ jobs:
           elif [ "$EXIT_CODE" -eq "3" ]; then
             echo "🔄 Clean deficit detected. Triggering Step 1 Scraper to top off..."
             # Adjusts the filename if your YAML file is named differently
-            gh workflow run step1_parallel_execution.yml -f target_rows=2000 -f global_goal=50000
+            gh workflow run step1_parallel_execution.yml -f total_rows=2000 
           elif [ "$EXIT_CODE" -eq "0" ]; then
             echo "🎉 Dataset perfectly balanced! Hibernating."
           fi
