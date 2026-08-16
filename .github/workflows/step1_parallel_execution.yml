@@ -16,6 +16,10 @@ on:
         required: true
         default: '2020'
 
+concurrency:
+  group: dataset-pipeline-lock
+  cancel-in-progress: false
+
 jobs:
   # ==========================================
   # JOB 1: DYNAMIC MATH & MATRIX SETUP
@@ -118,10 +122,27 @@ jobs:
           GLOBAL_DATASET_GOAL: ${{ inputs.total_rows }}
         run: python step2_merge_and_analyze.py
 
-      - name: Commit and Push Datasets
+      - name: Commit and Push Datasets (With Collision Handling)
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A labelled_output/
-          git commit -m "Auto-generated: Updated master dataset and JSON blueprint" || echo "No changes to commit"
-          git push
+          
+          # Add modified files
+          git add -A labelled_output/ prompt/
+          
+          # Only proceed if there are actual stage changes
+          if ! git diff --staged --quiet; then
+            git commit -m "Auto-harvested and merged target data [skip ci]"
+            
+            # Retry loop to handle race conditions
+            for i in {1..3}; do
+              git fetch origin main
+              git rebase origin/main -X ours && git push origin main && break || {
+                echo "⚠️ Push collision detected. Retrying ($i/3)..."
+                git rebase --abort || true
+                sleep 5
+              }
+            done
+          else
+            echo "No changes to commit."
+          fi
