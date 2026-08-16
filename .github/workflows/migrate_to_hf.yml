@@ -1,0 +1,60 @@
+name: "One-Off: Migrate to Hugging Face"
+
+on:
+  workflow_dispatch: 
+
+concurrency:
+  group: dataset-pipeline-lock
+  cancel-in-progress: false
+
+jobs:
+  migrate-to-hf:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Needed to commit the ledger file back to the repo
+      
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas requests tqdm huggingface_hub pyarrow
+
+      - name: Run HF Migration Script
+        env:
+          PYTHONUNBUFFERED: 1
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python -u migrate_to_hf.py
+
+      - name: Commit Migration Ledger State
+        if: always()  # Executes even if the python script fails/exits midway
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Add the ledger if it exists
+          git add migration_ledger.json || echo "No ledger to add."
+          
+          # Only commit and push if there are actual changes to the ledger
+          if ! git diff --staged --quiet; then
+            git commit -m "Auto-update migration ledger [skip ci]"
+            
+            # Simple retry loop for the push
+            for i in {1..3}; do
+              git fetch origin main
+              git rebase origin/main -X ours && git push origin main && break || {
+                echo "⚠️ Push collision detected. Retrying ($i/3)..."
+                git rebase --abort || true
+                sleep 5
+              }
+            done
+          else
+            echo "No changes to the migration ledger."
+          fi
