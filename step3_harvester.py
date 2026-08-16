@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from openai import OpenAI
 from huggingface_hub import HfApi
+from datasets import load_dataset
 from cleantext import clean
 
 print("🌾 Initializing Autonomous Harvester: Regional-Strict 3-Tier Engine...")
@@ -45,23 +46,42 @@ monitor_thread.start()
 # ==========================================
 # 1. LOAD CONFIGS & CALCULATE GOALS
 # ==========================================
-BASE_OUTPUT_DIR = './labelled_output/'
-CHUNKS_DIR = os.path.join(BASE_OUTPUT_DIR, 'chunks/')
-os.makedirs(CHUNKS_DIR, exist_ok=True)
-MASTER_PATH = os.path.join(BASE_OUTPUT_DIR, 'master_baseline_tier1.csv')
-TARGETS_PATH = os.path.join(BASE_OUTPUT_DIR, 'pipeline_targets.json')
+TARGETS_DIR = './prompt/'
+TARGETS_PATH = os.path.join(TARGETS_DIR, 'pipeline_targets.json')
 SUBREDDIT_CONFIG_PATH = "prompt/subreddits.json"
 LEXICON_CONFIG_PATH = "prompt/master_lexicon.json"
 
-if not os.path.exists(MASTER_PATH) or not os.path.exists(TARGETS_PATH):
-    print("❌ Master dataset or Blueprint JSON not found. Run Step 1 & 2 first.")
+HF_REPO_ID = "darelphilip/hinglish-toxicity"
+CHUNK_SIZE = 2500
+
+KEY_MAPPING = {
+    'pv': 'profanity_vulgarity',
+    'tah': 'targeted_abuse_harassment',
+    'dhs': 'discriminatory_hate_speech',
+    'cst': 'caste',
+    'cr': 'communal_religious',
+    'rx': 'regional_xenophobic',
+    'mg': 'misogyny_gender'
+}
+STUDENT_PROMPT = "You are an expert Hinglish content moderation AI. Analyze the following comment and output a JSON object containing the toxic classification flags and a brief analysis of the target and intent."
+
+if not os.path.exists(TARGETS_PATH):
+    print("❌ Blueprint JSON not found. Run Step 2 first.")
     exit(1)
 
 with open(TARGETS_PATH, 'r') as f:
     blueprint = json.load(f)
 TARGETS = blueprint.get("categories", {})
 
-df = pd.read_csv(MASTER_PATH)
+print(f"📥 Pulling live dataset from Hugging Face: {HF_REPO_ID} to calculate shortfalls...")
+try:
+    ds = load_dataset(HF_REPO_ID, split="train")
+    df = ds.to_pandas()
+except Exception as e:
+    stop_telemetry.set()
+    print(f"❌ Failed to load dataset from HF: {e}")
+    exit(1)
+
 shortfalls = {cat: max(0, TARGETS[cat] - df.get(cat, pd.Series([0])).sum()) for cat in TARGETS}
 
 if all(s <= 0 for s in shortfalls.values()):
@@ -121,7 +141,7 @@ except Exception:
 def basic_tokenize(text): return re.findall(r'\b[a-z0-9]+\b', str(text).lower())
 
 global_df_freq = collections.Counter()
-corpus_list = df['body'].tolist()
+corpus_list = df['text'].dropna().tolist()
 total_corpus = len(corpus_list)
 
 for doc in tqdm(corpus_list, desc="   ↳ Analyzing Global Corpus", miniters=max(1, total_corpus//10), maxinterval=float('inf'), leave=False):
@@ -132,8 +152,8 @@ effective_stopwords = static_stopwords.union(dynamic_stopwords)
 print(f"   ↳ Dynamic Threshold Triggered: Auto-purged {len(dynamic_stopwords)} filler words.")
 
 target_tf, bg_df_freq = collections.Counter(), collections.Counter()
-for doc in df[df[priority_cat] == 1]['body'].tolist(): target_tf.update([w for w in basic_tokenize(doc) if w not in effective_stopwords and len(w)>2])
-for doc in df[df[priority_cat] == 0]['body'].tolist():
+for doc in df[df[priority_cat] == 1]['text'].dropna().tolist(): target_tf.update([w for w in basic_tokenize(doc) if w not in effective_stopwords and len(w)>2])
+for doc in df[df[priority_cat] == 0]['text'].dropna().tolist():
     for word in set([w for w in basic_tokenize(doc) if w not in effective_stopwords and len(w)>2]): bg_df_freq[word] += 1
 
 tfidf_scores = {w: tf * math.log(max(len(bg_df_freq), 1) / (bg_df_freq.get(w, 0) + 1)) for w, tf in target_tf.items()}
@@ -146,6 +166,9 @@ print(f"   ↳ Raw Statistical Seeds: {raw_seed_words}")
 print("\n🛡️ [DIAGNOSTIC] Phase 1.5: Dynamic LLM Safety Net")
 OPENCODE_KEY = os.environ.get("OPENCODE_KEY")
 HF_TOKEN = os.environ.get("HF_TOKEN")
+if not OPENCODE_KEY:
+    raise ValueError("❌ OPENCODE_KEY environment variable is missing.")
+
 client = OpenAI(api_key=OPENCODE_KEY, base_url="https://opencode.ai/zen/go/v1")
 MODEL_NAME = "deepseek-v4-flash"
 
@@ -159,17 +182,13 @@ try:
         extra_body={"thinking": {"type": "disabled"}}
     )
     
-    # Audit token usage for the safety net call
     f_usage = filter_res.usage.model_dump() if hasattr(filter_res.usage, 'model_dump') else vars(filter_res.usage)
     perf_metrics['total_prompt_tokens'] += f_usage.get('prompt_tokens', 0)
     perf_metrics['total_completion_tokens'] += f_usage.get('completion_tokens', 0)
     perf_metrics['generator_tokens'] += f_usage.get('total_tokens', 0)
 
     toxic_seeds = json.loads(filter_res.choices[0].message.content.strip()).get("toxic_seeds", [])
-    
-    # Fallback if the LLM over-corrected and wiped the entire list
-    if not toxic_seeds:
-        toxic_seeds = raw_seed_words[:3]
+    if not toxic_seeds: toxic_seeds = raw_seed_words[:3]
         
     print(f"   ↳ Sanitized Toxic Seeds: {toxic_seeds}")
 except Exception as e:
@@ -215,7 +234,6 @@ print("\n🦆 [DIAGNOSTIC] Phase 3: Regional-Strict Quota Extraction")
 CANDIDATE_THRESHOLD = 500
 SOFT_THRESHOLD = int(CANDIDATE_THRESHOLD * 0.8)
 
-# Strict Regional Quotas (15% Tier 1 | 80% Tier 2 Archive | 5% Tier 3 Live API)
 T1_QUOTA = max(1, int(SOFT_THRESHOLD * 0.15))
 T2_QUOTA = max(1, int(SOFT_THRESHOLD * 0.80))
 T3_QUOTA = max(1, int(SOFT_THRESHOLD * 0.05))
@@ -232,7 +250,7 @@ extraction_stats = {
     "Tier 3 (Targeted Live API)": collections.defaultdict(int)
 }
 
-# --- TIER 3: TARGETED LIVE API (5% Quota / Strict Regional Subs) ---
+# --- TIER 3: TARGETED LIVE API (5% Quota) ---
 def fetch_tier3_live(subreddits, lexicon, max_rows, time_budget=15):
     print(f"      -> [Tier 3] Targeted Arctic API Search (Target: {max_rows} rows | Budget: {time_budget}s)...")
     session = requests.Session()
@@ -258,17 +276,19 @@ def fetch_tier3_live(subreddits, lexicon, max_rows, time_budget=15):
                 
                 for item in resp.json().get("data", []):
                     body = item.get("body", "")
+                    created_utc = item.get("created_utc", None)
+                    ym = datetime.utcfromtimestamp(created_utc).strftime('%Y-%m') if created_utc else None
                     if body and body not in ["[removed]", "[deleted]"]:
-                        collected.append({"id": item.get("id"), "body": body, "subreddit": sub, "created_utc": item.get("created_utc")})
+                        collected.append({"id": item.get("id"), "body": body, "subreddit": sub, "created_utc": created_utc, "year_month": ym})
                 time.sleep(0.5)
             except Exception:
                 continue
                 
-    df = pd.DataFrame(collected)
-    if not df.empty:
-        df = df.drop_duplicates(subset=["id"])
-        if len(df) > max_rows: df = df.sample(max_rows)
-    return df
+    t3_df = pd.DataFrame(collected)
+    if not t3_df.empty:
+        t3_df = t3_df.drop_duplicates(subset=["id"])
+        if len(t3_df) > max_rows: t3_df = t3_df.sample(max_rows)
+    return t3_df
 
 t3_df = fetch_tier3_live(TIER1_SUBS + TIER2_SUBS[:20], final_keywords, T3_QUOTA)
 if not t3_df.empty:
@@ -293,7 +313,7 @@ def duckdb_extract(sub_list, hf_urls_list, quota, limit=5000):
     sub_clause = f"AND LOWER(subreddit) IN ({subs_formatted})"
         
     query = f"""
-    SELECT id, body, LOWER(subreddit) as subreddit, created_utc
+    SELECT id, body, LOWER(subreddit) as subreddit, created_utc, strftime(epoch_ms(created_utc * 1000), '%Y-%m') as year_month
     FROM read_parquet({hf_urls_list}) 
     WHERE ({filter_clauses}) {sub_clause} AND body NOT IN ('[deleted]', '[removed]', '') 
     LIMIT {limit}
@@ -302,7 +322,6 @@ def duckdb_extract(sub_list, hf_urls_list, quota, limit=5000):
     if len(res_df) > quota: res_df = res_df.sample(quota)
     return res_df
 
-# Progress bar for DuckDB Time Travel
 with tqdm(total=(2024 - current_year + 1), desc="      -> [DuckDB Regional Scan]", leave=False) as pbar:
     while current_year <= 2024 and len(harvest_df) < SOFT_THRESHOLD:
         year_files = [f for f in all_files if f.endswith('.parquet') and f'data/comments/{current_year}' in f]
@@ -311,14 +330,12 @@ with tqdm(total=(2024 - current_year + 1), desc="      -> [DuckDB Regional Scan]
             
         hf_urls = [f"hf://datasets/open-index/arctic/{f}" for f in random.sample(year_files, min(40, len(year_files)))]
 
-        # Tier 1 Extraction
         if len(t1_df) < T1_QUOTA:
             t1_new = duckdb_extract(TIER1_SUBS, hf_urls, T1_QUOTA - len(t1_df))
             if not t1_new.empty:
                 t1_df = pd.concat([t1_df, t1_new]).drop_duplicates(subset=['id'])
                 extraction_stats["Tier 1 (Core Echo)"][current_year] += len(t1_new)
         
-        # Tier 2 Extraction
         if len(t2_df) < T2_QUOTA:
             t2_new = duckdb_extract(TIER2_SUBS, hf_urls, T2_QUOTA - len(t2_df))
             if not t2_new.empty:
@@ -344,7 +361,7 @@ print(f"   -------------------------------------------------")
 print(f"   🚀 Total Regional Pool: {len(harvest_df)} Candidates")
 
 # ==========================================
-# 5. SANITIZATION & AUTONOMOUS LABELING
+# 5. SANITIZATION, LABELING & HUGGING FACE UPLOAD
 # ==========================================
 print(f"\n🛡️ [DIAGNOSTIC] Phase 4: Verification of Candidates")
 
@@ -415,14 +432,70 @@ with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
 labels_df = pd.DataFrame(all_labels)
 if 'id' in labels_df.columns: labels_df.drop(columns=["id"], inplace=True)
 labels_df["temp_id"] = labels_df["temp_id"].astype(str)
-labels_df.rename(columns={"pv": "profanity_vulgarity", "tah": "targeted_abuse_harassment", "dhs": "discriminatory_hate_speech", "cst": "caste", "cr": "communal_religious", "rx": "regional_xenophobic", "mg": "misogyny_gender"}, inplace=True)
 
 final_df = harvest_df.merge(labels_df, on="temp_id", how="inner").drop(columns=["temp_id", "body_clean"], errors='ignore')
-final_df = final_df[final_df[priority_cat].notna()]
+final_df = final_df[final_df['pv'].notna()]
 
-timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-FINAL_PATH = os.path.join(CHUNKS_DIR, f'harvested_tier1_{priority_cat}_{timestamp}.csv')
-final_df.to_csv(FINAL_PATH, index=False)
+print("\n🛠️ Formatting Dual-Schema (RoBERTa + Sarvam ChatML)...")
+formatted_records = []
+
+for idx, row in final_df.iterrows():
+    try:
+        labels = {long_key: int(row.get(short_key, 0)) for short_key, long_key in KEY_MAPPING.items()}
+        has_analysis = 'analysis' in row and pd.notna(row['analysis'])
+        if has_analysis:
+            labels['analysis'] = str(row['analysis']).strip()
+            
+        chatml_messages = [
+            {"role": "system", "content": STUDENT_PROMPT},
+            {"role": "user", "content": str(row['body']).strip()},
+            {"role": "assistant", "content": json.dumps(labels, ensure_ascii=False)}
+        ]
+        
+        record = {
+            "id": str(row['id']),
+            "text": str(row['body']).strip(),
+            "subreddit": str(row.get('subreddit', 'unknown')),
+            "created_utc": row.get('created_utc', None),
+            "year_month": str(row['year_month']) if pd.notna(row.get('year_month')) else None
+        }
+        
+        record.update(labels)
+        record["messages"] = chatml_messages
+        if has_analysis:
+             record['analysis'] = str(row['analysis']).strip() 
+             
+        formatted_records.append(record)
+    except Exception as e:
+        pass
+
+hf_master_df = pd.DataFrame(formatted_records)
+total_lbl = len(hf_master_df)
+
+print(f"\n☁️ Initiating Chunked Upload to Hugging Face ({CHUNK_SIZE} rows/chunk)...")
+timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+chunks = [hf_master_df[i:i + CHUNK_SIZE] for i in range(0, len(hf_master_df), CHUNK_SIZE)]
+
+for chunk_idx, chunk_df in enumerate(chunks):
+    chunk_name = f"harvester_{priority_cat}_{timestamp_str}_part_{chunk_idx:03d}.parquet"
+    hf_path = f"data/{chunk_name}"
+    local_parquet_path = f"./{chunk_name}"
+    
+    print(f"   📤 Uploading {chunk_name} ({len(chunk_df):,} rows)...")
+    chunk_df.to_parquet(local_parquet_path, engine='pyarrow', index=False)
+    
+    max_retries = 5
+    for attempt in range(1, max_retries + 1):
+        try:
+            api.upload_file(path_or_fileobj=local_parquet_path, path_in_repo=hf_path, repo_id=HF_REPO_ID, repo_type="dataset")
+            print(f"   ✅ Successfully pushed {chunk_name} to HF.")
+            os.remove(local_parquet_path)
+            time.sleep(2)
+            break
+        except Exception as e:
+            if attempt == max_retries:
+                if os.path.exists(local_parquet_path): os.remove(local_parquet_path)
+            time.sleep(min(3 ** attempt, 30))
 
 stop_telemetry.set()
 monitor_thread.join()
@@ -431,8 +504,9 @@ print("\n==================================================")
 print(" 🏁 HARVESTER YIELD & TELEMETRY REPORT")
 print("==================================================")
 hit_rate = (perf_metrics['total_cache_hits'] / perf_metrics['total_prompt_tokens'] * 100) if perf_metrics['total_prompt_tokens'] > 0 else 0
+print(f"Total Rows Labeled & Pushed : {total_lbl:,}")
 print(f"Total Workflow Time      : {time.time() - script_start_time:.2f}s")
 print(f"LLM Generator Tokens     : {perf_metrics['generator_tokens']:,}")
 print(f"Inference Prompt Tokens  : {perf_metrics['total_prompt_tokens']:,} (Cache Hit: {hit_rate:.1f}%)")
 print(f"Inference Output Tokens  : {perf_metrics['total_completion_tokens']:,}")
-print(f"✅ Verified data committed to: {FINAL_PATH}")
+print(f"✅ Verified shards successfully uploaded to Hugging Face!")
