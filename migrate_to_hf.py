@@ -19,7 +19,7 @@ CHUNK_SIZE = 2500  # Uploads in batches of 2,500 to create safe checkpoints
 
 HF_TOKEN = os.environ.get("HF_TOKEN")
 # ⚠️ CHANGE THIS to your actual Hugging Face username and dataset name
-HF_REPO_ID = "darelphilipo/hinglish-toxicity" 
+HF_REPO_ID = "darelphilip/hinglish-toxicity" 
 
 if not HF_TOKEN:
     print("❌ Error: HF_TOKEN environment variable is missing.")
