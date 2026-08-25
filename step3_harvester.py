@@ -234,9 +234,9 @@ print("\n🦆 [DIAGNOSTIC] Phase 3: Regional-Strict Quota Extraction")
 CANDIDATE_THRESHOLD = 500
 SOFT_THRESHOLD = int(CANDIDATE_THRESHOLD * 0.8)
 
-T1_QUOTA = max(1, int(SOFT_THRESHOLD * 0.05))
-T2_QUOTA = max(1, int(SOFT_THRESHOLD * 0.10))
-T3_QUOTA = max(1, int(SOFT_THRESHOLD * 0.85))
+T1_QUOTA = 0
+T2_QUOTA = 0
+T3_QUOTA = int(SOFT_THRESHOLD * 1.0)
 
 print(f"   ↳ Target Candidates: {SOFT_THRESHOLD} | Quotas -> Tier 1: {T1_QUOTA} | Tier 2: {T2_QUOTA} | Tier 3 (5% API): {T3_QUOTA}")
 
