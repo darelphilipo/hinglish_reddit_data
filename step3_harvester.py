@@ -234,12 +234,17 @@ print("\n🦆 [DIAGNOSTIC] Phase 3: Regional-Strict Quota Extraction")
 CANDIDATE_THRESHOLD = 500
 SOFT_THRESHOLD = int(CANDIDATE_THRESHOLD * 0.8)
 
-# FORCING 100% OF EXTRACTION TO THE ARCTIC API
-T1_QUOTA = 0
-T2_QUOTA = 0
-T3_QUOTA = int(SOFT_THRESHOLD * 1.0)
+# ⚙️ EXTRACTION QUOTA DISTRIBUTION
+# Adjust these percentages to route the workload (Must equal 1.0 total)
+PCT_TIER1_ECHO   = 0.0
+PCT_TIER2_ARCHIV = 0.0
+PCT_TIER3_ARCTIC = 1.0
 
-print(f"   ↳ Target Candidates: {SOFT_THRESHOLD} | Quotas -> Tier 1: {T1_QUOTA} | Tier 2: {T2_QUOTA} | Tier 3 (100% API): {T3_QUOTA}")
+T1_QUOTA = int(SOFT_THRESHOLD * PCT_TIER1_ECHO)
+T2_QUOTA = int(SOFT_THRESHOLD * PCT_TIER2_ARCHIV)
+T3_QUOTA = int(SOFT_THRESHOLD * PCT_TIER3_ARCTIC)
+
+print(f"   ↳ Target Candidates: {SOFT_THRESHOLD} | Quotas -> Tier 1: {T1_QUOTA} | Tier 2: {T2_QUOTA} | Tier 3 (Arctic): {T3_QUOTA}")
 
 harvest_df = pd.DataFrame()
 safe_keywords = [k.replace("'", "''").lower() for k in final_keywords][:35]
@@ -251,40 +256,49 @@ extraction_stats = {
     "Tier 3 (Targeted Live API)": collections.defaultdict(int)
 }
 
-# --- TIER 3: TARGETED ARCTIC API (100% Quota) ---
-def fetch_tier3_live(subreddits, lexicon, max_rows, time_budget=120):
+# --- TIER 3: TARGETED ARCTIC API ---
+def fetch_tier3_live(subreddits, lexicon, max_rows, pct_allocated):
+    # Dynamically scale time budget based on how much work Tier 3 is expected to do
+    time_budget = max(15, int(120 * pct_allocated))
     print(f"      -> [Tier 3] Targeted Arctic API Search (Target: {max_rows} rows | Budget: {time_budget}s)...")
+    
+    if max_rows <= 0 or not subreddits or not lexicon: 
+        return pd.DataFrame()
+        
     session = requests.Session()
     start_time = time.time()
     collected = []
-    
-    if not subreddits or not lexicon: return pd.DataFrame()
 
-    # REMOVED THE RANDOM BOTTLENECK: Shuffle full lists to search huge matrix
     random.shuffle(subreddits)
-    random.shuffle(lexicon)
     
-    api_calls_made = 0
-    api_successes = 0
-    api_rate_limits = 0
+    # Strictly sanitize lexicon: Arctic Shift uses Postgres FTS which crashes on special characters
+    clean_lexicon = [term for term in lexicon if re.match(r'^[a-zA-Z0-9]+$', term)]
+    random.shuffle(clean_lexicon)
+    
+    api_calls_made, api_successes, api_rate_limits = 0, 0, 0
     
     for sub in subreddits:
         if len(collected) >= max_rows or (time.time() - start_time) > time_budget: break
         
-        for term in lexicon:
+        for term in clean_lexicon:
             if len(collected) >= max_rows or (time.time() - start_time) > time_budget: break
             
-            params = {"subreddit": sub, "q": term, "limit": 100, "sort": "desc"}
+            # Using 'body' parameter for comments as per Arctic Shift documentation
+            params = {"subreddit": sub, "body": term, "limit": 100, "sort": "desc"}
             api_calls_made += 1
             
             try:
                 resp = session.get("https://arctic-shift.photon-reddit.com/api/comments/search", params=params, timeout=10)
                 
-                # Handle Rate Limits gracefully
                 if resp.status_code == 429: 
                     api_rate_limits += 1
                     time.sleep(3) 
                     continue
+                
+                # If API rejects subreddit, it's not indexed. Break word loop and move to next sub.
+                if resp.status_code == 400:
+                    print(f"         [DEBUG] API rejected r/{sub} (Likely not indexed). Skipping sub.")
+                    break 
                     
                 resp.raise_for_status()
                 api_successes += 1
@@ -306,11 +320,10 @@ def fetch_tier3_live(subreddits, lexicon, max_rows, time_budget=120):
                 if found_in_call > 0:
                     print(f"         [DEBUG] Found {found_in_call} hits for '{term}' in r/{sub}")
                     
-                time.sleep(0.5) # Gentle pause between API calls
+                time.sleep(0.5)
                 
             except requests.exceptions.RequestException as e:
-                # Catch actual HTTP/Connection errors to log them instead of silently passing
-                print(f"         [DEBUG] API Error on r/{sub} with '{term}': {e}")
+                print(f"         [DEBUG] API Connection Error on r/{sub}: {e}")
                 time.sleep(2)
                 continue
                 
@@ -322,62 +335,62 @@ def fetch_tier3_live(subreddits, lexicon, max_rows, time_budget=120):
         if len(t3_df) > max_rows: t3_df = t3_df.sample(max_rows)
     return t3_df
 
-# Passed FULL sub lists and 120-second budget to ensure it thoroughly hits the Arctic API
-t3_df = fetch_tier3_live(TIER1_SUBS + TIER2_SUBS, final_keywords, T3_QUOTA, time_budget=120)
+t3_df = fetch_tier3_live(TIER1_SUBS + TIER2_SUBS, final_keywords, T3_QUOTA, PCT_TIER3_ARCTIC)
 if not t3_df.empty:
     harvest_df = pd.concat([harvest_df, t3_df], ignore_index=True)
     extraction_stats["Tier 3 (Targeted Live API)"]["ArcticHits"] = len(t3_df)
 print(f"         ✅ Yield: {len(t3_df)} candidates from Arctic API.")
 
 # --- TIER 1 & 2: DUCKDB REGIONAL ARCHIVES (2017-2024) ---
-print(f"      -> Searching Regional DuckDB Archives (2017-2024)")
-con = duckdb.connect()
-con.execute("PRAGMA memory_limit='6GB'; PRAGMA threads=8; INSTALL httpfs; LOAD httpfs;")
-if HF_TOKEN: con.execute(f"CREATE SECRET hf_auth (TYPE HUGGINGFACE, TOKEN '{HF_TOKEN}');")
-api = HfApi(token=HF_TOKEN)
-all_files = api.list_repo_files("open-index/arctic", repo_type="dataset")
-
-t1_df, t2_df = pd.DataFrame(), pd.DataFrame()
-current_year = int(os.environ.get("TARGET_YEAR", 2017))
-
-def duckdb_extract(sub_list, hf_urls_list, quota, limit=5000):
-    if not sub_list: return pd.DataFrame()
-    subs_formatted = ", ".join([f"'{s.replace(chr(39), chr(39)+chr(39))}'" for s in sub_list])
-    sub_clause = f"AND LOWER(subreddit) IN ({subs_formatted})"
-        
-    query = f"""
-    SELECT id, body, LOWER(subreddit) as subreddit, created_utc, strftime(epoch_ms(created_utc * 1000), '%Y-%m') as year_month
-    FROM read_parquet({hf_urls_list}) 
-    WHERE ({filter_clauses}) {sub_clause} AND body NOT IN ('[deleted]', '[removed]', '') 
-    LIMIT {limit}
-    """
-    res_df = con.query(query).to_df()
-    if len(res_df) > quota: res_df = res_df.sample(quota)
-    return res_df
-
-with tqdm(total=(2024 - current_year + 1), desc="      -> [DuckDB Regional Scan]", leave=False) as pbar:
-    while current_year <= 2024 and len(harvest_df) < SOFT_THRESHOLD:
-        year_files = [f for f in all_files if f.endswith('.parquet') and f'data/comments/{current_year}' in f]
-        if not year_files:
-            current_year += 1; pbar.update(1); continue
+if T1_QUOTA > 0 or T2_QUOTA > 0:
+    print(f"      -> Searching Regional DuckDB Archives (2017-2024)")
+    con = duckdb.connect()
+    con.execute("PRAGMA memory_limit='6GB'; PRAGMA threads=8; INSTALL httpfs; LOAD httpfs;")
+    if HF_TOKEN: con.execute(f"CREATE SECRET hf_auth (TYPE HUGGINGFACE, TOKEN '{HF_TOKEN}');")
+    api = HfApi(token=HF_TOKEN)
+    all_files = api.list_repo_files("open-index/arctic", repo_type="dataset")
+    
+    t1_df, t2_df = pd.DataFrame(), pd.DataFrame()
+    current_year = int(os.environ.get("TARGET_YEAR", 2017))
+    
+    def duckdb_extract(sub_list, hf_urls_list, quota, limit=5000):
+        if not sub_list or quota <= 0: return pd.DataFrame()
+        subs_formatted = ", ".join([f"'{s.replace(chr(39), chr(39)+chr(39))}'" for s in sub_list])
+        sub_clause = f"AND LOWER(subreddit) IN ({subs_formatted})"
             
-        hf_urls = [f"hf://datasets/open-index/arctic/{f}" for f in random.sample(year_files, min(40, len(year_files)))]
-
-        if len(t1_df) < T1_QUOTA:
-            t1_new = duckdb_extract(TIER1_SUBS, hf_urls, T1_QUOTA - len(t1_df))
-            if not t1_new.empty:
-                t1_df = pd.concat([t1_df, t1_new]).drop_duplicates(subset=['id'])
-                extraction_stats["Tier 1 (Core Echo)"][current_year] += len(t1_new)
-        
-        if len(t2_df) < T2_QUOTA:
-            t2_new = duckdb_extract(TIER2_SUBS, hf_urls, T2_QUOTA - len(t2_df))
-            if not t2_new.empty:
-                t2_df = pd.concat([t2_df, t2_new]).drop_duplicates(subset=['id'])
-                extraction_stats["Tier 2 (Expanded Archive)"][current_year] += len(t2_new)
+        query = f"""
+        SELECT id, body, LOWER(subreddit) as subreddit, created_utc, strftime(epoch_ms(created_utc * 1000), '%Y-%m') as year_month
+        FROM read_parquet({hf_urls_list}) 
+        WHERE ({filter_clauses}) {sub_clause} AND body NOT IN ('[deleted]', '[removed]', '') 
+        LIMIT {limit}
+        """
+        res_df = con.query(query).to_df()
+        if len(res_df) > quota: res_df = res_df.sample(quota)
+        return res_df
+    
+    with tqdm(total=(2024 - current_year + 1), desc="      -> [DuckDB Regional Scan]", leave=False) as pbar:
+        while current_year <= 2024 and len(harvest_df) < SOFT_THRESHOLD:
+            year_files = [f for f in all_files if f.endswith('.parquet') and f'data/comments/{current_year}' in f]
+            if not year_files:
+                current_year += 1; pbar.update(1); continue
+                
+            hf_urls = [f"hf://datasets/open-index/arctic/{f}" for f in random.sample(year_files, min(40, len(year_files)))]
+    
+            if len(t1_df) < T1_QUOTA:
+                t1_new = duckdb_extract(TIER1_SUBS, hf_urls, T1_QUOTA - len(t1_df))
+                if not t1_new.empty:
+                    t1_df = pd.concat([t1_df, t1_new]).drop_duplicates(subset=['id'])
+                    extraction_stats["Tier 1 (Core Echo)"][current_year] += len(t1_new)
             
-        harvest_df = pd.concat([t3_df, t1_df, t2_df]).drop_duplicates(subset=['id'])
-        current_year += 1
-        pbar.update(1)
+            if len(t2_df) < T2_QUOTA:
+                t2_new = duckdb_extract(TIER2_SUBS, hf_urls, T2_QUOTA - len(t2_df))
+                if not t2_new.empty:
+                    t2_df = pd.concat([t2_df, t2_new]).drop_duplicates(subset=['id'])
+                    extraction_stats["Tier 2 (Expanded Archive)"][current_year] += len(t2_new)
+                
+            harvest_df = pd.concat([t3_df, t1_df, t2_df]).drop_duplicates(subset=['id'])
+            current_year += 1
+            pbar.update(1)
 
 if harvest_df.empty:
     stop_telemetry.set()
