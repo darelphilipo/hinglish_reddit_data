@@ -234,11 +234,12 @@ print("\n🦆 [DIAGNOSTIC] Phase 3: Regional-Strict Quota Extraction")
 CANDIDATE_THRESHOLD = 500
 SOFT_THRESHOLD = int(CANDIDATE_THRESHOLD * 0.8)
 
+# FORCING 100% OF EXTRACTION TO THE ARCTIC API
 T1_QUOTA = 0
 T2_QUOTA = 0
 T3_QUOTA = int(SOFT_THRESHOLD * 1.0)
 
-print(f"   ↳ Target Candidates: {SOFT_THRESHOLD} | Quotas -> Tier 1: {T1_QUOTA} | Tier 2: {T2_QUOTA} | Tier 3 (5% API): {T3_QUOTA}")
+print(f"   ↳ Target Candidates: {SOFT_THRESHOLD} | Quotas -> Tier 1: {T1_QUOTA} | Tier 2: {T2_QUOTA} | Tier 3 (100% API): {T3_QUOTA}")
 
 harvest_df = pd.DataFrame()
 safe_keywords = [k.replace("'", "''").lower() for k in final_keywords][:35]
@@ -250,25 +251,24 @@ extraction_stats = {
     "Tier 3 (Targeted Live API)": collections.defaultdict(int)
 }
 
-# --- TIER 3: TARGETED LIVE API (5% Quota) ---
-def fetch_tier3_live(subreddits, lexicon, max_rows, time_budget=15):
+# --- TIER 3: TARGETED ARCTIC API (100% Quota) ---
+def fetch_tier3_live(subreddits, lexicon, max_rows, time_budget=30):
     print(f"      -> [Tier 3] Targeted Arctic API Search (Target: {max_rows} rows | Budget: {time_budget}s)...")
     session = requests.Session()
     start_time = time.time()
     collected = []
-    AFTER_2025 = 1735689600 
     
     if not subreddits or not lexicon: return pd.DataFrame()
 
-    sampled_subs = random.sample(subreddits, min(len(subreddits), 10))
-    sampled_terms = random.sample(lexicon, min(len(lexicon), 5))
+    sampled_subs = random.sample(subreddits, min(len(subreddits), 15))
+    sampled_terms = random.sample(lexicon, min(len(lexicon), 10))
     
     for sub in sampled_subs:
         if len(collected) >= max_rows or (time.time() - start_time) > time_budget: break
         for term in sampled_terms:
             if len(collected) >= max_rows or (time.time() - start_time) > time_budget: break
             
-            params = {"subreddit": sub, "q": term, "after": AFTER_2025, "limit": 50, "sort": "desc"}
+            params = {"subreddit": sub, "q": term, "limit": 50, "sort": "desc"}
             try:
                 resp = session.get("https://arctic-shift.photon-reddit.com/api/comments/search", params=params, timeout=5)
                 if resp.status_code == 429: break
@@ -290,11 +290,12 @@ def fetch_tier3_live(subreddits, lexicon, max_rows, time_budget=15):
         if len(t3_df) > max_rows: t3_df = t3_df.sample(max_rows)
     return t3_df
 
-t3_df = fetch_tier3_live(TIER1_SUBS + TIER2_SUBS[:20], final_keywords, T3_QUOTA)
+# Passed a 60-second budget to ensure it doesn't time out while hitting the Arctic API
+t3_df = fetch_tier3_live(TIER1_SUBS + TIER2_SUBS[:20], final_keywords, T3_QUOTA, time_budget=60)
 if not t3_df.empty:
     harvest_df = pd.concat([harvest_df, t3_df], ignore_index=True)
-    extraction_stats["Tier 3 (Targeted Live API)"]["2025+"] = len(t3_df)
-print(f"         ✅ Yield: {len(t3_df)} candidates from Live API.")
+    extraction_stats["Tier 3 (Targeted Live API)"]["ArcticHits"] = len(t3_df)
+print(f"         ✅ Yield: {len(t3_df)} candidates from Arctic API.")
 
 # --- TIER 1 & 2: DUCKDB REGIONAL ARCHIVES (2017-2024) ---
 print(f"      -> Searching Regional DuckDB Archives (2017-2024)")
