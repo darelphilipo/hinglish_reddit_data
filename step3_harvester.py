@@ -235,7 +235,6 @@ CANDIDATE_THRESHOLD = 500
 SOFT_THRESHOLD = int(CANDIDATE_THRESHOLD * 0.8)
 
 # ⚙️ EXTRACTION QUOTA DISTRIBUTION
-# Adjust these percentages to route the workload (Must equal 1.0 total)
 PCT_TIER1_ECHO   = 0.0
 PCT_TIER2_ARCHIV = 0.0
 PCT_TIER3_ARCTIC = 1.0
@@ -258,7 +257,6 @@ extraction_stats = {
 
 # --- TIER 3: TARGETED ARCTIC API ---
 def fetch_tier3_live(subreddits, lexicon, max_rows, pct_allocated):
-    # Dynamically scale time budget based on how much work Tier 3 is expected to do
     time_budget = max(15, int(120 * pct_allocated))
     print(f"      -> [Tier 3] Targeted Arctic API Search (Target: {max_rows} rows | Budget: {time_budget}s)...")
     
@@ -283,21 +281,23 @@ def fetch_tier3_live(subreddits, lexicon, max_rows, pct_allocated):
         for term in clean_lexicon:
             if len(collected) >= max_rows or (time.time() - start_time) > time_budget: break
             
-            # Using 'body' parameter for comments as per Arctic Shift documentation
             params = {"subreddit": sub, "body": term, "limit": 100, "sort": "desc"}
             api_calls_made += 1
             
             try:
-                resp = session.get("https://arctic-shift.photon-reddit.com/api/comments/search", params=params, timeout=10)
+                # 🚨 FIX 1: Increased timeout to 30s so the Postgres FTS engine has time to warm up
+                resp = session.get("https://arctic-shift.photon-reddit.com/api/comments/search", params=params, timeout=30)
                 
                 if resp.status_code == 429: 
                     api_rate_limits += 1
                     time.sleep(3) 
                     continue
                 
-                # If API rejects subreddit, it's not indexed. Break word loop and move to next sub.
-                if resp.status_code == 400:
-                    print(f"         [DEBUG] API rejected r/{sub} (Likely not indexed). Skipping sub.")
+                # 🚨 FIX 2: Added 422 to the bypass list. 
+                # 400 = Subreddit not indexed. 
+                # 422 = Subreddit is too large/active for FTS search.
+                if resp.status_code in [400, 422]:
+                    print(f"         [DEBUG] API rejected r/{sub} (Status {resp.status_code}: Not indexed or too active). Skipping sub.")
                     break 
                     
                 resp.raise_for_status()
@@ -321,7 +321,12 @@ def fetch_tier3_live(subreddits, lexicon, max_rows, pct_allocated):
                     print(f"         [DEBUG] Found {found_in_call} hits for '{term}' in r/{sub}")
                     
                 time.sleep(0.5)
-                
+            
+            except requests.exceptions.Timeout:
+                # Catch the timeout so it doesn't crash the script, give the DB a moment, and continue
+                print(f"         [DEBUG] API Timeout on r/{sub} with '{term}'. Database warming up...")
+                time.sleep(1)
+                continue
             except requests.exceptions.RequestException as e:
                 print(f"         [DEBUG] API Connection Error on r/{sub}: {e}")
                 time.sleep(2)
