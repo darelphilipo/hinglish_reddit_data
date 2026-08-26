@@ -252,7 +252,7 @@ extraction_stats = {
 }
 
 # --- TIER 3: TARGETED ARCTIC API (100% Quota) ---
-def fetch_tier3_live(subreddits, lexicon, max_rows, time_budget=30):
+def fetch_tier3_live(subreddits, lexicon, max_rows, time_budget=120):
     print(f"      -> [Tier 3] Targeted Arctic API Search (Target: {max_rows} rows | Budget: {time_budget}s)...")
     session = requests.Session()
     start_time = time.time()
@@ -260,38 +260,70 @@ def fetch_tier3_live(subreddits, lexicon, max_rows, time_budget=30):
     
     if not subreddits or not lexicon: return pd.DataFrame()
 
-    sampled_subs = random.sample(subreddits, min(len(subreddits), 15))
-    sampled_terms = random.sample(lexicon, min(len(lexicon), 10))
+    # REMOVED THE RANDOM BOTTLENECK: Shuffle full lists to search huge matrix
+    random.shuffle(subreddits)
+    random.shuffle(lexicon)
     
-    for sub in sampled_subs:
+    api_calls_made = 0
+    api_successes = 0
+    api_rate_limits = 0
+    
+    for sub in subreddits:
         if len(collected) >= max_rows or (time.time() - start_time) > time_budget: break
-        for term in sampled_terms:
+        
+        for term in lexicon:
             if len(collected) >= max_rows or (time.time() - start_time) > time_budget: break
             
-            params = {"subreddit": sub, "q": term, "limit": 50, "sort": "desc"}
+            params = {"subreddit": sub, "q": term, "limit": 100, "sort": "desc"}
+            api_calls_made += 1
+            
             try:
-                resp = session.get("https://arctic-shift.photon-reddit.com/api/comments/search", params=params, timeout=5)
-                if resp.status_code == 429: break
-                resp.raise_for_status()
+                resp = session.get("https://arctic-shift.photon-reddit.com/api/comments/search", params=params, timeout=10)
                 
-                for item in resp.json().get("data", []):
+                # Handle Rate Limits gracefully
+                if resp.status_code == 429: 
+                    api_rate_limits += 1
+                    time.sleep(3) 
+                    continue
+                    
+                resp.raise_for_status()
+                api_successes += 1
+                
+                data = resp.json().get("data", [])
+                if not data:
+                    time.sleep(0.5)
+                    continue
+                
+                found_in_call = 0
+                for item in data:
                     body = item.get("body", "")
                     created_utc = item.get("created_utc", None)
                     ym = datetime.utcfromtimestamp(created_utc).strftime('%Y-%m') if created_utc else None
                     if body and body not in ["[removed]", "[deleted]"]:
                         collected.append({"id": item.get("id"), "body": body, "subreddit": sub, "created_utc": created_utc, "year_month": ym})
-                time.sleep(0.5)
-            except Exception:
+                        found_in_call += 1
+                
+                if found_in_call > 0:
+                    print(f"         [DEBUG] Found {found_in_call} hits for '{term}' in r/{sub}")
+                    
+                time.sleep(0.5) # Gentle pause between API calls
+                
+            except requests.exceptions.RequestException as e:
+                # Catch actual HTTP/Connection errors to log them instead of silently passing
+                print(f"         [DEBUG] API Error on r/{sub} with '{term}': {e}")
+                time.sleep(2)
                 continue
                 
+    print(f"      -> [Tier 3 Diagnostics] API Calls: {api_calls_made} | Successes: {api_successes} | Rate Limits Hit: {api_rate_limits}")
+    
     t3_df = pd.DataFrame(collected)
     if not t3_df.empty:
         t3_df = t3_df.drop_duplicates(subset=["id"])
         if len(t3_df) > max_rows: t3_df = t3_df.sample(max_rows)
     return t3_df
 
-# Passed a 60-second budget to ensure it doesn't time out while hitting the Arctic API
-t3_df = fetch_tier3_live(TIER1_SUBS + TIER2_SUBS[:20], final_keywords, T3_QUOTA, time_budget=60)
+# Passed FULL sub lists and 120-second budget to ensure it thoroughly hits the Arctic API
+t3_df = fetch_tier3_live(TIER1_SUBS + TIER2_SUBS, final_keywords, T3_QUOTA, time_budget=120)
 if not t3_df.empty:
     harvest_df = pd.concat([harvest_df, t3_df], ignore_index=True)
     extraction_stats["Tier 3 (Targeted Live API)"]["ArcticHits"] = len(t3_df)
