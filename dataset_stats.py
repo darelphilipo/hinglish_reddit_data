@@ -11,12 +11,10 @@ HF_REPO_ID = "darelphilip/hinglish-toxicity"
 # ==========================================
 print(f"\n📥 Pulling live dataset from Hugging Face: {HF_REPO_ID}...")
 df = pd.DataFrame()
-
 hf_token = os.environ.get("HF_TOKEN")
 
 try:
     print("   ↳ Scanning authenticated raw parquet shards in repository tree...")
-    # Pass storage options with the token so it bypasses the 401 Unauthorized error
     storage_options = {"token": hf_token} if hf_token else {}
     
     ds = load_dataset(
@@ -40,6 +38,11 @@ except Exception as e:
     except Exception as ex:
         print(f"❌ Failed to load dataset from HF entirely: {ex}")
         exit(1)
+
+total_rows = len(df)
+if total_rows == 0:
+    print("⚠️ Dataset is empty.")
+    exit(0)
 
 # ==========================================
 # 2. COMPUTE METRICS & DISTRIBUTIONS
