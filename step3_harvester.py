@@ -283,14 +283,19 @@ def fetch_tier3_private(subreddits, lexicon, max_rows):
     subs_formatted = ", ".join([f"'{s.replace(chr(39), chr(39)+chr(39)).lower()}'" for s in subreddits])
     sub_clause = f"AND LOWER(subreddit) IN ({subs_formatted})"
     
-    fetch_target = max_rows * 2 
+    # Generate a random salt for the hashing function
+    random_salt = int(time.time()) % 1000
     
-    # 🚨 CHANGED LIMIT TO USING SAMPLE FOR RANDOMIZED HARVESTING
+    # OVER-FETCH by a wide margin to account for ledger overlaps we might drop
+    fetch_target = max(30000, max_rows * 10) 
+    
+    # 🚨 CHANGED TO USE HASH SHUFFLING FOR RANDOMIZED HARVESTING
     query = f"""
     SELECT id, body, LOWER(subreddit) as subreddit, created_utc, strftime(to_timestamp(created_utc), '%Y-%m') as year_month
     FROM read_parquet('hf://datasets/darelphilip/reddit_indian_subs/**/*.parquet', union_by_name=True)
     WHERE ({t3_filter_clauses}) {sub_clause} AND body IS NOT NULL AND body NOT IN ('[deleted]', '[removed]', '')
-    USING SAMPLE {fetch_target} ROWS
+    ORDER BY hash(id || '{random_salt}')
+    LIMIT {fetch_target}
     """
     
     try:
@@ -336,12 +341,14 @@ if T1_QUOTA > 0 or T2_QUOTA > 0:
         subs_formatted = ", ".join([f"'{s.replace(chr(39), chr(39)+chr(39))}'" for s in sub_list])
         sub_clause = f"AND LOWER(subreddit) IN ({subs_formatted})"
             
-        # 🚨 CHANGED LIMIT TO USING SAMPLE
+        random_salt = int(time.time()) % 1000
+        
         query = f"""
         SELECT id, body, LOWER(subreddit) as subreddit, created_utc, strftime(epoch_ms(created_utc * 1000), '%Y-%m') as year_month
         FROM read_parquet({hf_urls_list}) 
         WHERE ({filter_clauses}) {sub_clause} AND body NOT IN ('[deleted]', '[removed]', '') 
-        USING SAMPLE {limit} ROWS
+        ORDER BY hash(id || '{random_salt}')
+        LIMIT {limit}
         """
         res_df = con.query(query).to_df()
         
@@ -406,7 +413,6 @@ def sanitize_text(text):
 total_pool = len(harvest_df)
 harvest_df['body_clean'] = [sanitize_text(text) for text in tqdm(harvest_df['body'], desc="   ↳ Sanitizing text data", miniters=max(1, total_pool//10), maxinterval=float('inf'), leave=False)]
 
-# 🚨 FIX: Dropped temp_id logic. Resetting index cleanly instead.
 harvest_df = harvest_df.reset_index(drop=True)
 
 try: SYSTEM_PROMPT = requests.get("https://raw.githubusercontent.com/darelphilipo/hinglish_reddit_data/main/prompt/System_Prompt", timeout=10).text.strip()
@@ -442,7 +448,6 @@ def label_batch(comments_batch, attempt=1):
         results = json.loads(raw_content).get("results", [])
         if len(results) == len(comments_batch):
             for idx, item in enumerate(results): 
-                # 🚨 FIX: Assign actual Reddit 'id' instead of temp_id
                 item["id"] = str(comments_batch[idx][0])
             return results
         raise ValueError("Batch size mismatch")
@@ -452,7 +457,6 @@ def label_batch(comments_batch, attempt=1):
             return label_batch(comments_batch, attempt + 1)
         return []
 
-# 🚨 FIX: Bind batching directly to the unique Reddit 'id' to prevent Cartesian Joins
 batches = [list(zip(harvest_df["id"], harvest_df["body_clean"]))[i:i + 20] for i in range(0, len(harvest_df), 20)]
 all_labels = []
 
@@ -464,11 +468,9 @@ with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
 
 labels_df = pd.DataFrame(all_labels)
 
-# 🚨 FIX: Force labels_df to use 'id'
 labels_df["id"] = labels_df["id"].astype(str)
 harvest_df["id"] = harvest_df["id"].astype(str)
 
-# 🚨 FIX: Securely merge on unique 'id' and drop unused variables
 final_df = harvest_df.merge(labels_df, on="id", how="inner")
 final_df.drop(columns=["body_clean"], errors='ignore', inplace=True)
 final_df = final_df[final_df['pv'].notna()]
@@ -527,7 +529,6 @@ for chunk_idx, chunk_df in enumerate(chunks):
             api.upload_file(path_or_fileobj=local_parquet_path, path_in_repo=hf_path, repo_id=HF_REPO_ID, repo_type="dataset")
             print(f"   ✅ Successfully pushed {chunk_name} to HF.")
             
-            # 🚨 WRITE TO LEDGER TO SECURE PROGRESS
             with open(LEDGER_PATH, 'a') as f:
                 for cid in chunk_df['id'].tolist():
                     f.write(f"{cid}\n")
