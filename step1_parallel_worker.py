@@ -133,10 +133,9 @@ for cat_name, sub_list in categories.items():
                 TIER2_SUBS.append(s_clean)
 
 # ⚙️ EXTRACTION WEIGHT DISTRIBUTION
-# Configure the split across tiers (Sum should equal 1.0)
-PCT_TIER1_ECHO   = 0.0  # Historical Tier 1 (open-index/arctic)
-PCT_TIER2_ARCHIV = 0.0  # Historical Tier 2 (open-index/arctic)
-PCT_TIER3_NEW    = 1.0  # New Private Dataset (darelphilip/reddit_indian_subs 2022-2026)
+PCT_TIER1_ECHO   = 0.0  
+PCT_TIER2_ARCHIV = 0.0  
+PCT_TIER3_NEW    = 1.0  
 
 T1_QUOTA = int(TARGET_ROWS_PER_JOB * PCT_TIER1_ECHO)
 T2_QUOTA = int(TARGET_ROWS_PER_JOB * PCT_TIER2_ARCHIV)
@@ -223,8 +222,11 @@ if T3_QUOTA > 0:
         all_active_subs = ['indiaspeaks', 'india', 'bihar', 'delhi', 'bangalore', 'developersindia']
         
     subs_formatted = ", ".join([f"'{s.replace(chr(39), chr(39)+chr(39))}'" for s in all_active_subs])
-    fetch_limit = max(10000, int(T3_QUOTA * 2.5))
     
+    # 🚨 FIX: Increased buffer to 3x to protect against Ledger drops
+    fetch_limit = max(10000, int(T3_QUOTA * 3.0)) 
+    
+    # 🚨 FIX: Changed LIMIT to USING SAMPLE to guarantee randomized extraction from the 20M rows
     t3_query = f"""
     SELECT id, body, LOWER(subreddit) as subreddit, created_utc, strftime(to_timestamp(created_utc), '%Y-%m') as year_month, 'Tier 3' as tier_label
     FROM read_parquet('hf://datasets/darelphilip/reddit_indian_subs/**/*.parquet', union_by_name=True)
@@ -232,11 +234,11 @@ if T3_QUOTA > 0:
       AND body IS NOT NULL
       AND body NOT IN ('[deleted]', '[removed]', '')
       AND length(body) BETWEEN 10 AND 1000
-    LIMIT {fetch_limit}
+    USING SAMPLE {fetch_limit} ROWS
     """
     try:
         t3_raw_df = con.query(t3_query).to_df()
-        print(f"   ✅ [Tier 3] Pulled {len(t3_raw_df):,} raw comments from private dataset.")
+        print(f"   ✅ [Tier 3] Pulled {len(t3_raw_df):,} random raw comments from private dataset.")
     except Exception as e:
         print(f"   ❌ [Tier 3] Query Failed: {e}")
 
