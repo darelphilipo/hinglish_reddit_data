@@ -50,7 +50,7 @@ TARGETS_DIR = './prompt/'
 TARGETS_PATH = os.path.join(TARGETS_DIR, 'pipeline_targets.json')
 SUBREDDIT_CONFIG_PATH = "prompt/subreddits.json"
 LEXICON_CONFIG_PATH = "prompt/master_lexicon.json"
-LEDGER_PATH = './seen_ids_ledger.txt'  # 🚨 ADDED LEDGER PATH
+LEDGER_PATH = './seen_ids_ledger.txt'
 
 HF_REPO_ID = "darelphilip/hinglish-toxicity"
 CHUNK_SIZE = 2500
@@ -232,14 +232,13 @@ except Exception: pass
 # 4. STRICT 3-TIER REGIONAL EXTRACTION ENGINE
 # ==========================================
 print("\n🦆 [DIAGNOSTIC] Phase 3: Regional-Strict Quota Extraction")
-# 🚨 INCREASED CANDIDATE POOL (1250 threshold = 1000 soft target)
 CANDIDATE_THRESHOLD = 1250
 SOFT_THRESHOLD = int(CANDIDATE_THRESHOLD * 0.8)
 
 # ⚙️ EXTRACTION QUOTA DISTRIBUTION
 PCT_TIER1_ECHO   = 0.0
 PCT_TIER2_ARCHIV = 0.0
-PCT_TIER3_PRIVATE = 1.0 # 100% of the budget now goes to your private HF dataset
+PCT_TIER3_PRIVATE = 1.0 
 
 T1_QUOTA = int(SOFT_THRESHOLD * PCT_TIER1_ECHO)
 T2_QUOTA = int(SOFT_THRESHOLD * PCT_TIER2_ARCHIV)
@@ -284,13 +283,14 @@ def fetch_tier3_private(subreddits, lexicon, max_rows):
     subs_formatted = ", ".join([f"'{s.replace(chr(39), chr(39)+chr(39)).lower()}'" for s in subreddits])
     sub_clause = f"AND LOWER(subreddit) IN ({subs_formatted})"
     
-    # 🚨 OVER-FETCH by 2x to account for ledger overlaps we might drop
     fetch_target = max_rows * 2 
+    
+    # 🚨 CHANGED LIMIT TO USING SAMPLE FOR RANDOMIZED HARVESTING
     query = f"""
     SELECT id, body, LOWER(subreddit) as subreddit, created_utc, strftime(to_timestamp(created_utc), '%Y-%m') as year_month
     FROM read_parquet('hf://datasets/darelphilip/reddit_indian_subs/**/*.parquet', union_by_name=True)
     WHERE ({t3_filter_clauses}) {sub_clause} AND body IS NOT NULL AND body NOT IN ('[deleted]', '[removed]', '')
-    LIMIT {fetch_target}
+    USING SAMPLE {fetch_target} ROWS
     """
     
     try:
@@ -300,7 +300,6 @@ def fetch_tier3_private(subreddits, lexicon, max_rows):
         if not res_df.empty:
             res_df = res_df.drop_duplicates(subset=["id"])
             
-            # 🚨 FILTER AGAINST LEDGER BEFORE SENDING TO LLM
             initial_count = len(res_df)
             res_df = res_df[~res_df['id'].isin(seen_ids)]
             print(f"      -> [Tier 3 Diagnostics] Filtered out {initial_count - len(res_df)} comments already in ledger.")
@@ -320,7 +319,6 @@ if not t3_df.empty:
     extraction_stats["Tier 3 (Targeted Private Dataset)"]["PrivateDatasetHits"] = len(t3_df)
 print(f"         ✅ Yield: {len(t3_df)} candidates from Private Dataset.")
 
-
 # --- TIER 1 & 2: DUCKDB REGIONAL ARCHIVES (2017-2024) ---
 if T1_QUOTA > 0 or T2_QUOTA > 0:
     print(f"      -> Searching Regional DuckDB Archives (2017-2024)")
@@ -338,15 +336,15 @@ if T1_QUOTA > 0 or T2_QUOTA > 0:
         subs_formatted = ", ".join([f"'{s.replace(chr(39), chr(39)+chr(39))}'" for s in sub_list])
         sub_clause = f"AND LOWER(subreddit) IN ({subs_formatted})"
             
+        # 🚨 CHANGED LIMIT TO USING SAMPLE
         query = f"""
         SELECT id, body, LOWER(subreddit) as subreddit, created_utc, strftime(epoch_ms(created_utc * 1000), '%Y-%m') as year_month
         FROM read_parquet({hf_urls_list}) 
         WHERE ({filter_clauses}) {sub_clause} AND body NOT IN ('[deleted]', '[removed]', '') 
-        LIMIT {limit}
+        USING SAMPLE {limit} ROWS
         """
         res_df = con.query(query).to_df()
         
-        # 🚨 FILTER AGAINST LEDGER
         res_df = res_df[~res_df['id'].isin(seen_ids)]
 
         if len(res_df) > quota: res_df = res_df.sample(quota)
@@ -407,7 +405,9 @@ def sanitize_text(text):
 
 total_pool = len(harvest_df)
 harvest_df['body_clean'] = [sanitize_text(text) for text in tqdm(harvest_df['body'], desc="   ↳ Sanitizing text data", miniters=max(1, total_pool//10), maxinterval=float('inf'), leave=False)]
-harvest_df['temp_id'] = harvest_df.index.astype(str)
+
+# 🚨 FIX: Dropped temp_id logic. Resetting index cleanly instead.
+harvest_df = harvest_df.reset_index(drop=True)
 
 try: SYSTEM_PROMPT = requests.get("https://raw.githubusercontent.com/darelphilipo/hinglish_reddit_data/main/prompt/System_Prompt", timeout=10).text.strip()
 except Exception as e: stop_telemetry.set(); raise RuntimeError(f"❌ Failed to fetch System Prompt: {e}")
@@ -441,7 +441,9 @@ def label_batch(comments_batch, attempt=1):
         raw_content = re.sub(r"^```(?:json)?\n?|\n?```$", "", res.choices[0].message.content.strip())
         results = json.loads(raw_content).get("results", [])
         if len(results) == len(comments_batch):
-            for idx, item in enumerate(results): item["temp_id"] = str(comments_batch[idx][0])
+            for idx, item in enumerate(results): 
+                # 🚨 FIX: Assign actual Reddit 'id' instead of temp_id
+                item["id"] = str(comments_batch[idx][0])
             return results
         raise ValueError("Batch size mismatch")
     except Exception:
@@ -450,7 +452,8 @@ def label_batch(comments_batch, attempt=1):
             return label_batch(comments_batch, attempt + 1)
         return []
 
-batches = [list(zip(harvest_df["temp_id"], harvest_df["body_clean"]))[i:i + 20] for i in range(0, len(harvest_df), 20)]
+# 🚨 FIX: Bind batching directly to the unique Reddit 'id' to prevent Cartesian Joins
+batches = [list(zip(harvest_df["id"], harvest_df["body_clean"]))[i:i + 20] for i in range(0, len(harvest_df), 20)]
 all_labels = []
 
 print(f"\n🚀 Running Asynchronous Inference Engine ({MAX_WORKERS} Workers)...")
@@ -460,10 +463,14 @@ with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         all_labels.extend(future.result())
 
 labels_df = pd.DataFrame(all_labels)
-if 'id' in labels_df.columns: labels_df.drop(columns=["id"], inplace=True)
-labels_df["temp_id"] = labels_df["temp_id"].astype(str)
 
-final_df = harvest_df.merge(labels_df, on="temp_id", how="inner").drop(columns=["temp_id", "body_clean"], errors='ignore')
+# 🚨 FIX: Force labels_df to use 'id'
+labels_df["id"] = labels_df["id"].astype(str)
+harvest_df["id"] = harvest_df["id"].astype(str)
+
+# 🚨 FIX: Securely merge on unique 'id' and drop unused variables
+final_df = harvest_df.merge(labels_df, on="id", how="inner")
+final_df.drop(columns=["body_clean"], errors='ignore', inplace=True)
 final_df = final_df[final_df['pv'].notna()]
 
 print("\n🛠️ Formatting Dual-Schema (RoBERTa + Sarvam ChatML)...")
