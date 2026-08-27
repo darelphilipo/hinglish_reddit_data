@@ -280,23 +280,32 @@ if os.path.exists(LEDGER_PATH):
     print(f"🛡️ Filtered out {prev_len - len(raw_df)} comments processed in previous workflow runs.")
 
 # ==========================================
-# 5. STRATIFIED MULTI-TIER BALANCING
+# 5. STRATIFIED MULTI-TIER BALANCING (STRICT QUOTA CAPPED)
 # ==========================================
-print("\n⚖️ Balancing sampling evenly across Subreddits, Months, and Tiers...")
+print("\n⚖️ Balancing sampling strictly to quota...")
 
 def balance_tier_pool(tier_df, quota):
     if tier_df.empty or quota <= 0:
         return pd.DataFrame()
     tier_df = tier_df.copy()
+    
+    if len(tier_df) <= quota:
+        return tier_df.reset_index(drop=True)
+        
     tier_df['bucket'] = tier_df['subreddit'].astype(str) + "_" + tier_df['year_month'].astype(str)
     groups = tier_df['bucket'].unique()
-    sampled_indices = []
     
-    if len(groups) > 0:
-        samples_per_bucket = max(1, quota // len(groups))
-        for bucket in groups:
-            b_rows = tier_df[tier_df['bucket'] == bucket]
-            sampled_indices.extend(b_rows.sample(n=min(len(b_rows), samples_per_bucket), random_state=SEED_VALUE).index.tolist())
+    if quota <= len(groups):
+        return tier_df.sample(n=quota, random_state=SEED_VALUE).reset_index(drop=True)
+        
+    sampled_indices = []
+    samples_per_bucket = quota // len(groups)
+    
+    for bucket in groups:
+        b_rows = tier_df[tier_df['bucket'] == bucket]
+        n_to_take = min(len(b_rows), samples_per_bucket)
+        if n_to_take > 0:
+            sampled_indices.extend(b_rows.sample(n=n_to_take, random_state=SEED_VALUE).index.tolist())
             
     balanced = tier_df.loc[sampled_indices].reset_index(drop=True)
     
@@ -306,7 +315,7 @@ def balance_tier_pool(tier_df, quota):
         if not remaining.empty:
             balanced = pd.concat([balanced, tier_df.loc[remaining].sample(n=min(len(remaining), needed), random_state=SEED_VALUE)], ignore_index=True)
             
-    return balanced
+    return balanced.head(quota)
 
 t1_balanced = balance_tier_pool(raw_df[raw_df['tier_label'] == "Tier 1"], T1_QUOTA)
 t2_balanced = balance_tier_pool(raw_df[raw_df['tier_label'] == "Tier 2"], T2_QUOTA)
@@ -314,7 +323,9 @@ t3_balanced = balance_tier_pool(raw_df[raw_df['tier_label'] == "Tier 3"], T3_QUO
 
 df = pd.concat([t1_balanced, t2_balanced, t3_balanced], ignore_index=True)
 
-if len(df) < TARGET_ROWS_PER_JOB:
+if len(df) > TARGET_ROWS_PER_JOB:
+    df = df.sample(n=TARGET_ROWS_PER_JOB, random_state=SEED_VALUE).reset_index(drop=True)
+elif len(df) < TARGET_ROWS_PER_JOB:
     deficit = TARGET_ROWS_PER_JOB - len(df)
     remaining_raw = raw_df.index.difference(df.index)
     if not remaining_raw.empty:
@@ -404,29 +415,19 @@ final_df.drop(columns=["body_clean"], errors='ignore', inplace=True)
 print("\n🛠️ Formatting Dual-Schema (RoBERTa + Sarvam ChatML)...")
 final_df = final_df.dropna(subset=['pv'])
 
-# --- 📊 WORKER RUN DIAGNOSTIC STATISTICS & EXAMPLES ---
-print("\n==================================================")
-print(f" 📊 WORKER RUN STATISTICS (Target Year/Job: {TARGET_YEAR})")
-print("==================================================")
-
-# 🛠️ Map short inference keys to long diagnostic column names
+# Map short keys to long diagnostic names
 for short_k, long_k in KEY_MAPPING.items():
     if short_k in final_df.columns and long_k not in final_df.columns:
         final_df[long_k] = final_df[short_k]
     elif long_k not in final_df.columns:
         final_df[long_k] = 0
 
-total_worker_rows = len(final_df)
-core_cols = list(KEY_MAPPING.values())
-
 # --- 📊 WORKER RUN DIAGNOSTIC STATISTICS & EXAMPLES ---
 print("\n==================================================")
 print(f" 📊 WORKER RUN STATISTICS (Target Year/Job: {TARGET_YEAR})")
 print("==================================================")
 total_worker_rows = len(final_df)
 core_cols = list(KEY_MAPPING.values())
-for col in core_cols:
-    if col not in final_df.columns: final_df[col] = 0
 
 toxic_mask = final_df[core_cols].max(axis=1) == 1
 total_toxic = int(toxic_mask.sum())
@@ -449,7 +450,7 @@ for short_k, long_k in KEY_MAPPING.items():
         print("  (No positive examples found in this run)")
     else:
         for idx, row in cat_subset.sample(n=sample_count, random_state=42).iterrows():
-            print(f"  • Text: \"{row['text'][:120]}...\"")
+            print(f"  • Text: \"{row['body'][:120]}...\"")
             print(f"    Analysis: {row.get('analysis', 'N/A')}")
 print("==================================================")
 
