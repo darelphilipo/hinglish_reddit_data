@@ -11,7 +11,7 @@ HF_REPO_ID = "darelphilip/hinglish-toxicity"
 # ==========================================
 print(f"\n📥 Pulling live dataset from Hugging Face: {HF_REPO_ID}...")
 try:
-    ds = load_dataset(HF_REPO_ID, split="train")
+    ds = load_dataset(HF_REPO_ID, split="train", download_mode="force_redownload")
     df = ds.to_pandas()
     print(f"   ↳ Successfully loaded {len(df):,} rows.")
 except Exception as e:
