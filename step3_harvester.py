@@ -237,13 +237,13 @@ SOFT_THRESHOLD = int(CANDIDATE_THRESHOLD * 0.8)
 # ⚙️ EXTRACTION QUOTA DISTRIBUTION
 PCT_TIER1_ECHO   = 0.0
 PCT_TIER2_ARCHIV = 0.0
-PCT_TIER3_ARCTIC = 1.0
+PCT_TIER3_PRIVATE = 1.0 # 100% of the budget now goes to your private HF dataset
 
 T1_QUOTA = int(SOFT_THRESHOLD * PCT_TIER1_ECHO)
 T2_QUOTA = int(SOFT_THRESHOLD * PCT_TIER2_ARCHIV)
-T3_QUOTA = int(SOFT_THRESHOLD * PCT_TIER3_ARCTIC)
+T3_QUOTA = int(SOFT_THRESHOLD * PCT_TIER3_PRIVATE)
 
-print(f"   ↳ Target Candidates: {SOFT_THRESHOLD} | Quotas -> Tier 1: {T1_QUOTA} | Tier 2: {T2_QUOTA} | Tier 3 (Arctic): {T3_QUOTA}")
+print(f"   ↳ Target Candidates: {SOFT_THRESHOLD} | Quotas -> Tier 1: {T1_QUOTA} | Tier 2: {T2_QUOTA} | Tier 3 (Private HF): {T3_QUOTA}")
 
 harvest_df = pd.DataFrame()
 safe_keywords = [k.replace("'", "''").lower() for k in final_keywords][:35]
@@ -252,99 +252,59 @@ filter_clauses = " OR ".join([f"LOWER(body) LIKE '%{k}%'" for k in safe_keywords
 extraction_stats = {
     "Tier 1 (Core Echo)": collections.defaultdict(int),
     "Tier 2 (Expanded Archive)": collections.defaultdict(int),
-    "Tier 3 (Targeted Live API)": collections.defaultdict(int)
+    "Tier 3 (Targeted Private Dataset)": collections.defaultdict(int)
 }
 
-# --- TIER 3: TARGETED ARCTIC API ---
-def fetch_tier3_live(subreddits, lexicon, max_rows, pct_allocated):
-    time_budget = max(15, int(120 * pct_allocated))
-    print(f"      -> [Tier 3] Targeted Arctic API Search (Target: {max_rows} rows | Budget: {time_budget}s)...")
-    
+# --- TIER 3: DUCKDB QUERY ON PRIVATE HF REPOSITORY ---
+def fetch_tier3_private(subreddits, lexicon, max_rows):
+    print(f"      -> [Tier 3] Querying Private HF Dataset (Target: {max_rows} rows)...")
     if max_rows <= 0 or not subreddits or not lexicon: 
         return pd.DataFrame()
         
-    session = requests.Session()
-    start_time = time.time()
-    collected = []
+    con_t3 = duckdb.connect()
+    con_t3.execute("PRAGMA memory_limit='6GB'; PRAGMA threads=8; INSTALL httpfs; LOAD httpfs;")
+    
+    if HF_TOKEN: 
+        con_t3.execute(f"CREATE SECRET hf_auth (TYPE HUGGINGFACE, TOKEN '{HF_TOKEN}');")
+    else:
+        print("         [ERROR] HF_TOKEN missing. Cannot query private dataset.")
+        return pd.DataFrame()
 
-    random.shuffle(subreddits)
+    safe_keywords = [k.replace("'", "''").lower() for k in lexicon][:35]
+    t3_filter_clauses = " OR ".join([f"LOWER(body) LIKE '%{k}%'" for k in safe_keywords if k])
     
-    # Strictly sanitize lexicon: Arctic Shift uses Postgres FTS which crashes on special characters
-    clean_lexicon = [term for term in lexicon if re.match(r'^[a-zA-Z0-9]+$', term)]
-    random.shuffle(clean_lexicon)
+    # Format subreddits strictly for SQL injection safety
+    subs_formatted = ", ".join([f"'{s.replace(chr(39), chr(39)+chr(39)).lower()}'" for s in subreddits])
+    sub_clause = f"AND LOWER(subreddit) IN ({subs_formatted})"
     
-    api_calls_made, api_successes, api_rate_limits = 0, 0, 0
+    # DuckDB will query your custom dataset, parsing the epoch timestamp locally
+    query = f"""
+    SELECT id, body, LOWER(subreddit) as subreddit, created_utc, strftime(to_timestamp(created_utc), '%Y-%m') as year_month
+    FROM read_parquet('hf://datasets/darelphilip/reddit_indian_subs/**/*.parquet', union_by_name=True)
+    WHERE ({t3_filter_clauses}) {sub_clause} AND body IS NOT NULL AND body NOT IN ('[deleted]', '[removed]', '')
+    """
     
-    for sub in subreddits:
-        if len(collected) >= max_rows or (time.time() - start_time) > time_budget: break
+    try:
+        start_time = time.time()
+        res_df = con_t3.query(query).to_df()
         
-        for term in clean_lexicon:
-            if len(collected) >= max_rows or (time.time() - start_time) > time_budget: break
-            
-            params = {"subreddit": sub, "body": term, "limit": 100, "sort": "desc"}
-            api_calls_made += 1
-            
-            try:
-                # 🚨 FIX 1: Increased timeout to 30s so the Postgres FTS engine has time to warm up
-                resp = session.get("https://arctic-shift.photon-reddit.com/api/comments/search", params=params, timeout=30)
-                
-                if resp.status_code == 429: 
-                    api_rate_limits += 1
-                    time.sleep(3) 
-                    continue
-                
-                # 🚨 FIX 2: Added 422 to the bypass list. 
-                # 400 = Subreddit not indexed. 
-                # 422 = Subreddit is too large/active for FTS search.
-                if resp.status_code in [400, 422]:
-                    print(f"         [DEBUG] API rejected r/{sub} (Status {resp.status_code}: Not indexed or too active). Skipping sub.")
-                    break 
-                    
-                resp.raise_for_status()
-                api_successes += 1
-                
-                data = resp.json().get("data", [])
-                if not data:
-                    time.sleep(0.5)
-                    continue
-                
-                found_in_call = 0
-                for item in data:
-                    body = item.get("body", "")
-                    created_utc = item.get("created_utc", None)
-                    ym = datetime.utcfromtimestamp(created_utc).strftime('%Y-%m') if created_utc else None
-                    if body and body not in ["[removed]", "[deleted]"]:
-                        collected.append({"id": item.get("id"), "body": body, "subreddit": sub, "created_utc": created_utc, "year_month": ym})
-                        found_in_call += 1
-                
-                if found_in_call > 0:
-                    print(f"         [DEBUG] Found {found_in_call} hits for '{term}' in r/{sub}")
-                    
-                time.sleep(0.5)
-            
-            except requests.exceptions.Timeout:
-                # Catch the timeout so it doesn't crash the script, give the DB a moment, and continue
-                print(f"         [DEBUG] API Timeout on r/{sub} with '{term}'. Database warming up...")
-                time.sleep(1)
-                continue
-            except requests.exceptions.RequestException as e:
-                print(f"         [DEBUG] API Connection Error on r/{sub}: {e}")
-                time.sleep(2)
-                continue
-                
-    print(f"      -> [Tier 3 Diagnostics] API Calls: {api_calls_made} | Successes: {api_successes} | Rate Limits Hit: {api_rate_limits}")
-    
-    t3_df = pd.DataFrame(collected)
-    if not t3_df.empty:
-        t3_df = t3_df.drop_duplicates(subset=["id"])
-        if len(t3_df) > max_rows: t3_df = t3_df.sample(max_rows)
-    return t3_df
+        if not res_df.empty:
+            res_df = res_df.drop_duplicates(subset=["id"])
+            if len(res_df) > max_rows: 
+                res_df = res_df.sample(max_rows)
+        
+        print(f"      -> [Tier 3 Diagnostics] DuckDB Scan Complete in {time.time() - start_time:.2f}s | Hits: {len(res_df)}")
+        return res_df
+    except Exception as e:
+        print(f"      -> [Tier 3 Diagnostics] DuckDB Query Failed: {e}")
+        return pd.DataFrame()
 
-t3_df = fetch_tier3_live(TIER1_SUBS + TIER2_SUBS, final_keywords, T3_QUOTA, PCT_TIER3_ARCTIC)
+t3_df = fetch_tier3_private(TIER1_SUBS + TIER2_SUBS, final_keywords, T3_QUOTA)
 if not t3_df.empty:
     harvest_df = pd.concat([harvest_df, t3_df], ignore_index=True)
-    extraction_stats["Tier 3 (Targeted Live API)"]["ArcticHits"] = len(t3_df)
-print(f"         ✅ Yield: {len(t3_df)} candidates from Arctic API.")
+    extraction_stats["Tier 3 (Targeted Private Dataset)"]["PrivateDatasetHits"] = len(t3_df)
+print(f"         ✅ Yield: {len(t3_df)} candidates from Private Dataset.")
+
 
 # --- TIER 1 & 2: DUCKDB REGIONAL ARCHIVES (2017-2024) ---
 if T1_QUOTA > 0 or T2_QUOTA > 0:
