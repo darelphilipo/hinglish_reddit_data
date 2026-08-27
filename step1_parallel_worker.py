@@ -60,7 +60,6 @@ SUBREDDIT_URL = "https://raw.githubusercontent.com/darelphilipo/hinglish_reddit_
 HF_REPO_ID = "darelphilip/hinglish-toxicity"
 CHUNK_SIZE = 2500
 
-# Mapping DeepSeek short-keys to Hugging Face schema long-keys
 KEY_MAPPING = {
     'pv': 'profanity_vulgarity',
     'tah': 'targeted_abuse_harassment',
@@ -98,7 +97,6 @@ print(f"\n🔧 Loading Subreddit Configurations...")
 TIER1_SUBS, TIER2_SUBS = [], []
 seen_tier2 = set()
 
-# Load subreddits from local file or remote fallback
 sub_data = None
 if os.path.exists(SUBREDDIT_CONFIG_PATH):
     try:
@@ -119,11 +117,9 @@ if not sub_data:
 config_toggles = sub_data.get("config", {})
 categories = sub_data.get("categories", {})
 
-# Tier 1 = toxicity_focused
 if config_toggles.get("toxicity_focused", 1) == 1:
     TIER1_SUBS = [s.lower() for s in categories.get("toxicity_focused", [])]
 
-# Tier 2 = all other active categories
 for cat_name, sub_list in categories.items():
     if cat_name != "toxicity_focused" and config_toggles.get(cat_name, 1) == 1:
         for s in sub_list:
@@ -222,11 +218,8 @@ if T3_QUOTA > 0:
         all_active_subs = ['indiaspeaks', 'india', 'bihar', 'delhi', 'bangalore', 'developersindia']
         
     subs_formatted = ", ".join([f"'{s.replace(chr(39), chr(39)+chr(39))}'" for s in all_active_subs])
-    
-    # 🚨 FIX: Increased buffer to 3x to protect against Ledger drops
     fetch_limit = max(10000, int(T3_QUOTA * 3.0)) 
     
-    # 🚨 FIX: Changed LIMIT to USING SAMPLE to guarantee randomized extraction from the 20M rows
     t3_query = f"""
     SELECT id, body, LOWER(subreddit) as subreddit, created_utc, strftime(to_timestamp(created_utc), '%Y-%m') as year_month, 'Tier 3' as tier_label
     FROM read_parquet('hf://datasets/darelphilip/reddit_indian_subs/**/*.parquet', union_by_name=True)
@@ -331,13 +324,15 @@ if len(df) < TARGET_ROWS_PER_JOB:
         df = pd.concat([df, raw_df.loc[remaining_raw].sample(n=min(len(remaining_raw), deficit), random_state=SEED_VALUE)], ignore_index=True)
 
 df.drop(columns=['bucket', 'index', 'tier_label'], inplace=True, errors='ignore')
-df['temp_id'] = df.index.astype(str)
+
+# 🚨 PURGED TEMP_ID LOGIC: Reset index cleanly
+df = df.reset_index(drop=True)
 perf_metrics['sanitization_and_balancing_time'] = time.time() - sanitize_start
 
 print(f"🎯 Final Balanced Pool: {len(df):,} rows (Tier 1: {len(t1_balanced):,} | Tier 2: {len(t2_balanced):,} | Tier 3: {len(t3_balanced):,}).")
 
 # ==========================================
-# 6. INFERENCE ENGINE (THREAD-SAFE)
+# 6. INFERENCE ENGINE (THREAD-SAFE & ID-BOUND)
 # ==========================================
 api_start = time.time()
 
@@ -377,7 +372,9 @@ def label_batch(comments_batch, attempt=1):
         results = content.get("results", [])
         
         if len(results) == len(comments_batch):
-            for idx, item in enumerate(results): item["temp_id"] = str(comments_batch[idx][0])
+            for idx, item in enumerate(results): 
+                # 🚨 BIND DIRECTLY TO REDDIT ID
+                item["id"] = str(comments_batch[idx][0])
             return results
         raise ValueError("Batch mismatch")
     except Exception:
@@ -391,7 +388,8 @@ if df.empty:
     print(f"❌ Worker: No valid data to label.")
     exit(0)
 
-batches = [list(zip(df["temp_id"], df["body_clean"]))[i:i + 20] for i in range(0, len(df), 20)]
+# 🚨 ZIP WITH REAL ID INSTEAD OF TEMP_ID
+batches = [list(zip(df["id"], df["body_clean"]))[i:i + 20] for i in range(0, len(df), 20)]
 all_labels = []
 
 print(f"\n🚀 Running Parallel Inference on {len(df):,} rows across {len(batches):,} batches...")
@@ -401,12 +399,12 @@ with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
 
 labels_df = pd.DataFrame(all_labels)
 
-if 'id' in labels_df.columns: 
-    labels_df.drop(columns=["id"], inplace=True)
-labels_df["temp_id"] = labels_df["temp_id"].astype(str)
+# 🚨 MERGE SECURELY ON REDDIT ID
+labels_df["id"] = labels_df["id"].astype(str)
+df["id"] = df["id"].astype(str)
 
-final_df = df.merge(labels_df, on="temp_id", how="left")
-final_df.drop(columns=["temp_id", "body_clean"], errors='ignore', inplace=True)
+final_df = df.merge(labels_df, on="id", how="inner")
+final_df.drop(columns=["body_clean"], errors='ignore', inplace=True)
 
 # ==========================================
 # 7. DUAL-SCHEMA FORMATTING & HF SHARD UPLOAD
