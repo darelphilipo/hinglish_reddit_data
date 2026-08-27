@@ -408,6 +408,21 @@ final_df = final_df.dropna(subset=['pv'])
 print("\n==================================================")
 print(f" 📊 WORKER RUN STATISTICS (Target Year/Job: {TARGET_YEAR})")
 print("==================================================")
+
+# 🛠️ Map short inference keys to long diagnostic column names
+for short_k, long_k in KEY_MAPPING.items():
+    if short_k in final_df.columns and long_k not in final_df.columns:
+        final_df[long_k] = final_df[short_k]
+    elif long_k not in final_df.columns:
+        final_df[long_k] = 0
+
+total_worker_rows = len(final_df)
+core_cols = list(KEY_MAPPING.values())
+
+# --- 📊 WORKER RUN DIAGNOSTIC STATISTICS & EXAMPLES ---
+print("\n==================================================")
+print(f" 📊 WORKER RUN STATISTICS (Target Year/Job: {TARGET_YEAR})")
+print("==================================================")
 total_worker_rows = len(final_df)
 core_cols = list(KEY_MAPPING.values())
 for col in core_cols:
