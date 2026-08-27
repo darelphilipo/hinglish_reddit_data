@@ -1,521 +1,143 @@
 import pandas as pd
-import duckdb
 import os
+import sys
 import time
 import json
-import threading
-import html
-import re
-import requests
-import psutil
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
-from tqdm import tqdm
-from openai import OpenAI
-from huggingface_hub import HfApi
-import random
-import gc
-from cleantext import clean
+from datasets import load_dataset
 
-# ==========================================
-# 0. TELEMETRY & PROFILER SETUP
-# ==========================================
-perf_metrics = {
-    'total_prompt_tokens': 0,
-    'total_completion_tokens': 0,
-    'total_combined_tokens': 0,
-    'total_cache_hits': 0,
-    'total_cache_misses': 0,
-    'prompt_fetch_time': 0.0,
-    'duckdb_extract_time': 0.0,
-    'sanitization_and_balancing_time': 0.0,
-    'api_inference_time': 0.0,
-    'total_script_time': 0.0
-}
-token_lock = threading.Lock()
-stop_telemetry = threading.Event()
-
-def resource_monitor():
-    while not stop_telemetry.is_set():
-        ram = psutil.virtual_memory()
-        cpu = psutil.cpu_percent(interval=None)
-        print(f"   [⚙️ TELEMETRY] RAM: {ram.used / (1024**3):.2f}GB / {ram.total / (1024**3):.2f}GB ({ram.percent}%) | CPU: {cpu}%")
-        time.sleep(30) 
-
-monitor_thread = threading.Thread(target=resource_monitor, daemon=True)
-monitor_thread.start()
-script_start_time = time.time()
-
-# ==========================================
-# 1. CONFIGURATION & DIRECTORY SETUP
-# ==========================================
-TARGET_YEAR = os.environ.get("TARGET_YEAR", "2017")
-RUN_ID = os.environ.get("GITHUB_RUN_ID", str(int(time.time())))
-GITHUB_STARTED_AT = os.environ.get("GITHUB_RUN_STARTED_AT")
-
-LEDGER_PATH = './seen_ids_ledger.txt'
-SUBREDDIT_CONFIG_PATH = "prompt/subreddits.json"
-SUBREDDIT_URL = "https://raw.githubusercontent.com/darelphilipo/hinglish_reddit_data/main/prompt/subreddits.json"
+print("🔗 Initializing Master Audit & Loop Controller Engine...")
+script_start = time.time()
 
 HF_REPO_ID = "darelphilip/hinglish-toxicity"
-CHUNK_SIZE = 2500
+TARGETS_PATH = './prompt/pipeline_targets.json'
 
-KEY_MAPPING = {
-    'pv': 'profanity_vulgarity',
-    'tah': 'targeted_abuse_harassment',
-    'dhs': 'discriminatory_hate_speech',
-    'cst': 'caste',
-    'cr': 'communal_religious',
-    'rx': 'regional_xenophobic',
-    'mg': 'misogyny_gender'
-}
+if not os.path.exists(TARGETS_PATH):
+    print("❌ CRITICAL ERROR: Blueprint JSON not found. Run Step 2 first.")
+    sys.exit(1)
 
-STUDENT_PROMPT = "You are an expert Hinglish content moderation AI. Analyze the following comment and output a JSON object containing the toxic classification flags and a brief analysis of the target and intent."
+with open(TARGETS_PATH, 'r') as f:
+    blueprint = json.load(f)
 
-SEED_VALUE = int(RUN_ID) % 100000 
-random.seed(SEED_VALUE)
+TARGETS = blueprint.get("categories", {})
+CLEAN_GOAL = blueprint.get("clean_data", 0)
+GLOBAL_GOAL = blueprint.get("global_goal", 0)
 
-TARGET_ROWS_PER_JOB = int(os.environ.get("TARGET_ROWS", 12500))
-MAX_WORKERS = 10 
-
-OPENCODE_KEY = os.environ.get("OPENCODE_KEY")
-HF_TOKEN = os.environ.get("HF_TOKEN")
-
-if not OPENCODE_KEY:
-    raise ValueError("❌ OPENCODE_KEY environment variable is missing.")
-if not HF_TOKEN:
-    raise ValueError("❌ HF_TOKEN environment variable is missing.")
-
-client = OpenAI(api_key=OPENCODE_KEY, base_url="https://opencode.ai/zen/go/v1")
-MODEL_NAME = "deepseek-v4-flash"
-api = HfApi(token=HF_TOKEN)
-
-# ==========================================
-# 2. LOAD SUBREDDITS & DYNAMIC SYSTEM PROMPT
-# ==========================================
-print(f"\n🔧 Loading Subreddit Configurations...")
-TIER1_SUBS, TIER2_SUBS = [], []
-seen_tier2 = set()
-
-sub_data = None
-if os.path.exists(SUBREDDIT_CONFIG_PATH):
-    try:
-        with open(SUBREDDIT_CONFIG_PATH, "r", encoding="utf-8") as f:
-            sub_data = json.load(f)
-    except Exception as e:
-        print(f"⚠️ Failed reading local {SUBREDDIT_CONFIG_PATH}: {e}")
-
-if not sub_data:
-    try:
-        resp = requests.get(SUBREDDIT_URL, timeout=10)
-        resp.raise_for_status()
-        sub_data = resp.json()
-    except Exception as e:
-        stop_telemetry.set()
-        raise RuntimeError(f"❌ Failed to fetch subreddits.json from GitHub: {e}")
-
-config_toggles = sub_data.get("config", {})
-categories = sub_data.get("categories", {})
-
-if config_toggles.get("toxicity_focused", 1) == 1:
-    TIER1_SUBS = [s.lower() for s in categories.get("toxicity_focused", [])]
-
-for cat_name, sub_list in categories.items():
-    if cat_name != "toxicity_focused" and config_toggles.get(cat_name, 1) == 1:
-        for s in sub_list:
-            s_clean = s.lower()
-            if s_clean not in seen_tier2 and s_clean not in TIER1_SUBS:
-                seen_tier2.add(s_clean)
-                TIER2_SUBS.append(s_clean)
-
-# ⚙️ EXTRACTION WEIGHT DISTRIBUTION
-PCT_TIER1_ECHO   = 0.0  
-PCT_TIER2_ARCHIV = 0.0  
-PCT_TIER3_NEW    = 1.0  
-
-T1_QUOTA = int(TARGET_ROWS_PER_JOB * PCT_TIER1_ECHO)
-T2_QUOTA = int(TARGET_ROWS_PER_JOB * PCT_TIER2_ARCHIV)
-T3_QUOTA = int(TARGET_ROWS_PER_JOB * PCT_TIER3_NEW)
-
-print(f"   ↳ Quota Breakdown -> Tier 1: {T1_QUOTA:,} | Tier 2: {T2_QUOTA:,} | Tier 3 (New Dataset): {T3_QUOTA:,}")
-
-PROMPT_URL = "https://raw.githubusercontent.com/darelphilipo/hinglish_reddit_data/main/prompt/System_Prompt"
-prompt_start = time.time()
+print(f"\n📥 Pulling live dataset from Hugging Face: {HF_REPO_ID}...")
 try:
-    print(f"\n🌐 Fetching latest System Prompt from GitHub (For DeepSeek Inference)...")
-    response = requests.get(PROMPT_URL, timeout=10)
-    response.raise_for_status()
-    SYSTEM_PROMPT = response.text.strip()
-    print("✅ System Prompt loaded successfully.")
+    ds = load_dataset(HF_REPO_ID, split="train")
+    merged_df = ds.to_pandas()
+    print(f"   ↳ Successfully loaded {len(merged_df):,} rows from Hugging Face.")
 except Exception as e:
-    stop_telemetry.set()
-    raise RuntimeError(f"❌ Failed to fetch System Prompt from GitHub: {e}")
-perf_metrics['prompt_fetch_time'] = time.time() - prompt_start
+    print(f"❌ Failed to load dataset from HF: {e}")
+    sys.exit(1)
+
+initial_len = len(merged_df)
+merged_df.drop_duplicates(subset=['id'], keep='first', inplace=True)
+id_dupes_dropped = initial_len - len(merged_df)
+
+pre_text_dedup = len(merged_df)
+merged_df['dedup_hash'] = merged_df['text'].astype(str).str.lower().str.replace(r'[^a-z0-9]', '', regex=True)
+merged_df.drop_duplicates(subset=['dedup_hash'], keep='first', inplace=True)
+merged_df.drop(columns=['dedup_hash'], inplace=True)
+text_dupes_dropped = pre_text_dedup - len(merged_df)
+
+total_dupes = id_dupes_dropped + text_dupes_dropped
+if total_dupes > 0:
+    print(f"\n🛡️ Deduplication Engine Executed (In-Memory Audit):")
+    print(f"   - Blocked {id_dupes_dropped:,} exact ID overlaps.")
+    print(f"   - Blocked {text_dupes_dropped:,} semantic copy-pastes.")
+    print(f"   - Valid Unique Rows: {len(merged_df):,}")
 
 # ==========================================
-# 3. DUCKDB MULTI-TIER EXTRACTION ENGINE
+# 4. TELEMETRY & FINAL AUDIT REPORTS
 # ==========================================
-db_start = time.time()
-print(f"\n🦆 Initializing DuckDB Engine (Dynamic Seed: {SEED_VALUE})...")
-con = duckdb.connect()
 
-con.execute("PRAGMA memory_limit='6GB';") 
-con.execute("PRAGMA threads=4;") 
-con.execute("INSTALL httpfs; LOAD httpfs;")
-con.execute(f"CREATE SECRET hf_auth (TYPE HUGGINGFACE, TOKEN '{HF_TOKEN}');")
-
-t1_raw_df = pd.DataFrame()
-t2_raw_df = pd.DataFrame()
-t3_raw_df = pd.DataFrame()
-
-# --- A. HISTORICAL EXTRACTION (TIER 1 & 2: open-index/arctic) ---
-if T1_QUOTA > 0 or T2_QUOTA > 0:
-    print(f"🔍 Querying open-index/arctic explicitly for {TARGET_YEAR} shards...")
-    try:
-        tree = api.list_repo_tree("open-index/arctic", repo_type="dataset", path_in_repo=f"data/comments/{TARGET_YEAR}", recursive=True)
-        year_files = [f.path for f in tree if f.path.endswith('.parquet')]
-        if not year_files:
-            raise ValueError(f"❌ No Parquet shards found for year {TARGET_YEAR}.")
-
-        max_shards = 10 if TARGET_ROWS_PER_JOB < 1000 else 200
-        selected_shards = random.sample(year_files, min(max_shards, len(year_files)))
-
-        def extract_historical(sub_list, tier_name, quota):
-            if not sub_list or quota <= 0: return pd.DataFrame()
-            subs_formatted = ", ".join([f"'{s.replace(chr(39), chr(39)+chr(39))}'" for s in sub_list])
-            raw_list = []
-            chunk_size = 10
-            
-            for i in range(0, len(selected_shards), chunk_size):
-                shard_chunk = selected_shards[i:i + chunk_size]
-                hf_urls = [f"hf://datasets/open-index/arctic/{f}" for f in shard_chunk]
-                query = f"""
-                SELECT id, body, LOWER(subreddit) as subreddit, created_utc, strftime(epoch_ms(created_utc * 1000), '%Y-%m') as year_month, '{tier_name}' as tier_label
-                FROM read_parquet({hf_urls})
-                WHERE LOWER(subreddit) IN ({subs_formatted})
-                  AND body NOT IN ('[deleted]', '[removed]', '')
-                  AND length(body) BETWEEN 10 AND 1000
-                """
-                try:
-                    temp_df = con.query(query).to_df()
-                    raw_list.append(temp_df)
-                except Exception as e:
-                    print(f"   ⚠️ [{tier_name}] Rate Limit on batch {i//chunk_size + 1}: {e}. Skipping chunk.")
-                    time.sleep(5)
-                time.sleep(1)
-            return pd.concat(raw_list, ignore_index=True) if raw_list else pd.DataFrame()
-
-        if T1_QUOTA > 0: t1_raw_df = extract_historical(TIER1_SUBS, "Tier 1", T1_QUOTA)
-        if T2_QUOTA > 0: t2_raw_df = extract_historical(TIER2_SUBS, "Tier 2", T2_QUOTA)
-    except Exception as e:
-        print(f"⚠️ Historical extraction failed: {e}")
-
-# --- B. NEW DATASET EXTRACTION (TIER 3: darelphilip/reddit_indian_subs) ---
-if T3_QUOTA > 0:
-    print(f"🔍 [Tier 3] Streaming from darelphilip/reddit_indian_subs (Target: {T3_QUOTA:,} rows)...")
-    all_active_subs = list(set(TIER1_SUBS + TIER2_SUBS))
-    if not all_active_subs:
-        all_active_subs = ['indiaspeaks', 'india', 'bihar', 'delhi', 'bangalore', 'developersindia']
-        
-    subs_formatted = ", ".join([f"'{s.replace(chr(39), chr(39)+chr(39))}'" for s in all_active_subs])
-    fetch_limit = max(10000, int(T3_QUOTA * 3.0)) 
-    
-    t3_query = f"""
-    SELECT id, body, LOWER(subreddit) as subreddit, created_utc, strftime(to_timestamp(created_utc), '%Y-%m') as year_month, 'Tier 3' as tier_label
-    FROM read_parquet('hf://datasets/darelphilip/reddit_indian_subs/**/*.parquet', union_by_name=True)
-    WHERE LOWER(subreddit) IN ({subs_formatted})
-      AND body IS NOT NULL
-      AND body NOT IN ('[deleted]', '[removed]', '')
-      AND length(body) BETWEEN 10 AND 1000
-    USING SAMPLE {fetch_limit} ROWS
-    """
-    try:
-        t3_raw_df = con.query(t3_query).to_df()
-        print(f"   ✅ [Tier 3] Pulled {len(t3_raw_df):,} random raw comments from private dataset.")
-    except Exception as e:
-        print(f"   ❌ [Tier 3] Query Failed: {e}")
-
-raw_df = pd.concat([t1_raw_df, t2_raw_df, t3_raw_df], ignore_index=True)
-perf_metrics['duckdb_extract_time'] = time.time() - db_start
-print(f"📦 Total Extracted Pool: Tier 1 = {len(t1_raw_df):,} | Tier 2 = {len(t2_raw_df):,} | Tier 3 = {len(t3_raw_df):,} | Total = {len(raw_df):,}")
-
-if raw_df.empty:
-    stop_telemetry.set()
-    raise ValueError("❌ All extraction tiers returned 0 comments.")
-
-# ==========================================
-# 4. SANITIZATION & DEDUPLICATION
-# ==========================================
-sanitize_start = time.time()
-print("\n🧹 Sanitizing text...")
-
-def sanitize_text(text):
-    if not isinstance(text, str): return ""
-    text = html.unescape(text)
-    text = re.sub(r'<[^>]+>', '', text)
-    text = re.sub(r'[\r\n\t]+', ' ', text)
-    text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
-    text = re.sub(r'/?u/[A-Za-z0-9_-]+', '', text) 
-    text = text.replace('\u200b', '').replace('\u200c', '').replace('\u200d', '')
-    try:
-        text = clean(text, fix_unicode=True, to_ascii=False, lower=False, no_line_breaks=True, 
-                     no_urls=True, replace_with_url="", no_emails=True, replace_with_email="",
-                     no_phone_numbers=True, replace_with_phone_number="")
-    except Exception:
-        pass
-    return re.sub(r'\s{2,}', ' ', text).strip()
-
-raw_df['body_clean'] = raw_df['body'].apply(sanitize_text)
-raw_df = raw_df[raw_df['body_clean'].str.len() > 5]
-
-print("🛡️ Applying aggressive token-saving deduplication...")
-initial_count = len(raw_df)
-raw_df['dedup_key'] = raw_df['body_clean'].str.lower().str.replace(r'[^a-z0-9]', '', regex=True)
-raw_df.drop_duplicates(subset=['dedup_key'], keep='first', inplace=True)
-raw_df.drop(columns=['dedup_key'], inplace=True)
-print(f"✂️ Dropped {initial_count - len(raw_df)} spam/copy-paste variants.")
-
-if os.path.exists(LEDGER_PATH):
-    with open(LEDGER_PATH, 'r') as f:
-        seen = set(line.strip() for line in f if line.strip())
-    prev_len = len(raw_df)
-    raw_df = raw_df[~raw_df['id'].isin(seen)]
-    print(f"🛡️ Filtered out {prev_len - len(raw_df)} comments processed in previous workflow runs.")
-
-# ==========================================
-# 5. STRATIFIED MULTI-TIER BALANCING
-# ==========================================
-print("\n⚖️ Balancing sampling evenly across Subreddits, Months, and Tiers...")
-
-def balance_tier_pool(tier_df, quota):
-    if tier_df.empty or quota <= 0:
-        return pd.DataFrame()
-    tier_df = tier_df.copy()
-    tier_df['bucket'] = tier_df['subreddit'].astype(str) + "_" + tier_df['year_month'].astype(str)
-    groups = tier_df['bucket'].unique()
-    sampled_indices = []
-    
-    if len(groups) > 0:
-        samples_per_bucket = max(1, quota // len(groups))
-        for bucket in groups:
-            b_rows = tier_df[tier_df['bucket'] == bucket]
-            sampled_indices.extend(b_rows.sample(n=min(len(b_rows), samples_per_bucket), random_state=SEED_VALUE).index.tolist())
-            
-    balanced = tier_df.loc[sampled_indices].reset_index(drop=True)
-    
-    if len(balanced) < quota:
-        needed = quota - len(balanced)
-        remaining = tier_df.index.difference(balanced.index)
-        if not remaining.empty:
-            balanced = pd.concat([balanced, tier_df.loc[remaining].sample(n=min(len(remaining), needed), random_state=SEED_VALUE)], ignore_index=True)
-            
-    return balanced
-
-t1_balanced = balance_tier_pool(raw_df[raw_df['tier_label'] == "Tier 1"], T1_QUOTA)
-t2_balanced = balance_tier_pool(raw_df[raw_df['tier_label'] == "Tier 2"], T2_QUOTA)
-t3_balanced = balance_tier_pool(raw_df[raw_df['tier_label'] == "Tier 3"], T3_QUOTA)
-
-df = pd.concat([t1_balanced, t2_balanced, t3_balanced], ignore_index=True)
-
-if len(df) < TARGET_ROWS_PER_JOB:
-    deficit = TARGET_ROWS_PER_JOB - len(df)
-    remaining_raw = raw_df.index.difference(df.index)
-    if not remaining_raw.empty:
-        df = pd.concat([df, raw_df.loc[remaining_raw].sample(n=min(len(remaining_raw), deficit), random_state=SEED_VALUE)], ignore_index=True)
-
-df.drop(columns=['bucket', 'index', 'tier_label'], inplace=True, errors='ignore')
-
-# 🚨 PURGED TEMP_ID LOGIC: Reset index cleanly
-df = df.reset_index(drop=True)
-perf_metrics['sanitization_and_balancing_time'] = time.time() - sanitize_start
-
-print(f"🎯 Final Balanced Pool: {len(df):,} rows (Tier 1: {len(t1_balanced):,} | Tier 2: {len(t2_balanced):,} | Tier 3: {len(t3_balanced):,}).")
-
-# ==========================================
-# 6. INFERENCE ENGINE (THREAD-SAFE & ID-BOUND)
-# ==========================================
-api_start = time.time()
-
-def label_batch(comments_batch, attempt=1):
-    numbered = "\n".join(f'ID: {cid} | Comment: {body}' for cid, body in comments_batch)
-    user_prompt = f"Label these comments:\n{numbered}"
-    try:
-        res = client.chat.completions.create(
-            model=MODEL_NAME, 
-            messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_prompt}], 
-            temperature=0.1, 
-            response_format={"type": "json_object"},
-            extra_body={"thinking": {"type": "disabled"}}
-        )
-        
-        usage_dict = res.usage.model_dump() if hasattr(res.usage, 'model_dump') else vars(res.usage)
-        token_details = usage_dict.get('prompt_tokens_details', {}) or {}
-        p_tokens = usage_dict.get('prompt_tokens', 0)
-        c_tokens = usage_dict.get('completion_tokens', 0)
-        t_tokens = usage_dict.get('total_tokens', p_tokens + c_tokens)
-        c_hits = usage_dict.get('prompt_cache_hit_tokens', token_details.get('cached_tokens', 0))
-        c_misses = usage_dict.get('prompt_cache_miss_tokens', p_tokens - c_hits)
-
-        with token_lock:
-            perf_metrics['total_prompt_tokens'] += p_tokens
-            perf_metrics['total_completion_tokens'] += c_tokens
-            perf_metrics['total_combined_tokens'] += t_tokens
-            perf_metrics['total_cache_hits'] += c_hits
-            perf_metrics['total_cache_misses'] += c_misses
-
-        raw_content = res.choices[0].message.content.strip()
-        if raw_content.startswith("```"):
-            raw_content = re.sub(r"^```(?:json)?\n?", "", raw_content)
-            raw_content = re.sub(r"\n?```$", "", raw_content).strip()
-
-        content = json.loads(raw_content)
-        results = content.get("results", [])
-        
-        if len(results) == len(comments_batch):
-            for idx, item in enumerate(results): 
-                # 🚨 BIND DIRECTLY TO REDDIT ID
-                item["id"] = str(comments_batch[idx][0])
-            return results
-        raise ValueError("Batch mismatch")
-    except Exception:
-        if attempt <= 4:
-            time.sleep(min(2 ** attempt, 10))
-            return label_batch(comments_batch, attempt + 1)
-        return []
-
-if df.empty:
-    stop_telemetry.set()
-    print(f"❌ Worker: No valid data to label.")
-    exit(0)
-
-# 🚨 ZIP WITH REAL ID INSTEAD OF TEMP_ID
-batches = [list(zip(df["id"], df["body_clean"]))[i:i + 20] for i in range(0, len(df), 20)]
-all_labels = []
-
-print(f"\n🚀 Running Parallel Inference on {len(df):,} rows across {len(batches):,} batches...")
-with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-    for result in tqdm(executor.map(label_batch, batches), total=len(batches), desc="Inference Progress"): 
-        all_labels.extend(result)
-
-labels_df = pd.DataFrame(all_labels)
-
-# 🚨 MERGE SECURELY ON REDDIT ID
-labels_df["id"] = labels_df["id"].astype(str)
-df["id"] = df["id"].astype(str)
-
-final_df = df.merge(labels_df, on="id", how="inner")
-final_df.drop(columns=["body_clean"], errors='ignore', inplace=True)
-
-# ==========================================
-# 7. DUAL-SCHEMA FORMATTING & HF SHARD UPLOAD
-# ==========================================
-print("\n🛠️ Formatting Dual-Schema (RoBERTa + Sarvam ChatML)...")
-final_df = final_df.dropna(subset=['pv'])
-formatted_records = []
-
-for idx, row in final_df.iterrows():
-    try:
-        labels = {long_key: int(row.get(short_key, 0)) for short_key, long_key in KEY_MAPPING.items()}
-        has_analysis = 'analysis' in row and pd.notna(row['analysis'])
-        if has_analysis:
-            labels['analysis'] = str(row['analysis']).strip()
-            
-        chatml_messages = [
-            {"role": "system", "content": STUDENT_PROMPT},
-            {"role": "user", "content": str(row['body']).strip()},
-            {"role": "assistant", "content": json.dumps(labels, ensure_ascii=False)}
-        ]
-        
-        record = {
-            "id": str(row['id']),
-            "text": str(row['body']).strip(),
-            "subreddit": str(row.get('subreddit', 'unknown')),
-            "created_utc": row.get('created_utc', None),
-            "year_month": str(row['year_month']) if pd.notna(row.get('year_month')) else None
-        }
-        
-        record.update(labels)
-        record["messages"] = chatml_messages
-        
-        if has_analysis:
-             record['analysis'] = str(row['analysis']).strip() 
-             
-        formatted_records.append(record)
-    except Exception as e:
-        print(f"⚠️ Skipped formatting row {row.get('id', 'unknown')} due to error: {e}")
-
-hf_master_df = pd.DataFrame(formatted_records)
-total_lbl = len(hf_master_df)
-
-print(f"\n☁️ Initiating Chunked Upload to Hugging Face ({CHUNK_SIZE} rows/chunk)...")
-timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-chunks = [hf_master_df[i:i + CHUNK_SIZE] for i in range(0, len(hf_master_df), CHUNK_SIZE)]
-
-for chunk_idx, chunk_df in enumerate(chunks):
-    chunk_name = f"worker_{TARGET_YEAR}_{timestamp_str}_part_{chunk_idx:03d}.parquet"
-    hf_path = f"data/{chunk_name}"
-    local_parquet_path = f"./{chunk_name}"
-    
-    print(f"   📤 Uploading {chunk_name} ({len(chunk_df):,} rows)...")
-    chunk_df.to_parquet(local_parquet_path, engine='pyarrow', index=False)
-    
-    max_retries = 5
-    for attempt in range(1, max_retries + 1):
-        try:
-            api.upload_file(
-                path_or_fileobj=local_parquet_path,
-                path_in_repo=hf_path,
-                repo_id=HF_REPO_ID,
-                repo_type="dataset"
-            )
-            print(f"   ✅ Successfully pushed {chunk_name} to HF.")
-            
-            with open(LEDGER_PATH, 'a') as f:
-                for cid in chunk_df['id'].tolist():
-                    f.write(f"{cid}\n")
-                    
-            os.remove(local_parquet_path)
-            time.sleep(2)
-            break
-        except Exception as e:
-            print(f"   ⚠️ Upload failed on attempt {attempt}/{max_retries}: {e}")
-            if attempt == max_retries:
-                print(f"❌ Failed to upload {chunk_name}. It will be re-processed next run.")
-                if os.path.exists(local_parquet_path): os.remove(local_parquet_path)
-            time.sleep(min(3 ** attempt, 30))
-
-perf_metrics['api_inference_time'] = time.time() - api_start
-perf_metrics['total_script_time'] = time.time() - script_start_time
-stop_telemetry.set()
-monitor_thread.join()
-
-# ==========================================
-# 8. COMPLETE PERFORMANCE & RESOURCE LOG
-# ==========================================
-p_tokens = perf_metrics['total_prompt_tokens']
-c_tokens = perf_metrics['total_completion_tokens']
-comb_tokens = perf_metrics['total_combined_tokens']
-hits = perf_metrics['total_cache_hits']
-misses = perf_metrics['total_cache_misses']
-
-hit_rate = (hits / p_tokens * 100) if p_tokens > 0 else 0.0
-avg_tokens_per_comment = (comb_tokens / total_lbl) if total_lbl > 0 else 0.0
-
+# --- A. CURRENT RUN DISTRIBUTION REPORT ---
 print("\n==================================================")
-print(" 📈 PIPELINE PERFORMANCE & RESOURCE LOG")
+print(" 📊 CURRENT RUN DISTRIBUTION REPORT (TOTAL YIELD)")
 print("==================================================")
-print(f"Total Rows Labeled & Pushed : {total_lbl:,}")
-print(f"Prompt Fetch Time        : {perf_metrics['prompt_fetch_time']:.2f}s")
-print(f"DuckDB Extract Time      : {perf_metrics['duckdb_extract_time']:.2f}s")
-print(f"Data Prep & Sanitize     : {perf_metrics['sanitization_and_balancing_time']:.2f}s")
-print(f"API Inference & Upload   : {perf_metrics['api_inference_time']:.2f}s")
-print(f"Total Workflow Time      : {perf_metrics['total_script_time']:.2f}s")
-print("\n--- 💳 COMPLETE API TOKEN METRICS ---")
-print(f"Total Input / Prompt Tokens : {p_tokens:,}")
-print(f"  ↳ Prompt Cache Hits       : {hits:,} ({hit_rate:.1f}% Cache Hit Rate)")
-print(f"  ↳ Prompt Cache Misses     : {misses:,}")
-print(f"Total Output / Completion   : {c_tokens:,}")
-print(f"Total Combined Tokens       : {comb_tokens:,}")
-print(f"Average Tokens / Comment    : {avg_tokens_per_comment:.1f} tokens/comment")
+core_toxic_cols = ['profanity_vulgarity', 'targeted_abuse_harassment', 'discriminatory_hate_speech', 'caste', 'communal_religious', 'regional_xenophobic', 'misogyny_gender']
+for col in core_toxic_cols:
+    if col not in merged_df.columns: merged_df[col] = 0
+
+total_current_rows = len(merged_df)
+current_toxic_mask = merged_df[core_toxic_cols].max(axis=1) == 1
+current_total_toxic = int(current_toxic_mask.sum())
+current_total_clean = total_current_rows - current_total_toxic
+
+print(f"Total Dataset Yield      : {total_current_rows:,}")
+print(f"Total Toxic Records      : {current_total_toxic:,}")
+print(f"Total Clean Records      : {current_total_clean:,}")
+print("\nCategory Distribution Summary:")
+category_keys = {
+    'profanity_vulgarity': 'PROFANITY_VULGARITY',
+    'targeted_abuse_harassment': 'TARGETED_ABUSE_HARASSMENT',
+    'discriminatory_hate_speech': 'DISCRIMINATORY_HATE_SPEECH',
+    'caste': 'CASTE',
+    'communal_religious': 'COMMUNAL_RELIGIOUS',
+    'regional_xenophobic': 'REGIONAL_XENOPHOBIC',
+    'misogyny_gender': 'MISOGYNY_GENDER'
+}
+for col_key, label_name in category_keys.items():
+    cnt = int(merged_df[col_key].sum())
+    print(f" - {label_name:<30} : {cnt:,}")
+
+print("\n--- 📝 CURRENT RUN SAMPLE EXAMPLES (5 per category) ---")
+for col_key, label_name in category_keys.items():
+    subset = merged_df[merged_df[col_key] == 1]
+    sample_cnt = min(5, len(subset))
+    print(f"\n[{label_name} - {sample_cnt} samples]")
+    if sample_cnt == 0:
+        print("  (No entries found)")
+    else:
+        for idx, row in subset.sample(n=sample_cnt, random_state=42).iterrows():
+            print(f"  • Text: \"{str(row['text'])[:120]}...\"")
+            print(f"    Analysis: {row.get('analysis', 'N/A')}")
 print("==================================================")
-print(f"✅ Parallel Worker Complete! All shards safely secured in Hugging Face.")
+
+# --- B. FINAL MASTER DISTRIBUTION REPORT ---
+print("\n==================================================")
+print(" 📊 FINAL MASTER DISTRIBUTION REPORT")
+print("==================================================")
+
+final_counts = {cat: merged_df.get(cat, pd.Series([0])).sum() for cat in TARGETS}
+toxic_targets_met = True
+
+print(f"{'METRIC':<25} | {'CURRENT':<8} | {'GOAL':<8} | {'STATUS'}")
+print("-" * 65)
+
+for cat, goal in TARGETS.items():
+    current = int(final_counts[cat])
+    if current >= goal:
+        status = "✅ MET"
+    else:
+        status = f"❌ SHORT ({goal - current} needed)"
+        toxic_targets_met = False
+    print(f"{cat.upper():<25} | {current:<8,} | {goal:<8,} | {status}")
+
+print("-" * 65)
+
+current_clean = total_current_rows - current_toxic_mask.sum()
+clean_target_met = current_clean >= CLEAN_GOAL
+clean_status = "✅ MET" if clean_target_met else f"❌ SHORT ({CLEAN_GOAL - current_clean} needed)"
+
+print(f"{'CLEAN_BACKGROUND_DATA':<25} | {current_clean:<8,} | {CLEAN_GOAL:<8,} | {clean_status}")
+print("==================================================")
+print(f"Total Unique Rows        : {total_current_rows:,}")
+print(f"Auditor Execution Time   : {time.time() - script_start:.2f}s")
+print("==================================================")
+
+# ==========================================
+# 5. PIPELINE LOOP TRIGGER
+# ==========================================
+if toxic_targets_met and clean_target_met:
+    print("🎉 SUCCESS: All toxic and clean dataset goals have been met!")
+    print("Exiting with Code 0. The autonomous pipeline will now hibernate.")
+    sys.exit(0)
+elif not toxic_targets_met:
+    print("🔄 DEFICIT DETECTED (TOXIC): Returning Exit Code 2 to trigger the Harvester loop.")
+    sys.exit(2)
+else:
+    print("🔄 DEFICIT DETECTED (CLEAN): Toxic goals met, but clean buffer is short.")
+    print("Returning Exit Code 3 to trigger Step 1 buffer scraper.")
+    sys.exit(3)
