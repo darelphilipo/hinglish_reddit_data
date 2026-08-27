@@ -7,45 +7,39 @@ print("📊 Initializing Hugging Face Dataset Statistical Auditor...")
 HF_REPO_ID = "darelphilip/hinglish-toxicity"
 
 # ==========================================
-# 1. LOAD DATASET FROM HUGGING FACE (WITH SHARD FALLBACK)
+# 1. LOAD DATASET FROM HUGGING FACE (AUTHENTICATED)
 # ==========================================
 print(f"\n📥 Pulling live dataset from Hugging Face: {HF_REPO_ID}...")
 df = pd.DataFrame()
 
-# Attempt 1: Load directly by pointing to all parquet files in the data/ folder tree
+hf_token = os.environ.get("HF_TOKEN")
+
 try:
-    print("   ↳ Scanning raw parquet shards in repository tree...")
+    print("   ↳ Scanning authenticated raw parquet shards in repository tree...")
+    # Pass storage options with the token so it bypasses the 401 Unauthorized error
+    storage_options = {"token": hf_token} if hf_token else {}
+    
     ds = load_dataset(
         "parquet", 
         data_files={
-            "train": [
-                f"hf://datasets/{HF_REPO_ID}/data/**/*.parquet",
-                f"https://huggingface.co/datasets/{HF_REPO_ID}/raw/main/data/**/*.parquet"
-            ]
+            "train": f"hf://datasets/{HF_REPO_ID}/data/**/*.parquet"
         },
         split="train",
+        storage_options=storage_options,
         download_mode="force_redownload"
     )
     df = ds.to_pandas()
     print(f"   ↳ Successfully loaded {len(df):,} rows from raw shard scan.")
 except Exception as e:
-    print(f"   ⚠️ Shard scan fallback triggered: {e}")
-
-# Attempt 2: Standard load fallback if raw file glob fails
-if df.empty:
+    print(f"   ⚠️ Authenticated shard scan fallback triggered: {e}")
     try:
         print("   ↳ Falling back to standard Hugging Face dataset split...")
-        ds = load_dataset(HF_REPO_ID, split="train", download_mode="force_redownload")
+        ds = load_dataset(HF_REPO_ID, split="train", token=hf_token, download_mode="force_redownload")
         df = ds.to_pandas()
         print(f"   ↳ Successfully loaded {len(df):,} rows via standard loader.")
-    except Exception as e:
-        print(f"❌ Failed to load dataset from HF entirely: {e}")
+    except Exception as ex:
+        print(f"❌ Failed to load dataset from HF entirely: {ex}")
         exit(1)
-
-total_rows = len(df)
-if total_rows == 0:
-    print("⚠️ Dataset is empty.")
-    exit(0)
 
 # ==========================================
 # 2. COMPUTE METRICS & DISTRIBUTIONS
