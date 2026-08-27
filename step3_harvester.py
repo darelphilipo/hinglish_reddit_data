@@ -50,6 +50,7 @@ TARGETS_DIR = './prompt/'
 TARGETS_PATH = os.path.join(TARGETS_DIR, 'pipeline_targets.json')
 SUBREDDIT_CONFIG_PATH = "prompt/subreddits.json"
 LEXICON_CONFIG_PATH = "prompt/master_lexicon.json"
+LEDGER_PATH = './seen_ids_ledger.txt'  # 🚨 ADDED LEDGER PATH
 
 HF_REPO_ID = "darelphilip/hinglish-toxicity"
 CHUNK_SIZE = 2500
@@ -231,7 +232,8 @@ except Exception: pass
 # 4. STRICT 3-TIER REGIONAL EXTRACTION ENGINE
 # ==========================================
 print("\n🦆 [DIAGNOSTIC] Phase 3: Regional-Strict Quota Extraction")
-CANDIDATE_THRESHOLD = 500
+# 🚨 INCREASED CANDIDATE POOL (1250 threshold = 1000 soft target)
+CANDIDATE_THRESHOLD = 1250
 SOFT_THRESHOLD = int(CANDIDATE_THRESHOLD * 0.8)
 
 # ⚙️ EXTRACTION QUOTA DISTRIBUTION
@@ -255,6 +257,12 @@ extraction_stats = {
     "Tier 3 (Targeted Private Dataset)": collections.defaultdict(int)
 }
 
+# 🚨 PRE-LOAD LEDGER TO PREVENT EXTRACTING DUPLICATES
+seen_ids = set()
+if os.path.exists(LEDGER_PATH):
+    with open(LEDGER_PATH, 'r') as f:
+        seen_ids = set(line.strip() for line in f if line.strip())
+
 # --- TIER 3: DUCKDB QUERY ON PRIVATE HF REPOSITORY ---
 def fetch_tier3_private(subreddits, lexicon, max_rows):
     print(f"      -> [Tier 3] Querying Private HF Dataset (Target: {max_rows} rows)...")
@@ -273,15 +281,16 @@ def fetch_tier3_private(subreddits, lexicon, max_rows):
     safe_keywords = [k.replace("'", "''").lower() for k in lexicon][:35]
     t3_filter_clauses = " OR ".join([f"LOWER(body) LIKE '%{k}%'" for k in safe_keywords if k])
     
-    # Format subreddits strictly for SQL injection safety
     subs_formatted = ", ".join([f"'{s.replace(chr(39), chr(39)+chr(39)).lower()}'" for s in subreddits])
     sub_clause = f"AND LOWER(subreddit) IN ({subs_formatted})"
     
-    # DuckDB will query your custom dataset, parsing the epoch timestamp locally
+    # 🚨 OVER-FETCH by 2x to account for ledger overlaps we might drop
+    fetch_target = max_rows * 2 
     query = f"""
     SELECT id, body, LOWER(subreddit) as subreddit, created_utc, strftime(to_timestamp(created_utc), '%Y-%m') as year_month
     FROM read_parquet('hf://datasets/darelphilip/reddit_indian_subs/**/*.parquet', union_by_name=True)
     WHERE ({t3_filter_clauses}) {sub_clause} AND body IS NOT NULL AND body NOT IN ('[deleted]', '[removed]', '')
+    LIMIT {fetch_target}
     """
     
     try:
@@ -290,6 +299,12 @@ def fetch_tier3_private(subreddits, lexicon, max_rows):
         
         if not res_df.empty:
             res_df = res_df.drop_duplicates(subset=["id"])
+            
+            # 🚨 FILTER AGAINST LEDGER BEFORE SENDING TO LLM
+            initial_count = len(res_df)
+            res_df = res_df[~res_df['id'].isin(seen_ids)]
+            print(f"      -> [Tier 3 Diagnostics] Filtered out {initial_count - len(res_df)} comments already in ledger.")
+
             if len(res_df) > max_rows: 
                 res_df = res_df.sample(max_rows)
         
@@ -330,6 +345,10 @@ if T1_QUOTA > 0 or T2_QUOTA > 0:
         LIMIT {limit}
         """
         res_df = con.query(query).to_df()
+        
+        # 🚨 FILTER AGAINST LEDGER
+        res_df = res_df[~res_df['id'].isin(seen_ids)]
+
         if len(res_df) > quota: res_df = res_df.sample(quota)
         return res_df
     
@@ -500,6 +519,12 @@ for chunk_idx, chunk_df in enumerate(chunks):
         try:
             api.upload_file(path_or_fileobj=local_parquet_path, path_in_repo=hf_path, repo_id=HF_REPO_ID, repo_type="dataset")
             print(f"   ✅ Successfully pushed {chunk_name} to HF.")
+            
+            # 🚨 WRITE TO LEDGER TO SECURE PROGRESS
+            with open(LEDGER_PATH, 'a') as f:
+                for cid in chunk_df['id'].tolist():
+                    f.write(f"{cid}\n")
+                    
             os.remove(local_parquet_path)
             time.sleep(2)
             break
