@@ -1,9 +1,9 @@
-"""# Hinglish & English Content Moderation — Teacher Model Labeling Prompt
-Version: 6.5 (Batch Array + Full v6.2 English Coverage Restored) | Hindi-English code-mixed and English, Roman script 
+# Hinglish & English Content Moderation — Teacher Model Labeling Prompt
+Version: 6.6 (Strict Slur Detection + Full English/Hinglish Coverage) | Hindi-English code-mixed and English, Roman script 
 
-Philosophy: When in doubt on harassment/hate speech, output 0. Silencing legitimate speech is worse than missing an edge case. Never flag opinions, criticism, or political disagreement as harassment or hate speech.
+Philosophy: When in doubt on ambiguous harassment/hate speech, output 0. However, the presence of explicit slurs, derogatory identity markers, or systemic degradation must NEVER be treated as a harmless "edge case" unless clearly quoted in a strict educational/historical context. Silencing legitimate speech is bad, but allowing overt slurs to pass as 'clean' data degrades the model. Never flag opinions, criticism, or political disagreement as harassment or hate speech, provided they do not rely on slurs or dehumanization.
 
-Design note on pv (profanity_vulgarity): this flag is a detection signal, not a moderation verdict. It fires whenever explicit profanity is present, regardless of target — including profanity aimed at a government, institution, or policy. This is intentional: downstream platforms decide their own policy on whether non-personal profanity should be moderated. tah (targeted_abuse_harassment) and dhs (discriminatory_hate_speech) are the two flags that indicate an actual person/group was attacked. Do not treat pv: 1 alone as grounds to remove a comment.
+Design note on pv (profanity_vulgarity): this flag is a detection signal, not a moderation verdict. It fires whenever explicit profanity is present, regardless of target — including profanity aimed at a government, institution, or policy. This is intentional: downstream platforms decide their own policy on whether non-personal profanity should be moderated. tah (targeted_abuse_harassment) and dhs (discriminatory_hate_speech) are the two flags that indicate an actual person/group was attacked. Do not treat pv: 1 alone as grounds to remove a comment. A comment can be highly toxic and severely hateful (tah: 1, dhs: 1) without triggering the pv flag (pv: 0) if no traditional curse words are used.
 
 --- 
 
@@ -48,15 +48,15 @@ Test: if you removed the identity reference, would the sentence lose its hostile
 
 Step 4 — Political-affiliation terms (sanghi/bhakt/libtard/chamcha) are NOT an identity dimension on their own. Only flag cr if hostility is also tied to actual religious/communal identity. This applies whether the term appears in a Hindi or English sentence.
 
-Confidence check: if a comment hinges on one ambiguous/borderline term with no other corroborating signal (no clear target, no clear framing, could plausibly be a homonym or filler), prefer 0 on tah and dhs.
+Confidence check: If a comment hinges on an ambiguous/borderline term (like a homonym or filler) with no other corroborating signal, prefer 0 on tah and dhs. HOWEVER, if a comment consists primarily of a known slur or derogatory identity term, or uses variations of slurs to evade filters, you MUST output 1 on the corresponding identity dimension. Do not mark standalone slurs as clean background data.
 
 --- 
 
 ## CATEGORY DEFINITIONS 
 
-- Caste (cst): chamar, bhangi, neech jaati, dedh, chura, pallan, kanjar, dhobi, mehtar, harijan, "aarakshanjeevi"/"quota khane wale" (demeaning people), "quota-wallah"/"reservation cattle", "lower caste" (as insult), "untouchable" (derogatory).
+- Caste (cst): chamar, bhangi, neech jaati, dedh, chura, pallan, kanjar, dhobi, mehtar, harijan, "aarakshanjeevi"/"quota khane wale" (demeaning people), "quota-wallah"/"reservation cattle", "lower caste" (as insult), "untouchable" (derogatory). Flag ANY systemic degradation of caste groups or use of caste-based slurs, even if the specific word is a novel variation or not explicitly listed here.
 - Communal (cr): katwa, mulla/mulle, kafir, malaun, pajeet, "cow piss drinker", "dung worshipper", "sanghi/bhakt" (only when dehumanizing), "terrorist"/"jihadi" (applied to a religious group as a class), "invaders"/"outsiders" (applied to a religious community).
-- Regional (rx): bihari/madrasi (pejorative), bimaru, chinki, ghati, bhaiyya, "Porki"/"Porkistan", "Paki", "chink"/"chinky", "bloody Bihari/Madrasi", "these North/South Indians" (dismissively).
+- Regional (rx): bihari/madrasi (pejorative), bimaru, chinki, ghati, bhaiyya, "Porki"/"Porkistan", "Paki", "chink"/"chinky", "bloody Bihari/Madrasi", "these North/South Indians" (dismissively). Includes hostility aimed at linguistic groups (e.g., Hindi-speakers, Tamil-speakers) or state-based identities.
 - Gendered (mg): chhakka/hijra, "maal"/"item", "randi khana", "feminazi", "slut", "whore", "asking for it", gender-hierarchy statements in Hindi ("aurat ghar sambhale") or English ("women should just stay home").
 
 --- 
@@ -69,7 +69,7 @@ Confidence check: if a comment hinges on one ambiguous/borderline term with no o
 4. India-Pakistan content: criticizing Pakistani govt = 0. Nationalist boasts ("Agr hindu army may himat ha") = 0. Blanket-dehumanizing Pakistanis or Indian Muslims as a class = 1 on dhs, whether stated in Hindi or English.
 5. Body-shaming/mental-health insults (motu, paagal, mental, psycho, and English equivalents "retard(ed)", "crazy") = tah: 1 when directed at a person; NOT dhs unless also identity-based. Neutral discussion ("mental health matters") = 0.
 6. Obfuscation/evasion: letter repetition, character substitution (ch0@tiya), spacing. The same holds for English: censoring with asterisks (f*ck, sh1t) still trigger pv: 1.
-7. Topic discussion vs. endorsement: discussing a controversy as news = 0 on dhs. Asserting conspiracy as fact with hostile intent = 1.
+7. Topic discussion vs. endorsement: Discussing a controversy neutrally as news = 0 on dhs. HOWEVER, if the user discusses the news using derogatory framing, slurs, or dehumanizing language to make their point, it = 1. Asserting conspiracy as fact with hostile intent = 1. News discussion does not sanitize hate speech.
 8. Humor without animus: a joke referencing a region/group with no demeaning framing can be 0 on dhs.
 9. Icon-mocking: hostile mockery of a community's icons specifically to humiliate the community counts under Step 3, even without a slur.
 10. English homonyms/ambiguous terms: retard(ed) as a dated clinical term in neutral discussion vs. a personal insult. gay as an identity term vs. dismissive filler ("that's so gay") — filler use with no specific target stays at 0 on hate speech. cracker is almost always the firework in an Indian context.
@@ -98,6 +98,6 @@ Confidence check: if a comment hinges on one ambiguous/borderline term with no o
   {"id": "ex18", "analysis": "English, no profanity, regional hate.", "pv": 0, "tah": 0, "dhs": 1, "cst": 0, "cr": 0, "rx": 1, "mg": 0},
   {"id": "ex19", "analysis": "English, no profanity, misogyny.", "pv": 0, "tah": 0, "dhs": 1, "cst": 0, "cr": 0, "rx": 0, "mg": 1},
   {"id": "ex20", "analysis": "English, loyalty-questioning, no slur.", "pv": 0, "tah": 0, "dhs": 1, "cst": 0, "cr": 1, "rx": 0, "mg": 0},
-  {"id": "ex21", "analysis": "Self-directed English profanity.", "pv": 1, "tah": 0, "dhs": 0, "cst": 0, "cr": 0, "rx": 0, "mg": 0}
+  {"id": "ex21", "analysis": "Self-directed English profanity.", "pv": 1, "tah": 0, "dhs": 0, "cst": 0, "cr": 0, "rx": 0, "mg": 0},
+  {"id": "ex22", "analysis": "Standalone slur used to evade filters.", "pv": 0, "tah": 0, "dhs": 1, "cst": 1, "cr": 0, "rx": 0, "mg": 0}
 ]
-"""
