@@ -37,22 +37,42 @@ print(f"   ↳ Target: {CLEAN_GOAL:,} Clean Rows | {CATEGORY_GOAL:,} per Toxic C
 print(f"   ↳ Saved to {TARGETS_PATH}")
 
 # ==========================================
-# 2. PULL LIVE DATASET FROM HUGGING FACE
+# 2. PULL LIVE DATASET FROM HUGGING FACE (AUTHENTICATED)
 # ==========================================
 print(f"\n📥 Pulling live dataset from Hugging Face: {HF_REPO_ID}...")
+master_df = pd.DataFrame()
+hf_token = os.environ.get("HF_TOKEN")
+
 try:
-    ds = load_dataset(HF_REPO_ID, split="train")
+    print("   ↳ Scanning authenticated raw parquet shards in repository tree...")
+    storage_options = {"token": hf_token} if hf_token else {}
+    
+    ds = load_dataset(
+        "parquet", 
+        data_files={
+            "train": f"hf://datasets/{HF_REPO_ID}/data/**/*.parquet"
+        },
+        split="train",
+        storage_options=storage_options,
+        download_mode="force_redownload"
+    )
     master_df = ds.to_pandas()
-    print(f"   ↳ Successfully loaded {len(master_df):,} rows from Hugging Face.")
+    print(f"   ↳ Successfully loaded {len(master_df):,} rows from raw shard scan.")
 except Exception as e:
-    print(f"❌ Failed to load dataset from HF: {e}")
-    exit(1)
+    print(f"   ⚠️ Authenticated shard scan fallback triggered: {e}")
+    try:
+        print("   ↳ Falling back to standard Hugging Face dataset split...")
+        ds = load_dataset(HF_REPO_ID, split="train", token=hf_token, download_mode="force_redownload")
+        master_df = ds.to_pandas()
+        print(f"   ↳ Successfully loaded {len(master_df):,} rows via standard loader.")
+    except Exception as ex:
+        print(f"❌ Failed to load dataset from HF entirely: {ex}")
+        exit(1)
 
 # ==========================================
 # 3. MEMORY DEDUPLICATION (For Accurate Counting)
 # ==========================================
 initial_len = len(master_df)
-# We deduplicate on the 'text' column which holds the comment body
 master_df.drop_duplicates(subset=['text'], keep='first', inplace=True)
 dedup_count = initial_len - len(master_df)
 if dedup_count > 0:
@@ -66,7 +86,6 @@ print("\n==================================================")
 print(f" 📊 FINAL MASTER DISTRIBUTION REPORT ({total_rows:,} Rows)")
 print("==================================================")
 
-# Safely check for columns in case they are missing
 core_toxic_cols = ['profanity_vulgarity', 'targeted_abuse_harassment', 'discriminatory_hate_speech']
 for col in core_toxic_cols:
     if col not in master_df.columns:
