@@ -7,16 +7,40 @@ print("📊 Initializing Hugging Face Dataset Statistical Auditor...")
 HF_REPO_ID = "darelphilip/hinglish-toxicity"
 
 # ==========================================
-# 1. LOAD DATASET FROM HUGGING FACE
+# 1. LOAD DATASET FROM HUGGING FACE (WITH SHARD FALLBACK)
 # ==========================================
 print(f"\n📥 Pulling live dataset from Hugging Face: {HF_REPO_ID}...")
+df = pd.DataFrame()
+
+# Attempt 1: Load directly by pointing to all parquet files in the data/ folder tree
 try:
-    ds = load_dataset(HF_REPO_ID, split="train", download_mode="force_redownload")
+    print("   ↳ Scanning raw parquet shards in repository tree...")
+    ds = load_dataset(
+        "parquet", 
+        data_files={
+            "train": [
+                f"hf://datasets/{HF_REPO_ID}/data/**/*.parquet",
+                f"https://huggingface.co/datasets/{HF_REPO_ID}/raw/main/data/**/*.parquet"
+            ]
+        },
+        split="train",
+        download_mode="force_redownload"
+    )
     df = ds.to_pandas()
-    print(f"   ↳ Successfully loaded {len(df):,} rows.")
+    print(f"   ↳ Successfully loaded {len(df):,} rows from raw shard scan.")
 except Exception as e:
-    print(f"❌ Failed to load dataset from HF: {e}")
-    exit(1)
+    print(f"   ⚠️ Shard scan fallback triggered: {e}")
+
+# Attempt 2: Standard load fallback if raw file glob fails
+if df.empty:
+    try:
+        print("   ↳ Falling back to standard Hugging Face dataset split...")
+        ds = load_dataset(HF_REPO_ID, split="train", download_mode="force_redownload")
+        df = ds.to_pandas()
+        print(f"   ↳ Successfully loaded {len(df):,} rows via standard loader.")
+    except Exception as e:
+        print(f"❌ Failed to load dataset from HF entirely: {e}")
+        exit(1)
 
 total_rows = len(df)
 if total_rows == 0:
