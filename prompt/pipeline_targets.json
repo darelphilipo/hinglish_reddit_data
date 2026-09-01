@@ -1,10 +1,10 @@
 {
-    "global_goal": 1000,
-    "clean_data": 500,
+    "global_goal": 20000,
+    "clean_data": 10000,
     "categories": {
-        "caste": 125,
-        "communal_religious": 125,
-        "regional_xenophobic": 125,
-        "misogyny_gender": 125
+        "caste": 2500,
+        "communal_religious": 2500,
+        "regional_xenophobic": 2500,
+        "misogyny_gender": 2500
     }
 }
