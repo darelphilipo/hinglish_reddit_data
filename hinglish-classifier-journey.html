@@ -1,0 +1,1366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="description" content="A portfolio case study of building a Hinglish hate-speech detection model — from a MuRIL baseline to a 50k-row, CI/CD-driven training dataset built entirely from real Reddit data.">
+<title>Building a Hinglish Hate-Speech Classifier — A Journey</title>
+<style>
+  :root{
+    --bg:        #0a0f1c;
+    --bg-soft:   #0e1526;
+    --panel:     #111a2f;
+    --panel-2:   #0c1222;
+    --line:      #22304d;
+    --line-soft: #181c2e;
+    --text:      #e7edf8;
+    --muted:     #9aa8c4;
+    --dim:       #68789a;
+    --accent:    #2dd4bf;
+    --accent-2:  #818cf8;
+    --ok:        #34d399;
+    --warn:      #fbbf24;
+    --bad:       #f87171;
+    --code-bg:   #0b1220;
+    --radius:    14px;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --mono: ui-monospace, "Cascadia Code", "Segoe UI Mono", Consolas, "SF Mono", Menlo, monospace;
+  }
+
+  *, *::before, *::after{ box-sizing: border-box; }
+
+  html{
+    scroll-behavior: smooth;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body{
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+
+  body::before{
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: -2;
+    background:
+      radial-gradient(60rem 30rem at 85% -10%, rgba(45,212,191,0.09), transparent 60%),
+      radial-gradient(50rem 28rem at -10% 15%, rgba(129,140,248,0.10), transparent 55%),
+      var(--bg);
+  }
+
+  body::after{
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    background-image:
+      linear-gradient(rgba(255,255,255,0.02) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.02) 1px, transparent 1px);
+    background-size: 44px 44px;
+    mask-image: linear-gradient(to bottom, rgba(0,0,0,0.7), transparent 70%);
+    -webkit-mask-image: linear-gradient(to bottom, rgba(0,0,0,0.7), transparent 70%);
+  }
+
+  a{ color: var(--accent); text-decoration: none; }
+  a:hover{ text-decoration: underline; }
+  ::selection{ background: rgba(45,212,191,0.30); }
+
+  .container{
+    width: min(1120px, 92%);
+    margin-inline: auto;
+  }
+
+  /* ---------- skip link ---------- */
+  .skip-link{
+    position: fixed;
+    top: -60px;
+    left: 12px;
+    z-index: 200;
+    padding: 10px 16px;
+    background: var(--accent);
+    color: #06231f;
+    font-weight: 700;
+    border-radius: 8px;
+    transition: top 0.2s ease;
+  }
+  .skip-link:focus{ top: 12px; }
+
+  /* ---------- scroll progress ---------- */
+  .progress{
+    position: fixed;
+    top: 0;
+    left: 0;
+    height: 3px;
+    width: 100%;
+    z-index: 90;
+    transform: scaleX(0);
+    transform-origin: 0 50%;
+    background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  }
+
+  /* ---------- nav ---------- */
+  .nav{
+    position: sticky;
+    top: 0;
+    z-index: 80;
+    background: rgba(10,15,28,0.82);
+    -webkit-backdrop-filter: blur(12px);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--line);
+  }
+  .nav__inner{
+    width: min(1120px, 94%);
+    margin-inline: auto;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 10px 0;
+    flex-wrap: wrap;
+  }
+  .nav__brand{
+    font-family: var(--mono);
+    font-size: 0.8rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: var(--accent);
+    white-space: nowrap;
+  }
+  .nav__brand em{ color: var(--muted); font-style: normal; }
+  .nav__links{
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 2px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .nav__links a{
+    display: inline-block;
+    padding: 5px 9px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    color: var(--muted);
+    border-radius: 999px;
+    transition: color 0.15s ease, background 0.15s ease;
+  }
+  .nav__links a:hover{ color: var(--text); background: rgba(255,255,255,0.05); text-decoration: none; }
+  .nav__links a.is-active{
+    color: #06231f;
+    background: var(--accent);
+  }
+
+  /* ---------- hero ---------- */
+  .hero{
+    position: relative;
+    padding: 96px 0 72px;
+    border-bottom: 1px solid var(--line);
+    overflow: hidden;
+  }
+  .hero__eyebrow{
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-family: var(--mono);
+    font-size: 0.74rem;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--accent);
+    border: 1px solid rgba(45,212,191,0.35);
+    padding: 6px 12px;
+    border-radius: 999px;
+    background: rgba(45,212,191,0.06);
+    margin-bottom: 22px;
+  }
+  .hero__eyebrow::before{
+    content: "";
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--accent);
+    animation: pulse 2.2s ease-in-out infinite;
+  }
+  @keyframes pulse{
+    0%,100%{ box-shadow: 0 0 0 0 rgba(45,212,191,0.45); }
+    50%{ box-shadow: 0 0 0 6px rgba(45,212,191,0); }
+  }
+  .hero h1{
+    margin: 0 0 18px;
+    font-size: clamp(2.1rem, 5.4vw, 3.6rem);
+    line-height: 1.12;
+    letter-spacing: -0.02em;
+    font-weight: 800;
+  }
+  .hero h1 .grad{
+    background: linear-gradient(100deg, var(--accent), var(--accent-2));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .hero__sub{
+    margin: 0 0 14px;
+    max-width: 62ch;
+    font-size: clamp(1.02rem, 2.2vw, 1.22rem);
+    color: var(--muted);
+  }
+  .hero__note{
+    margin: 0 0 34px;
+    font-size: 0.9rem;
+    color: var(--dim);
+  }
+  .hero__note b{ color: var(--text); font-weight: 600; }
+  .hero__stats{
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  .stat{
+    flex: 1 1 190px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 16px 18px;
+    transition: transform 0.18s ease, border-color 0.18s ease;
+  }
+  .stat:hover{ transform: translateY(-3px); border-color: rgba(45,212,191,0.5); }
+  .stat__num{
+    font-family: var(--mono);
+    font-size: 1.34rem;
+    font-weight: 700;
+    color: var(--accent);
+    display: block;
+    margin-bottom: 4px;
+  }
+  .stat__lbl{
+    font-size: 0.8rem;
+    color: var(--muted);
+    line-height: 1.4;
+  }
+
+  /* ---------- sections ---------- */
+  .sec{ padding: 84px 0; }
+  .sec + .sec{ border-top: 1px solid var(--line); }
+  .sec__head{ margin-bottom: 40px; }
+  .sec__eyebrow{
+    font-family: var(--mono);
+    font-size: 0.74rem;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--accent-2);
+    margin-bottom: 8px;
+  }
+  .sec__head h2{
+    margin: 0;
+    font-size: clamp(1.6rem, 3.6vw, 2.3rem);
+    line-height: 1.2;
+    letter-spacing: -0.015em;
+  }
+  .sec__head p.lede{
+    margin: 12px 0 0;
+    max-width: 70ch;
+    color: var(--muted);
+  }
+
+  [id]{ scroll-margin-top: 84px; }
+
+  /* ---------- timeline ---------- */
+  .timeline{ position: relative; }
+  .timeline__rail{
+    position: absolute;
+    top: 8px;
+    bottom: 8px;
+    left: 16px;
+    width: 2px;
+    background: linear-gradient(180deg, transparent, var(--line) 8%, var(--line) 92%, transparent);
+  }
+  .stage{
+    position: relative;
+    padding-left: 52px;
+    margin-bottom: 56px;
+  }
+  .stage:last-child{ margin-bottom: 0; }
+  .stage__dot{
+    position: absolute;
+    left: 16px;
+    top: 30px;
+    width: 14px;
+    height: 14px;
+    transform: translateX(-50%);
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 0 4px rgba(45,212,191,0.15), 0 0 18px rgba(45,212,191,0.5);
+  }
+  .stage__card{
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 26px 28px;
+    position: relative;
+    transition: transform 0.18s ease, border-color 0.18s ease;
+  }
+  .stage__card:hover{
+    transform: translateY(-3px);
+    border-color: rgba(45,212,191,0.45);
+  }
+  .stage__meta{
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-bottom: 12px;
+  }
+  .stage__chip{
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    background: rgba(45,212,191,0.08);
+    border: 1px solid rgba(45,212,191,0.3);
+    padding: 3px 10px;
+    border-radius: 999px;
+  }
+  .stage__tag{
+    font-size: 0.74rem;
+    color: var(--muted);
+    font-family: var(--mono);
+  }
+  .stage__card h2{
+    margin: 0 0 12px;
+    font-size: clamp(1.25rem, 2.6vw, 1.55rem);
+    letter-spacing: -0.01em;
+  }
+  .stage__card p{ margin: 0 0 12px; color: var(--muted); }
+  .stage__card p:last-child{ margin-bottom: 0; }
+  .stage__card p strong, .stage__card p b{ color: var(--text); }
+
+  .stack{ display: grid; gap: 8px; margin: 14px 0; padding: 0; list-style: none; }
+  .stack li{
+    position: relative;
+    padding-left: 20px;
+    color: var(--muted);
+    font-size: 0.95rem;
+  }
+  .stack li::before{
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 0.62em;
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+    background: var(--accent-2);
+    opacity: 0.8;
+  }
+  .stack li b{ color: var(--text); font-weight: 600; }
+  .stack li code, p code, .stack li span.c{ font-family: var(--mono); font-size: 0.82em; color: var(--accent); background: rgba(45,212,191,0.08); padding: 1px 5px; border-radius: 5px; border: 1px solid rgba(45,212,191,0.18); }
+
+  /* ---------- code blocks ---------- */
+  .code{
+    margin: 18px 0;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--code-bg);
+    overflow: hidden;
+  }
+  .code__bar{
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 14px;
+    background: var(--panel-2);
+    border-bottom: 1px solid var(--line);
+  }
+  .code__bar i{
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    display: inline-block;
+    background: var(--line);
+  }
+  .code__bar i:nth-child(1){ background: #f87171; }
+  .code__bar i:nth-child(2){ background: #fbbf24; }
+  .code__bar i:nth-child(3){ background: #34d399; }
+  .code__bar span{
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    color: var(--dim);
+    margin-left: 6px;
+  }
+  .code pre{
+    margin: 0;
+    padding: 16px 18px;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: 0.84rem;
+    line-height: 1.6;
+    color: #c9d7ee;
+    tab-size: 4;
+  }
+  .code pre .c{ color: var(--dim); }
+  .code pre .k{ color: var(--accent-2); }
+  .code pre .s{ color: var(--ok); }
+  .code pre .f{ color: var(--warn); }
+
+  /* ---------- callouts & quotes ---------- */
+  .callout{
+    margin: 18px 0;
+    padding: 16px 18px;
+    border-left: 3px solid var(--accent);
+    background: rgba(45,212,191,0.06);
+    border-radius: 0 var(--radius) var(--radius) 0;
+  }
+  .callout--warn{ border-left-color: var(--warn); background: rgba(251,191,36,0.06); }
+  .callout--bad{ border-left-color: var(--bad); background: rgba(248,113,113,0.06); }
+  .callout p{ margin: 0; color: var(--muted); }
+  .callout p b{ color: var(--text); }
+  .callout__t{
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 6px;
+    display: block;
+  }
+  .callout--warn .callout__t{ color: var(--warn); }
+  .callout--bad .callout__t{ color: var(--bad); }
+
+  blockquote{
+    margin: 18px 0;
+    padding: 18px 22px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    font-size: 1.05rem;
+    font-style: italic;
+    color: var(--text);
+    position: relative;
+  }
+  blockquote::before{
+    content: "\201C";
+    position: absolute;
+    top: -14px;
+    left: 14px;
+    font-size: 3.4rem;
+    color: var(--accent);
+    opacity: 0.7;
+  }
+  blockquote cite{
+    display: block;
+    margin-top: 10px;
+    font-style: normal;
+    font-size: 0.8rem;
+    color: var(--dim);
+  }
+
+  /* ---------- shortfall table ---------- */
+  .gap-table{
+    margin: 18px 0;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  .gap-row{
+    display: grid;
+    grid-template-columns: 1.4fr 1fr 1fr;
+    gap: 12px;
+    align-items: center;
+    padding: 12px 16px;
+    font-size: 0.9rem;
+  }
+  .gap-row + .gap-row{ border-top: 1px solid var(--line); }
+  .gap-row.gap-row--head{
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--dim);
+    background: var(--panel-2);
+  }
+  .gap-row .g{ color: var(--muted); }
+  .gap-row .g b{ color: var(--text); }
+  .gap-row .target{ text-align: right; color: var(--dim); font-family: var(--mono); }
+  .gap-row .found{ text-align: right; font-family: var(--mono); color: var(--bad); font-weight: 700; }
+
+  /* ---------- pipeline flow ---------- */
+  .flow{
+    display: flex;
+    flex-wrap: wrap;
+    align-items: stretch;
+    justify-content: center;
+    gap: 0;
+    margin-top: 8px;
+  }
+  .flow__node{
+    flex: 1 1 200px;
+    min-width: 190px;
+    max-width: 260px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    transition: transform 0.18s ease, border-color 0.18s ease;
+  }
+  .flow__node:hover{ transform: translateY(-3px); border-color: rgba(129,140,248,0.5); }
+  .flow__node svg{
+    width: 30px;
+    height: 30px;
+    stroke: var(--accent-2);
+    fill: none;
+    stroke-width: 1.7;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  .flow__node h3{
+    margin: 0;
+    font-size: 0.98rem;
+    letter-spacing: -0.01em;
+  }
+  .flow__node p{
+    margin: 0;
+    font-size: 0.8rem;
+    color: var(--muted);
+    line-height: 1.5;
+  }
+  .flow__node .step-no{
+    font-family: var(--mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--dim);
+  }
+  .flow__arrow{
+    align-self: center;
+    width: 30px;
+    height: 30px;
+    flex: 0 0 30px;
+    display: grid;
+    place-items: center;
+  }
+  .flow__arrow svg{
+    width: 18px;
+    height: 18px;
+    stroke: var(--accent);
+    fill: none;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  .flow__note{
+    margin-top: 22px;
+    text-align: center;
+    font-size: 0.82rem;
+    color: var(--dim);
+  }
+
+  /* ---------- numbers grid ---------- */
+  .grid{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(215px, 1fr));
+    gap: 14px;
+  }
+  .num{
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 20px;
+    transition: transform 0.18s ease, border-color 0.18s ease;
+  }
+  .num:hover{ transform: translateY(-3px); border-color: rgba(45,212,191,0.45); }
+  .num__v{
+    font-family: var(--mono);
+    font-size: 1.5rem;
+    font-weight: 700;
+    color: var(--accent);
+    display: block;
+    margin-bottom: 6px;
+    letter-spacing: -0.01em;
+  }
+  .num__v small{ font-size: 0.72rem; color: var(--muted); font-weight: 600; }
+  .num__l{
+    font-size: 0.85rem;
+    color: var(--muted);
+    line-height: 1.45;
+  }
+
+  /* ---------- lessons ---------- */
+  .lessons{ padding: 0; margin: 0; list-style: none; display: grid; gap: 14px; }
+  .lessons li{
+    position: relative;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--accent);
+    border-radius: 0 var(--radius) var(--radius) 0;
+    padding: 16px 20px 16px 24px;
+    color: var(--muted);
+  }
+  .lessons li b{ color: var(--text); }
+  .lessons li .l-tag{
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    display: block;
+    margin-bottom: 6px;
+  }
+
+  /* ---------- footer ---------- */
+  .footer{
+    border-top: 1px solid var(--line);
+    padding: 44px 0 56px;
+    background: var(--bg-soft);
+  }
+  .footer__inner{
+    display: flex;
+    flex-wrap: wrap;
+    gap: 18px;
+    justify-content: space-between;
+    align-items: flex-start;
+  }
+  .footer p{ margin: 0; font-size: 0.88rem; color: var(--dim); max-width: 60ch; }
+  .footer .f-brand{ font-family: var(--mono); font-size: 0.8rem; color: var(--accent); font-weight: 700; letter-spacing: 0.05em; margin-bottom: 8px; display: block; }
+  .footer a.top{
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    color: var(--muted);
+    border: 1px solid var(--line);
+    padding: 8px 14px;
+    border-radius: 999px;
+    white-space: nowrap;
+  }
+  .footer a.top:hover{ color: var(--accent); border-color: rgba(45,212,191,0.4); text-decoration: none; }
+
+  /* ---------- reveal ---------- */
+  body.js .reveal{ opacity: 0; transform: translateY(18px); transition: opacity 0.55s ease, transform 0.55s ease; }
+  body.js .reveal.in{ opacity: 1; transform: none; }
+
+  @media (prefers-reduced-motion: reduce){
+    html{ scroll-behavior: auto; }
+    body.js .reveal{ opacity: 1; transform: none; transition: none; }
+    *{ animation: none !important; }
+  }
+
+  /* ---------- desktop timeline ---------- */
+  @media (min-width: 900px){
+    .timeline__rail{ left: 50%; transform: translateX(-50%); }
+    .stage{ padding-left: 0; }
+    .stage__dot{ left: 50%; top: 34px; }
+    .stage__card{ width: calc(50% - 52px); }
+    .stage:nth-of-type(odd) .stage__card{ margin-right: auto; }
+    .stage:nth-of-type(even) .stage__card{ margin-left: auto; }
+    .stage::before{
+      content: "";
+      position: absolute;
+      top: 40px;
+      height: 2px;
+      width: 38px;
+      background: linear-gradient(90deg, var(--accent), rgba(45,212,191,0.2));
+    }
+    .stage:nth-of-type(odd)::before{ left: calc(50% - 38px); right: auto; }
+    .stage:nth-of-type(even)::before{ right: calc(50% - 38px); left: auto; background: linear-gradient(90deg, rgba(45,212,191,0.2), var(--accent)); }
+  }
+</style>
+</head>
+<body>
+
+<a class="skip-link" href="#main">Skip to content</a>
+<div class="progress" id="progress" aria-hidden="true"></div>
+
+<nav class="nav" aria-label="Primary navigation">
+  <div class="nav__inner">
+    <span class="nav__brand">hinglish-classifier <em>/ journey</em></span>
+    <ul class="nav__links" id="nav-links">
+      <li><a href="#stage-1">01 Baseline</a></li>
+      <li><a href="#stage-2">02 Data</a></li>
+      <li><a href="#stage-3">03 Prompt</a></li>
+      <li><a href="#stage-4">04 CI/CD</a></li>
+      <li><a href="#stage-5">05 Bugs</a></li>
+      <li><a href="#stage-6">06 Results</a></li>
+      <li><a href="#stage-7">07 Harvester</a></li>
+      <li><a href="#stage-8">08 Judgement</a></li>
+      <li><a href="#stage-9">09 Closed Loop</a></li>
+      <li><a href="#stage-10">10 Prompt</a></li>
+      <li><a href="#stage-11">11 Sanitizer</a></li>
+      <li><a href="#stage-12">12 Guardrails</a></li>
+      <li><a href="#pipeline">Pipeline</a></li>
+      <li><a href="#numbers">Numbers</a></li>
+      <li><a href="#lessons">Lessons</a></li>
+    </ul>
+  </div>
+</nav>
+
+<header class="hero" id="top">
+  <div class="container">
+    <span class="hero__eyebrow">Case study &middot; data engineering &middot; prompt engineering</span>
+    <h1>Building a <span class="grad">Hinglish Hate-Speech</span> Classifier</h1>
+    <p class="hero__sub">A data-engineering and prompt-engineering journey &mdash; from a MuRIL baseline to a 50k-row, CI/CD-driven training dataset built entirely from real Reddit data.</p>
+    <p class="hero__note">Everything on this page is reconstructed from a <b>two-part AI-conversation transcript &mdash; 487 pages (part 1) plus a 359-page continuation (part 2)</b> of the actual build &mdash; the decisions, the dead ends, the debug sessions, and the wins. It is a documentation and educational showcase, not a product.</p>
+    <div class="hero__stats">
+      <div class="stat reveal">
+        <span class="stat__num">0.8398</span>
+        <span class="stat__lbl">MuRIL v3 baseline Macro F1 &mdash; the bar every later decision had to beat.</span>
+      </div>
+      <div class="stat reveal">
+        <span class="stat__num">v6.5</span>
+        <span class="stat__lbl">Labeling prompt version &mdash; the &ldquo;Goldilocks&rdquo; decoupled 3-flag design.</span>
+      </div>
+      <div class="stat reveal">
+        <span class="stat__num">~400</span>
+        <span class="stat__lbl">Tokens saved per batch via ultra-short JSON keys (pv/tah/dhs&hellip;).</span>
+      </div>
+      <div class="stat reveal">
+        <span class="stat__num">210 rows</span>
+        <span class="stat__lbl">First baseline run &mdash; 24.3% overall toxicity rate.</span>
+      </div>
+      <div class="stat reveal">
+        <span class="stat__num">86%</span>
+        <span class="stat__lbl">Prompt-cache hit rate observed on the first full job run.</span>
+      </div>
+    </div>
+  </div>
+</header>
+
+<main id="main">
+
+  <section class="sec" id="timeline" aria-labelledby="timeline-title">
+    <div class="container">
+      <header class="sec__head">
+        <span class="sec__eyebrow">The story</span>
+        <h2 id="timeline-title">Twelve stages, one pipeline</h2>
+        <p class="lede">The project is told here as a vertical timeline covering both parts of the build transcript &mdash; part 1 (stages 1&ndash;8) and part 2 (stages 9&ndash;12), which closes the loop with an autonomous, self-healing pipeline. Each stage is a real chapter from the build &mdash; what we tried, why it failed or worked, and what it forced us to build next.</p>
+      </header>
+
+      <div class="timeline">
+        <span class="timeline__rail" aria-hidden="true"></span>
+
+        <!-- STAGE 1 -->
+        <article class="stage reveal" id="stage-1" aria-labelledby="stage-1-h">
+          <span class="stage__dot" aria-hidden="true"></span>
+          <div class="stage__card">
+            <div class="stage__meta">
+              <span class="stage__chip">Stage 01</span>
+              <span class="stage__tag">baseline &middot; fine-tuning</span>
+            </div>
+            <h2 id="stage-1-h">The Baseline Model: MuRIL v3</h2>
+            <p>Every serious ML project starts with a baseline. This one began with <strong>MuRIL</strong> &mdash; Google&rsquo;s Multilingual Representations for Indian Languages transformer &mdash; fine-tuned for the toxicity task. The <strong>MuRIL v3</strong> classifier reached a <strong>Macro F1 of 0.8398</strong>, the number every later decision had to beat.</p>
+            <p>The <strong>core problem</strong>: Hinglish &mdash; Hindi-English code-mixing &mdash; is <em>sparse, obfuscated, and domain-specific</em>. Speakers deliberately misspell words, write romanized Hindi (&ldquo;<code>log hume hii kyun chhedte hai</code>&rdquo;), and lean on subreddit-specific slang. Generic, off-the-shelf toxicity models fail on it because they never saw that distribution in training.</p>
+            <p>To source data of varying toxicity density, a <strong>4-tier subreddit taxonomy</strong> was designed &mdash; from high-priority toxic subs like <strong>r/Chodi</strong> and <strong>r/bakchodi</strong> down to clean <em>&ldquo;hard negative control&rdquo;</em> subs like <strong>r/developersIndia</strong>, <strong>r/CarsIndia</strong>, and <strong>r/TwoXIndia</strong>:</p>
+            <div class="code" role="region" aria-label="Subreddit taxonomy snippet">
+              <div class="code__bar"><i></i><i></i><i></i><span>taxonomy.py</span></div>
+<pre><code><span class="c"># 4-tier taxonomy: tune the toxicity density per tier</span>
+TIERS = {
+    <span class="s">"t1_high_tox"</span>: [<span class="s">"Chodi"</span>, <span class="s">"bakchodi"</span>],   <span class="c"># high-priority toxic</span>
+    <span class="c"># ...intermediate tiers 2 &amp; 3 fill the middle density...</span>
+    <span class="s">"t4_hard_neg"</span>: [<span class="s">"developersIndia"</span>, <span class="s">"CarsIndia"</span>,
+                     <span class="s">"TwoXIndia"</span>],                <span class="c"># clean controls</span>
+}</code></pre>
+            </div>
+          </div>
+        </article>
+
+        <!-- STAGE 2 -->
+        <article class="stage reveal" id="stage-2" aria-labelledby="stage-2-h">
+          <span class="stage__dot" aria-hidden="true"></span>
+          <div class="stage__card">
+            <div class="stage__meta">
+              <span class="stage__chip">Stage 02</span>
+              <span class="stage__tag">data collection</span>
+            </div>
+            <h2 id="stage-2-h">Data Collection Architecture</h2>
+            <p>Reddit data was sourced from the <strong>Arctic Shift API</strong> and the <strong>historical Pushshift archives</strong> hosted on Hugging Face &mdash; for example the <code>open-index/arctic</code> dataset and <code>sentence-transformers/reddit-title-body</code> for banned subreddits like <strong>r/Chodi</strong> that no longer exist as live subreddits.</p>
+            <p>Mid-project, labeling moved from <strong>Gemini</strong> to the <strong>OpenCode Go API</strong> &mdash; model <code>deepseek-v4-flash</code>, base URL <code>https://opencode.ai/zen/go/v1</code>, key supplied from <strong>Colab secrets</strong>.</p>
+            <p>Several early decisions shaped everything after:</p>
+            <ul class="stack">
+              <li><b>Sanitize before sending</b> &mdash; HTML unescape, strip tags with the regex <code>&lt;[^&gt;]+&gt;</code>, strip markdown links, and scrub <code>/u/</code> handles. Cheap tokens, but they add up across 20-comment batches.</li>
+              <li><b>Deduplicate aggressively</b> on a normalized string core so no comment appears twice.</li>
+              <li><b>Checkpoint sampled rows</b> &mdash; a <code>seen_ids_ledger.txt</code> so re-runs never label the same comment twice.</li>
+            </ul>
+            <div class="code" role="region" aria-label="Sanitization snippet">
+              <div class="code__bar"><i></i><i></i><i></i><span>sanitize.py</span></div>
+<pre><code><span class="k">import</span> html, re
+
+<span class="k">def</span> <span class="f">sanitize</span>(text):
+    text = html.unescape(text)                    <span class="c"># &amp;amp; &amp;lt; &amp;gt;</span>
+    text = re.sub(<span class="s">r"&lt;[^&gt;]+&gt;"</span>, <span class="s">""</span>, text)      <span class="c"># strip HTML tags</span>
+    text = re.sub(<span class="s">r"\[.*?\]\(.*?\)"</span>, <span class="s">""</span>, text)  <span class="c"># markdown links</span>
+    text = re.sub(<span class="s">r"/u/[\w-]+"</span>, <span class="s">""</span>, text)      <span class="c"># scrub handles</span>
+    <span class="k">return</span> <span class="s">" "</span>.join(text.split())</code></pre>
+            </div>
+            <div class="code" role="region" aria-label="Checkpoint ledger snippet">
+              <div class="code__bar"><i></i><i></i><i></i><span>checkpoint.py</span></div>
+<pre><code><span class="c"># never label a comment twice</span>
+pending = [c <span class="k">for</span> c <span class="k">in</span> sampled <span class="k">if</span> c.id <span class="k">not in</span> seen_ids]
+<span class="k">with</span> open(<span class="s">"seen_ids_ledger.txt"</span>, <span class="s">"a"</span>) <span class="k">as</span> f:
+    <span class="k">for</span> cid <span class="k">in</span> batch_ids:
+        f.write(f<span class="s">"{cid}\n"</span>)</code></pre>
+            </div>
+          </div>
+        </article>
+
+        <!-- STAGE 3 -->
+        <article class="stage reveal" id="stage-3" aria-labelledby="stage-3-h">
+          <span class="stage__dot" aria-hidden="true"></span>
+          <div class="stage__card">
+            <div class="stage__meta">
+              <span class="stage__chip">Stage 03</span>
+              <span class="stage__tag">prompt engineering</span>
+            </div>
+            <h2 id="stage-3-h">The Labeling Prompt: v1 &rarr; v6.x &ldquo;Goldilocks&rdquo;</h2>
+            <p>The labeling prompt went through many versions. The <strong>v6.x &ldquo;Goldilocks&rdquo;</strong> redesign is the centerpiece of the project &mdash; not too coarse to be useless, not too fine to be unreachable. It is built on a <strong>decoupled 3-flag architecture</strong>:</p>
+            <ul class="stack">
+              <li><code>pv</code> &mdash; <b>profanity_vulgarity</b></li>
+              <li><code>tah</code> &mdash; <b>targeted_abuse_harassment</b></li>
+              <li><code>dhs</code> &mdash; <b>discriminatory_hate_speech</b> &mdash; <b>1 if and only if ANY hate dimension is 1</b>: <code>cst</code> (caste), <code>cr</code> (communal/religious), <code>rx</code> (regional/xenophobic), <code>mg</code> (misogyny/gender).</li>
+            </ul>
+            <p>The <strong>ultra-short JSON keys</strong> (<code>pv/tah/dhs/cst/cr/rx/mg</code>) saved roughly <strong>~400 tokens per batch</strong> &mdash; a deliberate 1-to-1 trade of JSON formatting tokens for reasoning runway, reinvested in a mandatory one-sentence <code>analysis</code> field on every comment.</p>
+            <div class="code" role="region" aria-label="Decision procedure">
+              <div class="code__bar"><i></i><i></i><i></i><span>decision procedure</span></div>
+<pre><code><span class="c"># Step 1  explicit profanity / vulgarity ......... pv  = 1</span>
+<span class="c">#         kept even for filler / abstract targets</span>
+<span class="c"># Step 2  targeted personal abuse / harassment .. tah = 1</span>
+<span class="c">#         identity-based stereotyping .......... dhs = 1</span>
+<span class="c">#         abstract entity / self-directed /</span>
+<span class="c">#         reported speech / filler ............. 0</span>
+<span class="c"># Step 3  "When in doubt, output 0."</span></code></pre>
+            </div>
+            <div class="callout">
+              <span class="callout__t">Philosophy</span>
+              <p><b>&ldquo;When in doubt, output 0.&rdquo;</b> <code>pv</code> is a <em>detection signal</em>, not a moderation verdict &mdash; profanity alone doesn&rsquo;t make a comment hate speech, and the flags must stay orthogonal.</p>
+            </div>
+            <p><strong>v6.5</strong> restored <strong>full English coverage</strong> (handling English hate and abuse without deviating from the main Hinglish objective) and wrapped batches in <code>{"results": [...]}</code>. A <strong>&ldquo;Human Reviewer Guidelines&rdquo; SOP</strong> was written so human reviewers and the AI labeler judge by the same standard &mdash; exact category definitions, a &ldquo;Load-Bearing Test&rdquo; for hate speech, and a list of common Hinglish traps.</p>
+            <p>Inference was tuned hard. <strong>Async labeling</strong> was tried (thinking ON, 12&ndash;18&nbsp;s/batch) but <strong>reverted to synchronous batch calls</strong> &mdash; thinking OFF via <code>extra_body={"thinking": {"type": "disabled"}}</code>, <code>temperature 0.1</code>, <code>max_tokens 2500</code>, <code>response_format={"type": "json_object"}</code>, <strong>4 retries with backoff</strong>, <strong>20 comments per batch</strong>, thread pool:</p>
+            <div class="code" role="region" aria-label="Inference call snippet">
+              <div class="code__bar"><i></i><i></i><i></i><span>label.py</span></div>
+<pre><code>resp = client.chat.completions.create(
+    model=<span class="s">"deepseek-v4-flash"</span>,
+    temperature=<span class="s">0.1</span>,
+    max_tokens=<span class="s">2500</span>,
+    response_format={<span class="s">"type"</span>: <span class="s">"json_object"</span>},
+    extra_body={<span class="s">"thinking"</span>: {<span class="s">"type"</span>: <span class="s">"disabled"</span>}},
+    messages=[{<span class="s">"role"</span>: <span class="s">"user"</span>, <span class="s">"content"</span>: batch_prompt}],
+)
+<span class="c"># 20 comments/batch &middot; 4 retries w/ backoff &middot; thread pool</span></code></pre>
+            </div>
+          </div>
+        </article>
+
+        <!-- STAGE 4 -->
+        <article class="stage reveal" id="stage-4" aria-labelledby="stage-4-h">
+          <span class="stage__dot" aria-hidden="true"></span>
+          <div class="stage__card">
+            <div class="stage__meta">
+              <span class="stage__chip">Stage 04</span>
+              <span class="stage__tag">ci/cd &middot; github actions</span>
+            </div>
+            <h2 id="stage-4-h">The CI/CD Pipeline: GitHub Actions</h2>
+            <p>The full pipeline runs on <strong>GitHub Actions</strong> free-tier VMs, with a <strong>matrix of 4 parallel year-workers</strong> (2017, 2018, 2019, 2020) and <code>fail-fast: false</code> so one bad year doesn&rsquo;t kill the rest. <strong>DuckDB with httpfs</strong> reads Parquet shards directly from Hugging Face &mdash; <code>PRAGMA memory_limit='6GB'</code>, threads bumped 2&rarr;8 for parallel network pipes, <code>hf://datasets/open-index/arctic/&hellip;</code>.</p>
+            <div class="code" role="region" aria-label="DuckDB extraction snippet">
+              <div class="code__bar"><i></i><i></i><i></i><span>extract.sql</span></div>
+<pre><code><span class="k">SET</span> memory_limit = <span class="s">'6GB'</span>;
+<span class="k">SET</span> threads = <span class="s">8</span>;            <span class="c">-- parallel network pipes</span>
+<span class="k">SET</span> httpfs_enable = <span class="s">1</span>;
+
+<span class="k">SELECT</span> id, body, subreddit, created_utc
+<span class="k">FROM</span> read_parquet(<span class="s">'hf://datasets/open-index/arctic/**/*.parquet'</span>)
+<span class="k">WHERE</span> subreddit IN (tier_subs)   <span class="c">-- 10 shards test / 200 prod</span>
+<span class="k">LIMIT</span> 5000;</code></pre>
+            </div>
+            <p>Two classic production mistakes got engineered away:</p>
+            <ul class="stack">
+              <li><b>Dynamic shard scaling</b> &mdash; 10 shards for test runs (&lt;1000 rows), 200 for production. The original mistake was scanning <b>200 shards (~100GB)</b> just to test on 50 rows.</li>
+              <li><b>Dynamic seed from <code>GITHUB_RUN_ID % 100000</code></b> &mdash; a fixed <code>random.seed(42)</code> silently pulled <em>identical rows</em> on every run.</li>
+            </ul>
+            <div class="code" role="region" aria-label="Dynamic seed snippet">
+              <div class="code__bar"><i></i><i></i><i></i><span>seed.py</span></div>
+<pre><code>seed = int(os.environ[<span class="s">"GITHUB_RUN_ID"</span>]) % 100000
+random.seed(seed)   <span class="c"># never a hard-coded 42</span>
+
+df = df.groupby(<span class="s">"bucket"</span>).sample(n, random_state=seed)
+df = backfill_shortfalls(df, seed)   <span class="c"># stratify subreddit &times; month</span></code></pre>
+            </div>
+            <p><strong>Stratified balancing</strong> samples across subreddit &times; month buckets (with backfill) so every run samples evenly. Telemetry was added because CI is blind: a <strong>psutil resource-monitor daemon</strong> prints RAM/CPU every 30s, a <strong>DuckDB &ldquo;heartbeat&rdquo; thread</strong> prints elapsed time and network stats every 15s (DuckDB&rsquo;s native progress bar is swallowed by headless CI logs), and <code>PYTHONUNBUFFERED: 1</code> defeats Python&rsquo;s log buffering that made the workflow look frozen.</p>
+            <p>The <strong>system prompt is fetched at runtime from a raw GitHub URL</strong> &mdash; prompt changes need no code change. Output is chunked to <code>labelled_output/chunks/</code> per year, then <strong>Job 2</strong> (<code>needs:</code> chain) downloads all artifacts, merges them into <code>master_baseline_tier1.csv</code>, prints a distribution report, and auto-commits/pushes via <code>github-actions[bot]</code> (<code>permissions: contents: write</code>). A <code>step3_harvester.py</code> (<strong>Job 3</strong>) closes the loop: read the master file &rarr; find category shortfalls &rarr; generate targeted keywords &rarr; surgically extract matching real comments &rarr; label and merge.</p>
+          </div>
+        </article>
+
+        <!-- STAGE 5 -->
+        <article class="stage reveal" id="stage-5" aria-labelledby="stage-5-h">
+          <span class="stage__dot" aria-hidden="true"></span>
+          <div class="stage__card">
+            <div class="stage__meta">
+              <span class="stage__chip">Stage 05</span>
+              <span class="stage__tag">debugging saga</span>
+            </div>
+            <h2 id="stage-5-h">The Bug-Fixing Saga</h2>
+            <p>A CI pipeline is a debugging surface, and this one produced five memorable fights with the machine &mdash; each one worth telling:</p>
+            <ul class="stack">
+              <li><b><code>id_x</code>/<code>id_y</code> merge collision</b> &mdash; both source data and the LLM JSON contained an <code>id</code> column, so pandas renamed them on merge. Fix: force-drop the LLM&rsquo;s <code>id</code> column before merging.</li>
+              <li><b><code>groupby().sample()</code> index/data-loss bug</b> &mdash; the balancing logic silently dropped columns. Rewritten with a temporary <code>bucket</code> column (<code>subreddit_year_month</code>), direct index extraction, and explicit backfill &mdash; &ldquo;bulletproof stratified balancing&rdquo;.</li>
+              <li><b>clean-text API drift</b> &mdash; <code>no_html=True</code> was never a valid argument; the library version silently changed and crashed. Fix: strip HTML with a manual regex before calling <code>clean()</code> &mdash; version-proof. The AI assistant <em>admitted its own mistake twice</em> here.</li>
+              <li><b>The missing rename line</b> &mdash; a &ldquo;final&rdquo; script accidentally deleted the column-rename step, so chunks were saved with short keys (<code>pv</code>, etc.) and the merge script crashed with <code>KeyError</code>. Salvage fix: a <code>rename_mapping</code> dictionary in the merge script expands abbreviations back to full column names.</li>
+              <li><b>Fresh-VM gotcha</b> &mdash; every GitHub Actions job boots a blank VM; Job 2 crashed with <code>ModuleNotFoundError: pandas</code>. Fix: add its own <code>pip install pandas</code> step.</li>
+            </ul>
+            <div class="code" role="region" aria-label="rename mapping snippet">
+              <div class="code__bar"><i></i><i></i><i></i><span>merge.py</span></div>
+<pre><code>RENAME = {
+    <span class="s">"pv"</span>:  <span class="s">"profanity_vulgarity"</span>,
+    <span class="s">"tah"</span>: <span class="s">"targeted_abuse_harassment"</span>,
+    <span class="s">"dhs"</span>: <span class="s">"discriminatory_hate_speech"</span>,
+    <span class="s">"cst"</span>: <span class="s">"caste"</span>,  <span class="s">"cr"</span>: <span class="s">"communal_religious"</span>,
+    <span class="s">"rx"</span>:  <span class="s">"regional_xenophobic"</span>,
+    <span class="s">"mg"</span>:  <span class="s">"misogyny_gender"</span>,
+}
+df = df.drop(columns=[<span class="s">"id"</span>], errors=<span class="s">"ignore"</span>)   <span class="c"># id_x/id_y fix</span>
+df = df.rename(columns=RENAME)</code></pre>
+            </div>
+          </div>
+        </article>
+
+        <!-- STAGE 6 -->
+        <article class="stage reveal" id="stage-6" aria-labelledby="stage-6-h">
+          <span class="stage__dot" aria-hidden="true"></span>
+          <div class="stage__card">
+            <div class="stage__meta">
+              <span class="stage__chip">Stage 06</span>
+              <span class="stage__tag">first results</span>
+            </div>
+            <h2 id="stage-6-h">First Results &amp; The Class-Imbalance Problem</h2>
+            <p>The first baseline run produced <strong>210 rows at a 24.3% overall toxicity rate</strong>. But the distribution report showed <strong>severe shortfalls</strong> versus targets &mdash; exactly why random stratified sampling alone is economically wasteful:</p>
+            <div class="gap-table" role="table" aria-label="Category shortfalls before harvesting">
+              <div class="gap-row gap-row--head" role="row">
+                <span role="columnheader">Category</span>
+                <span class="target" role="columnheader">Target</span>
+                <span class="found" role="columnheader">Found</span>
+              </div>
+              <div class="gap-row" role="row">
+                <span class="g" role="cell"><b>Caste</b> (<code>cst</code>)</span>
+                <span class="target" role="cell">1,000</span>
+                <span class="found" role="cell">3</span>
+              </div>
+              <div class="gap-row" role="row">
+                <span class="g" role="cell"><b>Misogyny / Gender</b> (<code>mg</code>)</span>
+                <span class="target" role="cell">1,000</span>
+                <span class="found" role="cell">2</span>
+              </div>
+              <div class="gap-row" role="row">
+                <span class="g" role="cell"><b>Communal / Religious</b> (<code>cr</code>)</span>
+                <span class="target" role="cell">1,200</span>
+                <span class="found" role="cell">9</span>
+              </div>
+              <div class="gap-row" role="row">
+                <span class="g" role="cell"><b>Regional / Xenophobic</b> (<code>rx</code>)</span>
+                <span class="target" role="cell">1,000</span>
+                <span class="found" role="cell">10</span>
+              </div>
+            </div>
+            <p>Random sampling burns <em>thousands of rows and tokens</em> to scrape a handful of caste/misogyny positives out of a sparse corpus. That insight drove the entire <strong>Stage 7</strong> harvester design.</p>
+            <p>One bright spot: the first full job run observed an <strong>86% prompt-cache hit rate</strong> &mdash; the static system prompt was served from cache, slashing label costs.</p>
+          </div>
+        </article>
+
+        <!-- STAGE 7 -->
+        <article class="stage reveal" id="stage-7" aria-labelledby="stage-7-h">
+          <span class="stage__dot" aria-hidden="true"></span>
+          <div class="stage__card">
+            <div class="stage__meta">
+              <span class="stage__chip">Stage 07</span>
+              <span class="stage__tag">targeted extraction</span>
+            </div>
+            <h2 id="stage-7-h">The Harvester: Filling the Gaps (No Synthetic Data)</h2>
+            <p><strong>Step 3 &ldquo;Harvester&rdquo;</strong> is a targeted extraction engine. It reads the master CSV, computes shortfalls per category, picks the priority category, prompts the LLM to generate <strong>~50 highly specific Hinglish slurs/phrases/text patterns</strong>, builds a <code>WHERE body LIKE '%keyword%'</code> DuckDB query, and <strong>surgically harvests real matching comments</strong> (<code>LIMIT 5000</code>) &mdash; which are then labeled and merged back into the master file.</p>
+            <div class="code" role="region" aria-label="Harvester query snippet">
+              <div class="code__bar"><i></i><i></i><i></i><span>harvester.py</span></div>
+<pre><code>clause = <span class="s">" OR "</span>.join(
+    f<span class="s">"LOWER(body) LIKE '%{k}%'"</span> <span class="k">for</span> k <span class="k">in</span> keywords)
+query = f<span class="s">"""</span>
+<span class="s">SELECT id, body, subreddit, created_utc</span>
+<span class="s">FROM read_parquet(shards)</span>
+<span class="s">WHERE ({clause}) AND subreddit IN ({tier_subs})</span>
+<span class="s">LIMIT 5000</span>
+<span class="s">"""</span></code></pre>
+            </div>
+            <div class="callout callout--bad">
+              <span class="callout__t">Critical clarification</span>
+              <p>This is <b>NOT synthetic data</b>. The LLM is used only as a <em>lexicon / dictionary builder</em> &mdash; every harvested comment is a <b>real Reddit comment</b> pulled from the Arctic dataset.</p>
+            </div>
+            <p><strong>Data-informed keyword discovery (few-shot) beats zero-shot</strong>: feed the LLM the few real positive examples already found, so the generated keywords match real-world typing habits and automod-obfuscation &mdash; not dictionary definitions.</p>
+            <p>The earlier <strong>&ldquo;Hunter&rdquo; approach</strong> was revisited: <strong>Differential Word Frequency Analysis (TF-IDF)</strong> &mdash; deterministic, no LLM. Split the corpus into the target category vs. a background corpus, tokenize, strip stopwords (English: <em>the/and/is/of/to</em>; Hinglish: <em>hai/ki/aur/mein/se</em>), and score words by TF-IDF. Words frequent in the target but rare in the background spike and become candidate search keywords:</p>
+            <div class="code" role="region" aria-label="TF-IDF differential snippet">
+              <div class="code__bar"><i></i><i></i><i></i><span>hunter.py</span></div>
+<pre><code><span class="c"># target corpus  vs  background corpus</span>
+t = tokenize(target_corpus);   t = minus_stopwords(t)   <span class="c"># en + hinglish</span>
+b = tokenize(background);      b = minus_stopwords(b)   <span class="c"># hai/ki/aur/mein/se</span>
+score = <span class="k">lambda</span> w: tfidf(w, t, b)   <span class="c"># freq in target, rare in bg</span>
+keywords = top_n(rank(score), <span class="s">50</span>)</code></pre>
+            </div>
+          </div>
+        </article>
+
+        <!-- STAGE 8 -->
+        <article class="stage reveal" id="stage-8" aria-labelledby="stage-8-h">
+          <span class="stage__dot" aria-hidden="true"></span>
+          <div class="stage__card">
+            <div class="stage__meta">
+              <span class="stage__chip">Stage 08</span>
+              <span class="stage__tag">engineering judgement</span>
+            </div>
+            <h2 id="stage-8-h">Engineering Judgement: When to Say No</h2>
+            <p>Library upgrades were considered for <em>every</em> pipeline stage &mdash; <strong>Loguru</strong> for telemetry, <strong>Neattext + ftfy</strong> for sanitization, <strong>scikit-learn <code>train_test_split(stratify=&hellip;)</code></strong> for balancing, <strong>AsyncOpenAI + Instructor</strong> for inference, <strong>Rich</strong> for logs. The verdict:</p>
+            <blockquote>
+              Don&rsquo;t refactor a working pipeline. If it isn&rsquo;t broken, don&rsquo;t fix it.
+              <cite>&mdash; the guiding principle of the entire build</cite>
+            </blockquote>
+            <ul class="stack">
+              <li><b>sklearn&rsquo;s <code>train_test_split</code> fatally errors</b> when any bucket has exactly 1 row &mdash; the custom backfill logic handles it.</li>
+              <li><b>scikit-learn bloats VM boot time</b> and eats free GitHub Actions minutes.</li>
+              <li><b>Async rewrites risk silently swallowing API errors</b> &mdash; synchronous, retry-with-backoff calls were battle-tested.</li>
+            </ul>
+            <p>Save the shiny libraries for <strong>v2.0</strong>. The pipeline that shipped is boring on purpose &mdash; and it works.</p>
+          </div>
+        </article>
+
+        <!-- STAGE 9 -->
+        <article class="stage reveal" id="stage-9" aria-labelledby="stage-9-h">
+          <span class="stage__dot" aria-hidden="true"></span>
+          <div class="stage__card">
+            <div class="stage__meta">
+              <span class="stage__chip">Stage 09</span>
+              <span class="stage__tag">part 2 &middot; closed loop</span>
+            </div>
+            <h2 id="stage-9-h">The 4-Step Closed Loop: Hunt, Harvest, Rebalance</h2>
+            <p>Part 2 opens by locking the whole pipeline into a formal 4-step feedback loop. <strong>Step 1 &mdash; Parallel Extraction</strong>: a 4-VM GitHub Actions matrix pulls and labels baseline data (12,500 rows per year). <strong>Step 2 &mdash; Analysis &amp; Deficiency Detection</strong> (<code>merge_and_analyze.py</code>): merges the yearly CSVs, compares each minority category against targets (1,000 minimum rows each), and writes a <code>deficiencies.json</code>. <strong>Step 3 &mdash; Smart Hunter</strong> (<code>hunter_worker.py</code>): reads the deficiencies, surgically queries DuckDB with keyword vectors, filters out anything already labeled (no wasted API tokens), labels the new rows, and saves <code>hunter_supplement.csv</code>. <strong>Step 4 &mdash; Final Rebalance</strong> (<code>final_rebalance.py</code>): merges baseline + hunter, deduplicates, shuffles, prints the distribution report, exports the master CSV.</p>
+            <blockquote>
+              The pipeline no longer just records what it lacks &mdash; it goes out and finds it.
+            </blockquote>
+            <div class="code" role="region" aria-label="Deficiencies JSON shape">
+              <div class="code__bar"><i></i><i></i><i></i><span>deficiencies.json</span></div>
+<pre><code>{
+  <span class="s">"caste"</span>: { <span class="s">"shortfall"</span>: 997, <span class="s">"keywords"</span>: [
+      <span class="s">"dalit"</span>, <span class="s">"chamar"</span>, <span class="s">"bhangi"</span>,
+      <span class="s">"neech"</span>, <span class="s">"quota"</span>, <span class="s">"untouchable"</span>
+  ]},
+  <span class="s">"misogyny_gender"</span>: { <span class="s">"shortfall"</span>: 998, ... }
+}</code></pre>
+            </div>
+            <div class="callout">
+              <span class="callout__t">Spread cap</span>
+              <p>The hunter caps its own appetite: <code>HUNTER_LIMIT = min(total_shortfall * 2, 8000)</code> &mdash; enough to cover the gap with redundancy, never enough to blow up API spend on a runaway search.</p>
+            </div>
+          </div>
+        </article>
+
+        <!-- STAGE 10 -->
+        <article class="stage reveal" id="stage-10" aria-labelledby="stage-10-h">
+          <span class="stage__dot" aria-hidden="true"></span>
+          <div class="stage__card">
+            <div class="stage__meta">
+              <span class="stage__chip">Stage 10</span>
+              <span class="stage__tag">part 2 &middot; prompt precision</span>
+            </div>
+            <h2 id="stage-10-h">The v6.5 Decision Procedure, Sharper</h2>
+            <p>Part 2 also pins down the exact v6.5 decision procedure the teacher model follows &mdash; the detail that makes labels consistent at scale:</p>
+            <ul class="stack">
+              <li>(1) Explicit profanity/vulgarity anywhere &rarr; <code>pv:1</code>, even toward filler or abstract targets.</li>
+              <li>(2) Targeted personal abuse/harassment &rarr; <code>tah:1</code> &mdash; with the &ldquo;public figure reverse test&rdquo;: professional critique of a politician, journalist, or actor is NOT abuse; a personal attack on a private individual IS.</li>
+              <li>(3) <code>dhs:1</code> if and only if any identity dimension (<code>cst</code>/<code>cr</code>/<code>rx</code>/<code>mg</code>) fires.</li>
+              <li>(4) Political labels (sanghi, bhakt, libtard, snowflake) are NOT identity dimensions on their own &mdash; they only become hate speech when paired with a dimension or targeted abuse.</li>
+            </ul>
+            <div class="code" role="region" aria-label="Decision procedure v6.5">
+              <div class="code__bar"><i></i><i></i><i></i><span>decision procedure</span></div>
+<pre><code><span class="c"># 1  explicit profanity / vulgarity anywhere .... pv  = 1</span>
+<span class="c">#    kept even for filler / abstract targets</span>
+<span class="c"># 2  targeted personal abuse / harassment ....... tah = 1</span>
+<span class="c">#    public figure, professional capacity = critique, not abuse</span>
+<span class="c"># 3  dhs = 1 if and only if a dimension fires</span>
+<span class="c">#    cst / cr / rx / mg</span>
+<span class="c"># 4  political labels alone .................... 0</span>
+<span class="c">#    sanghi / bhakt / libtard / snowflake need a dimension</span></code></pre>
+            </div>
+            <div class="callout callout--bad">
+              <span class="callout__t">Politics &ne; identity</span>
+              <p>Rule 4 exists because politics &ne; identity: calling someone a &ldquo;sanghi&rdquo; is criticism; claiming their religion makes them subhuman is hate. The prompt must be able to tell the difference.</p>
+            </div>
+            <p>The full v6.5 prompt &mdash; including per-category Hinglish slur lists, homonym traps (<code>chakka</code> = jackfruit vs slur; <code>BC</code> = date vs profanity), the India-Pakistan government-vs-people rule, and code-switching guidance &mdash; is fetched at runtime from a raw URL in the GitHub repo, so every pipeline run labels with the newest prompt.</p>
+          </div>
+        </article>
+
+        <!-- STAGE 11 -->
+        <article class="stage reveal" id="stage-11" aria-labelledby="stage-11-h">
+          <span class="stage__dot" aria-hidden="true"></span>
+          <div class="stage__card">
+            <div class="stage__meta">
+              <span class="stage__chip">Stage 11</span>
+              <span class="stage__tag">part 2 &middot; sanitization</span>
+            </div>
+            <h2 id="stage-11-h">Sanitization: Every Parameter Is a Trade-Off</h2>
+            <p>Part 2 turns text scrubbing into a studied discipline. PII shredders were added &mdash; <code>no_emails=True</code>, <code>no_phone_numbers=True</code> &mdash; so doxxing data never poisons the training set. But NOT <code>no_numbers</code>: in regional-xenophobia detection, numbers carry meaning (&ldquo;Tier 2&rdquo;, &ldquo;2002&rdquo;).</p>
+            <ul class="stack">
+              <li><b><code>no_html=True</code> &mdash; high risk:</b> clever slang like &ldquo;absolute <code>&lt;idiot&gt;</code>&rdquo; looks like markup and gets deleted.</li>
+              <li><b><code>no_urls=True</code> &mdash; medium risk:</b> sometimes the URL IS the context (a link to an offensive meme).</li>
+              <li><b><code>to_ascii=False</code> &mdash; critical for Hinglish:</b> forcing ASCII would destroy Devanagari.</li>
+              <li><b><code>lower=False</code>:</b> keeps the ALL-CAPS shouting signal intact.</li>
+            </ul>
+            <div class="code" role="region" aria-label="Sanitize parameters snippet">
+              <div class="code__bar"><i></i><i></i><i></i><span>sanitize.py</span></div>
+<pre><code>text = html.unescape(text)
+text = strip_markdown_links(text)      <span class="c"># drop [...](url) text</span>
+text = scrub_u_handles(text)           <span class="c"># /u/... gone</span>
+text = clean(text, no_html=<span class="k">True</span>, no_urls=<span class="k">True</span>,
+             to_ascii=<span class="k">False</span>, lower=<span class="k">False</span>)
+key = dedup_key(text)   <span class="c"># lower + strip punctuation &rarr; core</span></code></pre>
+            </div>
+            <p>The <code>dedup_key</code> trick became a token saver: normalize the string to its core before comparing, and near-duplicate spam collapses to a single paid label.</p>
+          </div>
+        </article>
+
+        <!-- STAGE 12 -->
+        <article class="stage reveal" id="stage-12" aria-labelledby="stage-12-h">
+          <span class="stage__dot" aria-hidden="true"></span>
+          <div class="stage__card">
+            <div class="stage__meta">
+              <span class="stage__chip">Stage 12</span>
+              <span class="stage__tag">part 2 &middot; validation</span>
+            </div>
+            <h2 id="stage-12-h">Validation Guardrails &mdash; Before It All Hangs Together</h2>
+            <p>Before declaring the dataset done, part 2 adds lean, explicit guardrails at every step of the pipeline:</p>
+            <ol>
+              <li><b>Extraction</b> &mdash; validate source completeness: row counts per shard and per year, explicit coverage check.</li>
+              <li><b>Labeling</b> &mdash; take a 10% sample and manually spot-check the LLM&rsquo;s output for hallucinated or flipped flags.</li>
+              <li><b>Hunt</b> &mdash; assert the detected deficiencies after each hunt cycle.</li>
+              <li><b>Finalize</b> &mdash; assert minimums (&gt;= 1,000 per minority class) and distribution sanity (&gt; 1% per class, &lt; 30% profanity).</li>
+            </ol>
+            <div class="callout">
+              <span class="callout__t">Keep it lean</span>
+              <p>Full custom validation is overkill at this stage &mdash; the rule is 10% spot-checks and three hard asserts, not a test suite. Don&rsquo;t over-engineer; the model will do the heavy validation later.</p>
+            </div>
+            <p>Along the way, part 2 collected its share of operational scars: GitHub&rsquo;s &ldquo;100 entries per page&rdquo; log pagination looks like a hang but isn&rsquo;t; fresh VMs mean every job needs its own <code>pip install pandas</code>; interleaved logs can lie &mdash; &ldquo;Worker 2018 loaded 9,664 rows from the 2020 CSV&rdquo; is an output artifact; and <code>python: can&rsquo;t open file</code> usually means the script isn&rsquo;t in the runner&rsquo;s working directory.</p>
+          </div>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <section class="sec" id="pipeline" aria-labelledby="pipeline-title">
+    <div class="container">
+      <header class="sec__head">
+        <span class="sec__eyebrow">Final architecture</span>
+        <h2 id="pipeline-title">The Data Pipeline, End to End</h2>
+        <p class="lede">Every stage above collapses into this single flow. Nothing here is synthetic &mdash; raw Reddit comments in, a balanced master dataset out.</p>
+      </header>
+      <div class="flow" role="img" aria-label="Data pipeline: Arctic and Pushshift data to DuckDB extraction to sanitization and dedup to stratified balancing to DeepSeek V4 Flash labeling in 20 comment batches to JSON parse to merge and commit to master dataset">
+        <div class="flow__node reveal">
+          <span class="step-no">01 &middot; source</span>
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <ellipse cx="12" cy="5" rx="8" ry="3"></ellipse>
+            <path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"></path>
+            <path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"></path>
+          </svg>
+          <h3>Arctic / Pushshift data</h3>
+          <p>Raw Reddit comments from the Arctic Shift API and Pushshift archives on Hugging Face.</p>
+        </div>
+        <span class="flow__arrow" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"></path></svg></span>
+        <div class="flow__node reveal">
+          <span class="step-no">02 &middot; extract</span>
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <ellipse cx="12" cy="5" rx="8" ry="3"></ellipse>
+            <path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"></path>
+          </svg>
+          <h3>DuckDB extraction</h3>
+          <p>httpfs reads Parquet shards straight from <code>hf://</code> &mdash; 200 shards in production, 10 for tests.</p>
+        </div>
+        <span class="flow__arrow" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"></path></svg></span>
+        <div class="flow__node reveal">
+          <span class="step-no">03 &middot; clean</span>
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M3 12a9 9 0 1 1 18 0 9 9 0 0 1-18 0z"></path>
+            <path d="M9 12l2 2 4-4"></path>
+          </svg>
+          <h3>Sanitization &amp; dedup</h3>
+          <p>HTML/markdown stripped, <code>/u/</code> handles scrubbed, normalized-core dedup, ledger checkpoint.</p>
+        </div>
+        <span class="flow__arrow" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"></path></svg></span>
+        <div class="flow__node reveal">
+          <span class="step-no">04 &middot; balance</span>
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 3v18"></path>
+            <path d="M8 7h8"></path>
+            <path d="M5 7l-2.5 6a3 3 0 0 0 5 0L5 7z"></path>
+            <path d="M19 7l-2.5 6a3 3 0 0 0 5 0L19 7z"></path>
+          </svg>
+          <h3>Stratified balancing</h3>
+          <p>subreddit &times; month buckets, dynamic run-ID seed, explicit backfill for shortfall categories.</p>
+        </div>
+        <span class="flow__arrow" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"></path></svg></span>
+        <div class="flow__node reveal">
+          <span class="step-no">05 &middot; label</span>
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 8.4 8.4 0 0 1-3.2-.6L3 21l1.7-5.8A8.4 8.4 0 0 1 12 3.1a8.4 8.4 0 0 1 9 8.4z"></path>
+          </svg>
+          <h3>DeepSeek V4 Flash labeling</h3>
+          <p>20-comment batches, thinking off, temperature 0.1, 4 retries with backoff, short-key JSON.</p>
+        </div>
+        <span class="flow__arrow" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"></path></svg></span>
+        <div class="flow__node reveal">
+          <span class="step-no">06 &middot; validate</span>
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M8 3h8l2 3h3v15H3V6h3z"></path>
+            <path d="M8 12h8M8 16h5"></path>
+          </svg>
+          <h3>JSON parse</h3>
+          <p><code>{"results":[...]}</code> responses parsed, validated, keys expanded back to full column names.</p>
+        </div>
+        <span class="flow__arrow" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"></path></svg></span>
+        <div class="flow__node reveal">
+          <span class="step-no">07 &middot; commit</span>
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="6" cy="5" r="2"></circle>
+            <circle cx="18" cy="5" r="2"></circle>
+            <circle cx="18" cy="19" r="2"></circle>
+            <path d="M6 7v4a4 4 0 0 0 4 4h6"></path>
+          </svg>
+          <h3>Merge &amp; commit</h3>
+          <p>Job 2 merges year chunks into the master file, prints the distribution report, auto-commits.</p>
+        </div>
+        <span class="flow__arrow" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"></path></svg></span>
+        <div class="flow__node reveal">
+          <span class="step-no">08 &middot; ship</span>
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M4 6h16M4 12h16M4 18h10"></path>
+            <path d="M17 16v2M17 16l-3 3"></path>
+          </svg>
+          <h3>Master dataset</h3>
+          <p><code>master_baseline_tier1.csv</code> &mdash; the growing, 50k-row training target, ready for MuRIL v3.</p>
+        </div>
+      </div>
+      <p class="flow__note">Job 3 (<code>step3_harvester.py</code>) feeds shortfalls back to step 05 &mdash; the loop closes: harvest, label, merge, repeat.</p>
+    </div>
+  </section>
+
+  <section class="sec" id="numbers" aria-labelledby="numbers-title">
+    <div class="container">
+      <header class="sec__head">
+        <span class="sec__eyebrow">Key numbers</span>
+        <h2 id="numbers-title">The Scorecard</h2>
+        <p class="lede">Fourteen numbers that tell the whole story &mdash; from baseline to pipeline to target.</p>
+      </header>
+      <div class="grid">
+        <div class="num reveal"><span class="num__v">0.8398</span><span class="num__l">MuRIL v3 baseline Macro F1 &mdash; the benchmark every decision chased.</span></div>
+        <div class="num reveal"><span class="num__v">v6.5</span><span class="num__l">Labeling prompt, the &ldquo;Goldilocks&rdquo; decoupled 3-flag design (<code>pv/tah/dhs</code>).</span></div>
+        <div class="num reveal"><span class="num__v">~400</span><span class="num__l">Tokens saved per batch by switching to ultra-short JSON keys.</span></div>
+        <div class="num reveal"><span class="num__v">20</span><span class="num__l">Comments per API batch &mdash; the sweet spot for throughput and parse reliability.</span></div>
+        <div class="num reveal"><span class="num__v">4</span><span class="num__l">Parallel year-workers (2017&ndash;2020) in the GitHub Actions matrix, <code>fail-fast: false</code>.</span></div>
+        <div class="num reveal"><span class="num__v">6GB</span><span class="num__l">DuckDB memory cap (<code>PRAGMA memory_limit</code>) for the extract step.</span></div>
+        <div class="num reveal"><span class="num__v">200 / 10</span><span class="num__l">Parquet shards scanned in production vs. test runs &mdash; dynamic shard scaling.</span></div>
+        <div class="num reveal"><span class="num__v">210 &middot; 24.3%</span><span class="num__l">First baseline run &mdash; rows labeled and overall toxicity rate.</span></div>
+        <div class="num reveal"><span class="num__v">86%</span><span class="num__l">Prompt-cache hit rate &mdash; the static system prompt served from cache.</span></div>
+        <div class="num reveal"><span class="num__v">50k</span><span class="num__l">Row target for the master training dataset, grown entirely from real Reddit data.</span></div>
+        <div class="num reveal"><span class="num__v">min(&times;2, 8k)</span><span class="num__l">HUNTER_LIMIT cap &mdash; harvest up to double the shortfall, never more than 8,000 rows per hunt.</span></div>
+        <div class="num reveal"><span class="num__v">1,000</span><span class="num__l">Minimum target rows per minority class (caste, misogyny, regional, communal).</span></div>
+        <div class="num reveal"><span class="num__v">10%</span><span class="num__l">LLM-label spot-check sample &mdash; manual review gate before the dataset ships.</span></div>
+        <div class="num reveal"><span class="num__v">&lt;30%</span><span class="num__l">Profanity-sanity cap per class in the final distribution report.</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="sec" id="lessons" aria-labelledby="lessons-title">
+    <div class="container">
+      <header class="sec__head">
+        <span class="sec__eyebrow">What it taught us</span>
+        <h2 id="lessons-title">Lessons Learned</h2>
+        <p class="lede">The transcript is full of hard-won wisdom. Ten lessons distilled for the next project.</p>
+      </header>
+      <ol class="lessons">
+        <li class="reveal"><span class="l-tag">Reproducibility</span><b>Fixed seeds are a silent trap.</b> Derive the seed from the run ID (<code>GITHUB_RUN_ID % 100000</code>) and checkpoint everything &mdash; the ledger file <em>will</em> save you.</li>
+        <li class="reveal"><span class="l-tag">Performance</span><b>&ldquo;Big data&rdquo; is a networking problem before it is a compute problem.</b> Most of a 5&ndash;7 minute DuckDB extract was waiting on Parquet footers; parallel threads plus fewer shards for tests fixed it.</li>
+        <li class="reveal"><span class="l-tag">Prompt design</span><b>Design the prompt for the failure mode.</b> Short keys free tokens for reasoning, and &ldquo;when in doubt, output 0&rdquo; keeps precision honest.</li>
+        <li class="reveal"><span class="l-tag">CI/CD</span><b>A CI pipeline is also a debugging surface.</b> Log buffering, fresh VMs, and API drift will bite you &mdash; make every job self-contained and logs live (<code>PYTHONUNBUFFERED=1</code>).</li>
+        <li class="reveal"><span class="l-tag">Sampling</span><b>For rare classes, random sampling is economically insane.</b> Use statistical differential analysis (TF-IDF) and LLM-generated targeted queries to harvest real data.</li>
+        <li class="reveal"><span class="l-tag">Data ethics</span><b>Never generate synthetic data to fix class imbalance</b> when real data exists and can be found with better search.</li>
+        <li class="reveal"><span class="l-tag">Judgement</span><b>Refactoring a working, battle-tested script for the sake of &ldquo;modern libraries&rdquo; is a risk, not an improvement.</b> If it isn&rsquo;t broken, don&rsquo;t fix it.</li>
+        <li class="reveal"><span class="l-tag">Validation</span><b>Assert before you train.</b> Minimums per class, &gt;1% per class, &lt;30% profanity, and a 10% human spot-check &mdash; lean guardrails beat a test suite.</li>
+        <li class="reveal"><span class="l-tag">Prompt precision</span><b>Codify the decision procedure.</b> &ldquo;Public figure, professional capacity&rdquo; and &ldquo;political term &ne; identity dimension&rdquo; are the rules that keep labels consistent at 50k rows.</li>
+        <li class="reveal"><span class="l-tag">CI/CD</span><b>Logs are evidence, not truth.</b> &ldquo;100 entries per page&rdquo; isn&rsquo;t a hang, every job is a fresh VM, and interleaved output can misattribute rows to years.</li>
+      </ol>
+    </div>
+  </section>
+
+</main>
+
+<footer class="footer">
+  <div class="container footer__inner">
+    <div>
+      <span class="f-brand">hinglish-classifier / journey</span>
+      <p>This page is a documentation and educational showcase reconstructed from a two-part AI-conversation transcript (487 + 359 pages) of building a Hinglish hate-speech classifier. It is not affiliated with, endorsed by, or a product of any of the tools, models, or platforms mentioned (MuRIL, DeepSeek, Gemini, DuckDB, GitHub Actions, Hugging Face, Arctic, Pushshift, Reddit). All metrics shown are as recorded during the build.</p>
+    </div>
+    <a class="top" href="#top">&uarr; Back to top</a>
+  </div>
+</footer>
+
+<script>
+(function () {
+  "use strict";
+  document.body.classList.add("js");
+
+  /* active nav link + reveal-on-scroll via IntersectionObserver */
+  var navLinks = Array.prototype.slice.call(
+    document.querySelectorAll("#nav-links a[href^='#']")
+  );
+  var targets = navLinks.map(function (a) {
+    return document.querySelector(a.getAttribute("href"));
+  }).filter(Boolean);
+
+  var revealEls = Array.prototype.slice.call(
+    document.querySelectorAll(".reveal")
+  );
+
+  var io = new IntersectionObserver(function (entries) {
+    entries.forEach(function (entry) {
+      if (entry.isIntersecting) {
+        entry.target.classList.add("in");
+        if (targets.indexOf(entry.target) !== -1) {
+          navLinks.forEach(function (a) {
+            var linkOn = a.getAttribute("href") === "#" + entry.target.id;
+            a.classList.toggle("is-active", linkOn);
+            if (linkOn) { a.setAttribute("aria-current", "true"); }
+            else { a.removeAttribute("aria-current"); }
+          });
+        }
+      }
+    });
+  }, { rootMargin: "-30% 0px -55% 0px", threshold: 0 });
+
+  targets.forEach(function (t) { io.observe(t); });
+  revealEls.forEach(function (el) { io.observe(el); });
+
+  /* scroll progress bar */
+  var bar = document.getElementById("progress");
+  var ticking = false;
+  function paint() {
+    var doc = document.documentElement;
+    var max = doc.scrollHeight - window.innerHeight;
+    bar.style.transform = "scaleX(" + (max > 0 ? window.scrollY / max : 0) + ")";
+    ticking = false;
+  }
+  window.addEventListener("scroll", function () {
+    if (!ticking) { window.requestAnimationFrame(paint); ticking = true; }
+  }, { passive: true });
+  paint();
+})();
+</script>
+</body>
+</html>
