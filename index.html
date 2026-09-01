@@ -697,6 +697,10 @@
       <li><a href="#stage-10">10 Prompt</a></li>
       <li><a href="#stage-11">11 Sanitizer</a></li>
       <li><a href="#stage-12">12 Guardrails</a></li>
+      <li><a href="#stage-13">13 Self-Tuning</a></li>
+      <li><a href="#stage-14">14 Migration</a></li>
+      <li><a href="#stage-15">15 Training</a></li>
+      <li><a href="#stage-16">16 mmBERT</a></li>
       <li><a href="#pipeline">Pipeline</a></li>
       <li><a href="#numbers">Numbers</a></li>
       <li><a href="#lessons">Lessons</a></li>
@@ -706,10 +710,10 @@
 
 <header class="hero" id="top">
   <div class="container">
-    <span class="hero__eyebrow">Case study &middot; data engineering &middot; prompt engineering</span>
+    <span class="hero__eyebrow">Case study &middot; data engineering &middot; prompt engineering &middot; model training</span>
     <h1>Building a <span class="grad">Hinglish Hate-Speech</span> Classifier</h1>
-    <p class="hero__sub">A data-engineering and prompt-engineering journey &mdash; from a MuRIL baseline to a 50k-row, CI/CD-driven training dataset built entirely from real Reddit data.</p>
-    <p class="hero__note">Everything on this page is reconstructed from a <b>two-part AI-conversation transcript &mdash; 487 pages (part 1) plus a 359-page continuation (part 2)</b> of the actual build &mdash; the decisions, the dead ends, the debug sessions, and the wins. It is a documentation and educational showcase, not a product.</p>
+    <p class="hero__sub">A data-engineering, prompt-engineering, and model-training journey &mdash; from a MuRIL baseline benchmark, through a 196k-row real-Reddit training set, to a fine-tuned hing-roberta classifier, with an mmBERT upgrade already on the roadmap.</p>
+    <p class="hero__note">Everything on this page is reconstructed from a <b>three-part AI-conversation transcript &mdash; 487 pages (part 1), a 359-page continuation (part 2), and a 552-page part 3</b> of the actual build &mdash; the decisions, the dead ends, the debug sessions, and the wins. It is a documentation and educational showcase, not a product.</p>
     <div class="hero__stats">
       <div class="stat reveal">
         <span class="stat__num">0.8398</span>
@@ -731,6 +735,18 @@
         <span class="stat__num">86%</span>
         <span class="stat__lbl">Prompt-cache hit rate observed on the first full job run.</span>
       </div>
+      <div class="stat reveal">
+        <span class="stat__num">196,700</span>
+        <span class="stat__lbl">Unique rows in the master dataset after the dedup sweep.</span>
+      </div>
+      <div class="stat reveal">
+        <span class="stat__num">hing-roberta</span>
+        <span class="stat__lbl">The model actually fine-tuned (l3cube-pune) &mdash; XLM-RoBERTa DAPT&rsquo;d on HingCorpus.</span>
+      </div>
+      <div class="stat reveal">
+        <span class="stat__num">mmBERT</span>
+        <span class="stat__lbl">Next-gen multilingual roadmap (jhu-clsp/mmBERT-base) &mdash; 256k vocab, 1,800+ languages.</span>
+      </div>
     </div>
   </div>
 </header>
@@ -741,8 +757,8 @@
     <div class="container">
       <header class="sec__head">
         <span class="sec__eyebrow">The story</span>
-        <h2 id="timeline-title">Twelve stages, one pipeline</h2>
-        <p class="lede">The project is told here as a vertical timeline covering both parts of the build transcript &mdash; part 1 (stages 1&ndash;8) and part 2 (stages 9&ndash;12), which closes the loop with an autonomous, self-healing pipeline. Each stage is a real chapter from the build &mdash; what we tried, why it failed or worked, and what it forced us to build next.</p>
+        <h2 id="timeline-title">Sixteen stages, one pipeline</h2>
+        <p class="lede">The project is told here as a vertical timeline covering all three parts of the build transcript &mdash; part 1 (stages 1&ndash;8), part 2 (stages 9&ndash;12), and part 3 (stages 13&ndash;16), which takes the pipeline into storage migration, model training, and the mmBERT roadmap. Each stage is a real chapter from the build &mdash; what we tried, why it failed or worked, and what it forced us to build next.</p>
       </header>
 
       <div class="timeline">
@@ -1151,6 +1167,97 @@ key = dedup_key(text)   <span class="c"># lower + strip punctuation &rarr; core<
             <p>Along the way, part 2 collected its share of operational scars: GitHub&rsquo;s &ldquo;100 entries per page&rdquo; log pagination looks like a hang but isn&rsquo;t; fresh VMs mean every job needs its own <code>pip install pandas</code>; interleaved logs can lie &mdash; &ldquo;Worker 2018 loaded 9,664 rows from the 2020 CSV&rdquo; is an output artifact; and <code>python: can&rsquo;t open file</code> usually means the script isn&rsquo;t in the runner&rsquo;s working directory.</p>
           </div>
         </article>
+
+        <!-- STAGE 13 -->
+        <article class="stage reveal" id="stage-13" aria-labelledby="stage-13-h">
+          <span class="stage__dot" aria-hidden="true"></span>
+          <div class="stage__card">
+            <div class="stage__meta">
+              <span class="stage__chip">Stage 13</span>
+              <span class="stage__tag">part 3 &middot; self-tuning</span>
+            </div>
+            <h2 id="stage-13-h">The Harvester Goes Tiered and Self-Tuning</h2>
+            <p>Part 3 opens by making the pipeline self-aware. Hardcoded targets are gone &mdash; <code>step2</code> now writes a <code>pipeline_targets.json</code> blueprint that both the harvester and the merger read, so every run hunts against the real, current deficit.</p>
+            <ul class="stack">
+              <li><b>Stateful memory:</b> keywords accumulate in <code>prompt/master_lexicon.json</code> &mdash; the harvester gets &ldquo;smarter&rdquo; with every run. Clearing it is a valid reset, but leave <code>{}</code>, never a blank file (JSON parse errors).</li>
+              <li><b>Corpus-specific thresholding:</b> a dynamic thresholding engine purges any word appearing in more than 15% of the corpus before the TF-IDF math &mdash; the fix for the harvester &ldquo;hemorrhaging tokens on useless English.&rdquo;</li>
+              <li><b>Tiered search:</b> Tier 1 = legacy echo chambers (small weight), Tier 2 = exhaustive Indian subreddits, Tier 3 = live data (the Arctic API, later a private <code>reddit_indian_subs</code> dataset with 160+ subs across 2022&ndash;2026). Diversity caps stop Tier 1 from vacuuming the whole quota.</li>
+              <li><b>Concurrency locks:</b> editing <code>master_lexicon.json</code> on GitHub while the bot auto-commits is a guaranteed race condition &mdash; write-collision guards added.</li>
+            </ul>
+            <div class="callout">
+              <span class="callout__t">The 15% ceiling</span>
+              <p>&ldquo;Just drop words that appear too often&rdquo; is the simple-sounding idea that fixed token waste: a max-15% document-frequency purge before keyword math. The pipeline learned to stop paying for obvious English.</p>
+            </div>
+          </div>
+        </article>
+
+        <!-- STAGE 14 -->
+        <article class="stage reveal" id="stage-14" aria-labelledby="stage-14-h">
+          <span class="stage__dot" aria-hidden="true"></span>
+          <div class="stage__card">
+            <div class="stage__meta">
+              <span class="stage__chip">Stage 14</span>
+              <span class="stage__tag">part 3 &middot; storage migration</span>
+            </div>
+            <h2 id="stage-14-h">From GitHub to Hugging Face &mdash; and a Cartesian Bug</h2>
+            <p>The GitHub repo had quietly become a database. Part 3 migrates all data storage to the Hugging Face dataset <code>darelphilip/hinglish-toxicity</code> &mdash; ChatML rows, parquet shards, a clean student-vs-teacher prompt split &mdash; leaving GitHub to host code and orchestration only.</p>
+            <ul class="stack">
+              <li><b>One-off migration script</b> with a 10% progress bar, HF rate-limit awareness, and resume-on-failure.</li>
+              <li><b>The Cartesian product bug:</b> duplicate rows traced to a cross-join in a harvester path &mdash; the same reddit id + text repeated across 7+ rows. A one-off Colab cleanup collapses the dataset to <b>196,700 unique rows</b>.</li>
+              <li><b>The HF caching gotcha:</b> freshly uploaded 2026 shards stayed invisible in stats runs &mdash; the datasets library served a cached snapshot. Fix: a raw <code>data/**/*.parquet</code> file-tree scan fallback in the auditor.</li>
+            </ul>
+            <div class="callout callout--bad">
+              <span class="callout__t">GitHub is not a database</span>
+              <p>Storing data in a git repo worked until the dataset outgrew it. The move to Hugging Face Datasets is what made a 200k-row training run realistic.</p>
+            </div>
+          </div>
+        </article>
+
+        <!-- STAGE 15 -->
+        <article class="stage reveal" id="stage-15" aria-labelledby="stage-15-h">
+          <span class="stage__dot" aria-hidden="true"></span>
+          <div class="stage__card">
+            <div class="stage__meta">
+              <span class="stage__chip">Stage 15</span>
+              <span class="stage__tag">part 3 &middot; training</span>
+            </div>
+            <h2 id="stage-15-h">Model Selection: MuRIL Was the Benchmark, RoBERTa Got the Job</h2>
+            <p>Here is the honest arc: <strong>MuRIL v3 (0.8398)</strong> was the starting point and the benchmark every decision chased &mdash; but when it came time to actually train, the candidate showdown rejected MuRIL. The verdict: <em>&ldquo;Google MuRIL &mdash; downgrade.&rdquo;</em> Standard BERT architecture, trained on formal Hindi, never optimized for chaotic, slang-heavy internet Hinglish.</p>
+            <p>The model actually fine-tuned was <strong><code>l3cube-pune/hing-roberta</code></strong> &mdash; an XLM-RoBERTa backbone further pre-trained (DAPT) on the <strong>L3Cube-HingCorpus</strong>: 52.9M sentences and 1.04B tokens of real Romanized Hinglish from Twitter. With 95%+ of Indian Reddit written in Romanized Hinglish, it is the &ldquo;perfect weapon&rdquo; for the job.</p>
+            <ul class="stack">
+              <li><b>Training environment:</b> Google Colab on a T4 &mdash; GitHub Actions runners (2 vCPU / 7 GB RAM) are useless for GPU backprop.</li>
+              <li><b>Recipe:</b> ~110k rows, 90/10 split, seed 42, 3 epochs, BCE loss + class weights for imbalance, macro-F1 evaluation; 278M parameters; ~1h05m at ~77 examples/s.</li>
+              <li><b>Ship:</b> pushed to <code>darelphilip/hinglish-toxicity-classifier</code>, deployed as a free Gradio Space (<code>darelphilip/hinglish_toxicity</code>), with a model card and launch posts.</li>
+              <li><b>Reality check:</b> deployed macro-F1 lands around <strong>0.55</strong> &mdash; expected for imbalanced multi-label. All-zero outputs on &ldquo;<code>Tu pyaar hai mere chamar I love you</code>&rdquo; and &ldquo;<code>Mulle bahut hi mast log hote hain&hellip;</code>&rdquo; expose the two killers: sentiment-slur conflicts and sarcastic/masked hate. More data won&rsquo;t fix an encoder ceiling.</li>
+            </ul>
+            <blockquote>
+              MuRIL measured the problem at 0.8398. RoBERTa was what actually learned to solve it.
+            </blockquote>
+          </div>
+        </article>
+
+        <!-- STAGE 16 -->
+        <article class="stage reveal" id="stage-16" aria-labelledby="stage-16-h">
+          <span class="stage__dot" aria-hidden="true"></span>
+          <div class="stage__card">
+            <div class="stage__meta">
+              <span class="stage__chip">Stage 16</span>
+              <span class="stage__tag">part 3 &middot; roadmap</span>
+            </div>
+            <h2 id="stage-16-h">The Roadmap: mmBERT-base</h2>
+            <p>Part 3 ends with the next chapter planned: fine-tuning <strong><code>jhu-clsp/mmBERT-base</code></strong>. It is ModernBERT on a Gemma-2 tokenizer with a 256k vocabulary, trained on 3T+ tokens across 1,800+ languages, with Flash Attention 2 and unpadding &mdash; 2&ndash;4x faster inference and 25&ndash;40% faster training than RoBERTa-class models.</p>
+            <ul class="stack">
+              <li><b>Expected cost:</b> ~35&ndash;45 minutes for a 3-epoch run on the ~226k deduplicated rows, free Colab T4.</li>
+              <li><b>Still the 2026 pick:</b> recent encoder releases optimize for retrieval (bi-encoders), not discriminative sequence classification &mdash; mmBERT-base wins for this task.</li>
+              <li><b>Discipline:</b> vocabulary trimming and 4-bit quantization are real-time-API optimizations &mdash; both explicitly deferred for the MVP (4-bit measurably hurts quality; trimming is &ldquo;textbook premature optimization&rdquo; right now).</li>
+              <li><b>Ready to go:</b> the trial Colab script targets <code>darelphilip/mmbert-hinglish-mvp</code>.</li>
+            </ul>
+            <div class="callout">
+              <span class="callout__t">The loop keeps closing</span>
+              <p>Data pipeline &rarr; storage &rarr; training &rarr; serving &rarr; evaluation &rarr; next model. The project stopped being a dataset project the day the first classifier shipped.</p>
+            </div>
+          </div>
+        </article>
       </div>
     </div>
   </section>
@@ -1256,7 +1363,7 @@ key = dedup_key(text)   <span class="c"># lower + strip punctuation &rarr; core<
       <header class="sec__head">
         <span class="sec__eyebrow">Key numbers</span>
         <h2 id="numbers-title">The Scorecard</h2>
-        <p class="lede">Fourteen numbers that tell the whole story &mdash; from baseline to pipeline to target.</p>
+        <p class="lede">Twenty numbers that tell the whole story &mdash; from baseline to pipeline to target.</p>
       </header>
       <div class="grid">
         <div class="num reveal"><span class="num__v">0.8398</span><span class="num__l">MuRIL v3 baseline Macro F1 &mdash; the benchmark every decision chased.</span></div>
@@ -1273,6 +1380,12 @@ key = dedup_key(text)   <span class="c"># lower + strip punctuation &rarr; core<
         <div class="num reveal"><span class="num__v">1,000</span><span class="num__l">Minimum target rows per minority class (caste, misogyny, regional, communal).</span></div>
         <div class="num reveal"><span class="num__v">10%</span><span class="num__l">LLM-label spot-check sample &mdash; manual review gate before the dataset ships.</span></div>
         <div class="num reveal"><span class="num__v">&lt;30%</span><span class="num__l">Profanity-sanity cap per class in the final distribution report.</span></div>
+        <div class="num reveal"><span class="num__v">196,700</span><span class="num__l">Unique rows after the Cartesian-join dedup &mdash; the real size of the master dataset.</span></div>
+        <div class="num reveal"><span class="num__v">0.55</span><span class="num__l">Deployed classifier Macro F1 &mdash; normal for imbalanced multi-label; the edge cases are documented.</span></div>
+        <div class="num reveal"><span class="num__v">278M</span><span class="num__l">Parameters of the trained XLMRobertaForSequenceClassification.</span></div>
+        <div class="num reveal"><span class="num__v">~110k</span><span class="num__l">Rows used to fine-tune hing-roberta &mdash; 90/10 split, 3 epochs, seed 42.</span></div>
+        <div class="num reveal"><span class="num__v">~1h05m</span><span class="num__l">Fine-tune time on a free Colab T4 at ~77 examples/s.</span></div>
+        <div class="num reveal"><span class="num__v">256k</span><span class="num__l">mmBERT-base vocabulary (Gemma-2 tokenizer), trained on 3T+ tokens over 1,800+ languages.</span></div>
       </div>
     </div>
   </section>
@@ -1282,7 +1395,7 @@ key = dedup_key(text)   <span class="c"># lower + strip punctuation &rarr; core<
       <header class="sec__head">
         <span class="sec__eyebrow">What it taught us</span>
         <h2 id="lessons-title">Lessons Learned</h2>
-        <p class="lede">The transcript is full of hard-won wisdom. Ten lessons distilled for the next project.</p>
+        <p class="lede">The transcript is full of hard-won wisdom. Fourteen lessons distilled for the next project.</p>
       </header>
       <ol class="lessons">
         <li class="reveal"><span class="l-tag">Reproducibility</span><b>Fixed seeds are a silent trap.</b> Derive the seed from the run ID (<code>GITHUB_RUN_ID % 100000</code>) and checkpoint everything &mdash; the ledger file <em>will</em> save you.</li>
@@ -1295,6 +1408,10 @@ key = dedup_key(text)   <span class="c"># lower + strip punctuation &rarr; core<
         <li class="reveal"><span class="l-tag">Validation</span><b>Assert before you train.</b> Minimums per class, &gt;1% per class, &lt;30% profanity, and a 10% human spot-check &mdash; lean guardrails beat a test suite.</li>
         <li class="reveal"><span class="l-tag">Prompt precision</span><b>Codify the decision procedure.</b> &ldquo;Public figure, professional capacity&rdquo; and &ldquo;political term &ne; identity dimension&rdquo; are the rules that keep labels consistent at 50k rows.</li>
         <li class="reveal"><span class="l-tag">CI/CD</span><b>Logs are evidence, not truth.</b> &ldquo;100 entries per page&rdquo; isn&rsquo;t a hang, every job is a fresh VM, and interleaved output can misattribute rows to years.</li>
+        <li class="reveal"><span class="l-tag">Models</span><b>Benchmark &ne; deployed model.</b> MuRIL&rsquo;s 0.8398 was the starting point and measuring stick; what actually shipped was l3cube-pune/hing-roberta, an XLM-RoBERTa DAPT&rsquo;d on Romanized Hinglish.</li>
+        <li class="reveal"><span class="l-tag">Models</span><b>Domain-adaptive pretraining beats newer architecture.</b> MuRIL lost because it wasn&rsquo;t optimized for internet Hinglish; the HingCorpus-DAPT&rsquo;d RoBERTa won despite an older backbone.</li>
+        <li class="reveal"><span class="l-tag">Models</span><b>The encoder ceiling is real.</b> Sarcastic/masked hate and sentiment-slur conflicts defeat encoders no matter how much data you add &mdash; the mmBERT roadmap is the answer, not more rows.</li>
+        <li class="reveal"><span class="l-tag">Storage</span><b>GitHub is not a database.</b> Move to HF Datasets when the corpus outgrows git, dedupe properly (watch for Cartesian-join bugs), and remember client-side caching hides your freshest shards.</li>
       </ol>
     </div>
   </section>
@@ -1305,7 +1422,7 @@ key = dedup_key(text)   <span class="c"># lower + strip punctuation &rarr; core<
   <div class="container footer__inner">
     <div>
       <span class="f-brand">hinglish-classifier / journey</span>
-      <p>This page is a documentation and educational showcase reconstructed from a two-part AI-conversation transcript (487 + 359 pages) of building a Hinglish hate-speech classifier. It is not affiliated with, endorsed by, or a product of any of the tools, models, or platforms mentioned (MuRIL, DeepSeek, Gemini, DuckDB, GitHub Actions, Hugging Face, Arctic, Pushshift, Reddit). All metrics shown are as recorded during the build.</p>
+      <p>This page is a documentation and educational showcase reconstructed from a three-part AI-conversation transcript (487 + 359 + 552 pages) of building a Hinglish hate-speech classifier. It is not affiliated with, endorsed by, or a product of any of the tools, models, or platforms mentioned (MuRIL, DeepSeek, Gemini, DuckDB, GitHub Actions, Hugging Face, Arctic, Pushshift, Reddit). All metrics shown are as recorded during the build.</p>
     </div>
     <a class="top" href="#top">&uarr; Back to top</a>
   </div>
