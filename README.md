@@ -1,8 +1,8 @@
 # Building a Hinglish Hate-Speech Classifier — A Journey
 
-*A data-engineering and prompt-engineering case study — from a MuRIL baseline to a 50k-row, CI/CD-driven training dataset built entirely from real Reddit data.*
+*A data-engineering, prompt-engineering, and model-training case study — from a MuRIL baseline benchmark, through a 196k-row real-Reddit training set, to a fine-tuned hing-roberta classifier, with an mmBERT upgrade already on the roadmap.*
 
-> Everything in this document is reconstructed from a **two-part AI-conversation transcript — 487 pages (part 1) plus a 359-page continuation (part 2)** — of the actual build: the decisions, the dead ends, the debug sessions, and the wins. It is a documentation and educational showcase, **not a product**, and all metrics shown are as recorded during the build.
+> Everything in this document is reconstructed from a **three-part AI-conversation transcript — 487 pages (part 1), a 359-page continuation (part 2), and a 552-page part 3** — of the actual build: the decisions, the dead ends, the debug sessions, and the wins. It is a documentation and educational showcase, **not a product**, and all metrics shown are as recorded during the build.
 
 ---
 
@@ -24,6 +24,12 @@
 | Minimum rows per minority class | **1,000** (caste, misogyny, regional, communal) |
 | LLM-label spot-check sample | **10%** — manual review gate before shipping |
 | Profanity sanity cap | **<30%** per class in the final distribution report |
+| Unique rows after dedup | **196,700** — real size of the master dataset after the Cartesian-join fix |
+| Deployed classifier Macro F1 | **0.55** — normal for imbalanced multi-label; edge cases documented |
+| Model parameters | **278M** (`XLMRobertaForSequenceClassification`) |
+| Fine-tuning set | **~110k rows** — 90/10 split, 3 epochs, seed 42 |
+| Fine-tune time | **~1h05m** on a free Colab T4 at ~77 examples/s |
+| mmBERT-base vocabulary | **256k** (Gemma-2 tokenizer), trained on 3T+ tokens over 1,800+ languages |
 
 ---
 
@@ -41,10 +47,14 @@
 10. [The v6.5 Decision Procedure, Sharper](#10--the-v65-decision-procedure-sharper)
 11. [Sanitization: Every Parameter Is a Trade-Off](#11--sanitization-every-parameter-is-a-trade-off)
 12. [Validation Guardrails](#12--validation-guardrails--before-it-all-hangs-together)
-13. [The Data Pipeline, End to End](#the-data-pipeline-end-to-end)
-14. [Lessons Learned](#lessons-learned)
+13. [The Harvester Goes Tiered and Self-Tuning](#13--the-harvester-goes-tiered-and-self-tuning)
+14. [From GitHub to Hugging Face — and a Cartesian Bug](#14--from-github-to-hugging-face--and-a-cartesian-bug)
+15. [Model Selection: MuRIL Was the Benchmark, RoBERTa Got the Job](#15--model-selection-muril-was-the-benchmark-roberta-got-the-job)
+16. [The Roadmap: mmBERT-base](#16--the-roadmap-mmbert-base)
+17. [The Data Pipeline, End to End](#the-data-pipeline-end-to-end)
+18. [Lessons Learned](#lessons-learned)
 
-The project is told as twelve stages spanning both parts of the build transcript: **part 1 covers stages 1–8**, **part 2 covers stages 9–12**, which close the loop with an autonomous, self-healing pipeline.
+The project is told as sixteen stages spanning all three parts of the build transcript: **part 1 covers stages 1–8**, **part 2 covers stages 9–12** (closing the loop with an autonomous, self-healing pipeline), and **part 3 covers stages 13–16**, which take the pipeline into storage migration, model training, and the mmBERT roadmap.
 
 ---
 
@@ -375,6 +385,67 @@ Along the way, part 2 collected its share of operational scars: GitHub's "100 en
 
 ---
 
+## 13 · The Harvester Goes Tiered and Self-Tuning
+
+*part 3 · self-tuning*
+
+Part 3 opens by making the pipeline self-aware. Hardcoded targets are gone — `step2` now writes a `pipeline_targets.json` blueprint that both the harvester and the merger read, so every run hunts against the real, current deficit.
+
+- **Stateful memory:** keywords accumulate in `prompt/master_lexicon.json` — the harvester gets "smarter" with every run. Clearing it is a valid reset, but leave `{}`, never a blank file (JSON parse errors).
+- **Corpus-specific thresholding:** a dynamic thresholding engine purges any word appearing in more than 15% of the corpus before the TF-IDF math — the fix for the harvester "hemorrhaging tokens on useless English."
+- **Tiered search:** Tier 1 = legacy echo chambers (small weight), Tier 2 = exhaustive Indian subreddits, Tier 3 = live data (the Arctic API, later a private `reddit_indian_subs` dataset with 160+ subs across 2022–2026). Diversity caps stop Tier 1 from vacuuming the whole quota.
+- **Concurrency locks:** editing `master_lexicon.json` on GitHub while the bot auto-commits is a guaranteed race condition — write-collision guards added.
+
+> **The 15% ceiling:** "Just drop words that appear too often" is the simple-sounding idea that fixed token waste: a max-15% document-frequency purge before keyword math. The pipeline learned to stop paying for obvious English.
+
+---
+
+## 14 · From GitHub to Hugging Face — and a Cartesian Bug
+
+*part 3 · storage migration*
+
+The GitHub repo had quietly become a database. Part 3 migrates all data storage to the Hugging Face dataset `darelphilip/hinglish-toxicity` — ChatML rows, parquet shards, a clean student-vs-teacher prompt split — leaving GitHub to host code and orchestration only.
+
+- **One-off migration script** with a 10% progress bar, HF rate-limit awareness, and resume-on-failure.
+- **The Cartesian product bug:** duplicate rows traced to a cross-join in a harvester path — the same reddit id + text repeated across 7+ rows. A one-off Colab cleanup collapses the dataset to **196,700 unique rows**.
+- **The HF caching gotcha:** freshly uploaded 2026 shards stayed invisible in stats runs — the datasets library served a cached snapshot. Fix: a raw `data/**/*.parquet` file-tree scan fallback in the auditor.
+
+> **GitHub is not a database:** Storing data in a git repo worked until the dataset outgrew it. The move to Hugging Face Datasets is what made a 200k-row training run realistic.
+
+---
+
+## 15 · Model Selection: MuRIL Was the Benchmark, RoBERTa Got the Job
+
+*part 3 · training*
+
+Here is the honest arc: **MuRIL v3 (0.8398)** was the starting point and the benchmark every decision chased — but when it came time to actually train, the candidate showdown rejected MuRIL. The verdict: *"Google MuRIL — downgrade."* Standard BERT architecture, trained on formal Hindi, never optimized for chaotic, slang-heavy internet Hinglish.
+
+The model actually fine-tuned was **`l3cube-pune/hing-roberta`** — an XLM-RoBERTa backbone further pre-trained (DAPT) on the **L3Cube-HingCorpus**: 52.9M sentences and 1.04B tokens of real Romanized Hinglish from Twitter. With 95%+ of Indian Reddit written in Romanized Hinglish, it is the "perfect weapon" for the job.
+
+- **Training environment:** Google Colab on a T4 — GitHub Actions runners (2 vCPU / 7 GB RAM) are useless for GPU backprop.
+- **Recipe:** ~110k rows, 90/10 split, seed 42, 3 epochs, BCE loss + class weights for imbalance, macro-F1 evaluation; 278M parameters; ~1h05m at ~77 examples/s.
+- **Ship:** pushed to `darelphilip/hinglish-toxicity-classifier`, deployed as a free Gradio Space (`darelphilip/hinglish_toxicity`), with a model card and launch posts.
+- **Reality check:** deployed macro-F1 lands around **0.55** — expected for imbalanced multi-label. All-zero outputs on "`Tu pyaar hai mere chamar I love you`" and "`Mulle bahut hi mast log hote hain…`" expose the two killers: sentiment-slur conflicts and sarcastic/masked hate. More data won't fix an encoder ceiling.
+
+> MuRIL measured the problem at 0.8398. RoBERTa was what actually learned to solve it.
+
+---
+
+## 16 · The Roadmap: mmBERT-base
+
+*part 3 · roadmap*
+
+Part 3 ends with the next chapter planned: fine-tuning **`jhu-clsp/mmBERT-base`**. It is ModernBERT on a Gemma-2 tokenizer with a 256k vocabulary, trained on 3T+ tokens across 1,800+ languages, with Flash Attention 2 and unpadding — 2–4x faster inference and 25–40% faster training than RoBERTa-class models.
+
+- **Expected cost:** ~35–45 minutes for a 3-epoch run on the ~226k deduplicated rows, free Colab T4.
+- **Still the 2026 pick:** recent encoder releases optimize for retrieval (bi-encoders), not discriminative sequence classification — mmBERT-base wins for this task.
+- **Discipline:** vocabulary trimming and 4-bit quantization are real-time-API optimizations — both explicitly deferred for the MVP (4-bit measurably hurts quality; trimming is "textbook premature optimization" right now).
+- **Ready to go:** the trial Colab script targets `darelphilip/mmbert-hinglish-mvp`.
+
+> **The loop keeps closing:** Data pipeline → storage → training → serving → evaluation → next model. The project stopped being a dataset project the day the first classifier shipped.
+
+---
+
 ## The Data Pipeline, End to End
 
 Every stage above collapses into this single flow. Nothing here is synthetic — raw Reddit comments in, a balanced master dataset out.
@@ -411,7 +482,7 @@ Job 3 (`step3_harvester.py`) feeds shortfalls back to step 05 — the loop close
 
 ## Lessons Learned
 
-Ten lessons distilled for the next project:
+Fourteen lessons distilled for the next project:
 
 1. **[Reproducibility] Fixed seeds are a silent trap.** Derive the seed from the run ID (`GITHUB_RUN_ID % 100000`) and checkpoint everything — the ledger file *will* save you.
 2. **[Performance] "Big data" is a networking problem before it is a compute problem.** Most of a 5–7 minute DuckDB extract was waiting on Parquet footers; parallel threads plus fewer shards for tests fixed it.
@@ -423,9 +494,13 @@ Ten lessons distilled for the next project:
 8. **[Validation] Assert before you train.** Minimums per class, >1% per class, <30% profanity, and a 10% human spot-check — lean guardrails beat a test suite.
 9. **[Prompt precision] Codify the decision procedure.** "Public figure, professional capacity" and "political term ≠ identity dimension" are the rules that keep labels consistent at 50k rows.
 10. **[CI/CD] Logs are evidence, not truth.** "100 entries per page" isn't a hang, every job is a fresh VM, and interleaved output can misattribute rows to years.
+11. **[Models] Benchmark ≠ deployed model.** MuRIL's 0.8398 was the starting point and measuring stick; what actually shipped was `l3cube-pune/hing-roberta`, an XLM-RoBERTa DAPT'd on Romanized Hinglish.
+12. **[Models] Domain-adaptive pretraining beats newer architecture.** MuRIL lost because it wasn't optimized for internet Hinglish; the HingCorpus-DAPT'd RoBERTa won despite an older backbone.
+13. **[Models] The encoder ceiling is real.** Sarcastic/masked hate and sentiment-slur conflicts defeat encoders no matter how much data you add — the mmBERT roadmap is the answer, not more rows.
+14. **[Storage] GitHub is not a database.** Move to HF Datasets when the corpus outgrows git, dedupe properly (watch for Cartesian-join bugs), and remember client-side caching hides your freshest shards.
 
 ---
 
 ## Disclaimer
 
-This document is a documentation and educational showcase reconstructed from a two-part AI-conversation transcript (487 + 359 pages) of building a Hinglish hate-speech classifier. It is not affiliated with, endorsed by, or a product of any of the tools, models, or platforms mentioned (MuRIL, DeepSeek, Gemini, DuckDB, GitHub Actions, Hugging Face, Arctic, Pushshift, Reddit). All metrics shown are as recorded during the build.
+This document is a documentation and educational showcase reconstructed from a three-part AI-conversation transcript (487 + 359 + 552 pages) of building a Hinglish hate-speech classifier. It is not affiliated with, endorsed by, or a product of any of the tools, models, or platforms mentioned (MuRIL, DeepSeek, Gemini, DuckDB, GitHub Actions, Hugging Face, Arctic, Pushshift, Reddit). All metrics shown are as recorded during the build.
