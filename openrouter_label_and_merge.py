@@ -33,16 +33,19 @@ if not OPENROUTER_KEY:
 if not HF_TOKEN:
     raise ValueError("❌ HF_TOKEN environment variable is missing (Required to read raw data).")
 
-# Model Parameters
-MODEL_NAME = "google/gemma-4-31b-it:free"
+# Smart Fallback Routing: If Google's upstream fails, it instantly tries Meta, then DeepSeek.
+FALLBACK_MODELS = [
+    "google/gemma-4-31b-it:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "deepseek/deepseek-r1:free"
+]
 
 OPENROUTER_REASONING = {
     "enabled": True,
     "effort": "low"  
 }
 
-# Free-tier API rate limiting safety
-MAX_WORKERS = 2  # Lowered to 2 to prevent instant 429 Rate Limit errors on the free tier
+MAX_WORKERS = 2  
 
 HF_REPO_ID = "darelphilip/hinglish-toxicity"
 LEDGER_PATH = './seen_ids_ledger.txt'
@@ -61,11 +64,10 @@ KEY_MAPPING = {
 }
 STUDENT_PROMPT = "You are an expert Hinglish content moderation AI. Analyze the following comment and output a JSON object containing the toxic classification flags and a brief analysis of the target and intent."
 
-# Initialize OpenRouter Client with strict timeouts and dashboard headers
 client = OpenAI(
     api_key=OPENROUTER_KEY, 
     base_url="https://openrouter.ai/api/v1",
-    timeout=60.0, # Fails fast instead of hanging indefinitely 
+    timeout=60.0, 
     default_headers={
         "HTTP-Referer": "https://github.com/darelphilipo/hinglish_reddit_data",
         "X-Title": "Hinglish Toxicity Pipeline"
@@ -147,8 +149,7 @@ if T3_QUOTA > 0:
     except Exception as e:
         print(f"   ❌ Query Failed: {e}", flush=True)
 
-# Use explicit .copy() to prevent SettingWithCopyWarning during sanitization
-raw_df = t3_raw_df.copy()
+raw_df = t3_raw_df.copy(deep=True)
 if raw_df.empty:
     raise ValueError("❌ Extraction returned 0 comments.")
 
@@ -174,7 +175,9 @@ def sanitize_text(text):
     return re.sub(r'\s{2,}', ' ', text).strip()
 
 raw_df['body_clean'] = raw_df['body'].apply(sanitize_text)
-raw_df = raw_df[raw_df['body_clean'].str.len() > 5]
+
+# Fixes the SettingWithCopyWarning by explicitly creating a fresh DataFrame after filtering
+raw_df = raw_df[raw_df['body_clean'].str.len() > 5].copy(deep=True)
 
 print("🛡️ Applying aggressive token-saving deduplication...", flush=True)
 initial_count = len(raw_df)
@@ -199,14 +202,18 @@ df.drop(columns=['index', 'tier_label'], inplace=True, errors='ignore')
 print(f"🎯 Final Inference Pool: {len(df):,} rows.", flush=True)
 
 # ==========================================
-# 5. OPENROUTER INFERENCE ENGINE 
+# 5. OPENROUTER INFERENCE ENGINE (WITH FAILOVER)
 # ==========================================
-def label_batch(comments_batch, attempt=1):
+def label_batch(comments_batch, attempt=1, model_idx=0):
     numbered = "\n".join(f'ID: {cid} | Comment: {body}' for cid, body in comments_batch)
     user_prompt = f"Label these comments:\n{numbered}"
+    
+    # Select model from fallback array
+    current_model = FALLBACK_MODELS[model_idx]
+    
     try:
         res = client.chat.completions.create(
-            model=MODEL_NAME, 
+            model=current_model, 
             messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_prompt}], 
             temperature=0.1, 
             response_format={"type": "json_object"},
@@ -226,14 +233,25 @@ def label_batch(comments_batch, attempt=1):
                 item["id"] = str(comments_batch[idx][0])
             return results
         raise ValueError("Batch mismatch")
+        
     except Exception as e:
+        err_msg = str(e)
+        
+        # Immediate Failover Logic: If upstream provider is congested, switch models instantly
+        if "upstream_provider_shared_pool" in err_msg or "Provider returned error" in err_msg:
+            if model_idx + 1 < len(FALLBACK_MODELS):
+                next_model = FALLBACK_MODELS[model_idx + 1]
+                print(f"\n   🔄 Upstream congested for {current_model}. Failing over to {next_model}...", flush=True)
+                return label_batch(comments_batch, attempt, model_idx + 1)
+        
+        # Standard Exponential Backoff for general rate limits
         if attempt <= 5:
             wait_time = min(3 ** attempt, 30)
-            # Explicitly log the error so you know if you are hitting OpenRouter's rate limits
-            print(f"\n   ⏳ OpenRouter Error (Attempt {attempt}): {e}. Retrying in {wait_time}s...", flush=True)
+            print(f"\n   ⏳ OpenRouter Error ({current_model}) (Attempt {attempt}): {e}. Retrying in {wait_time}s...", flush=True)
             time.sleep(wait_time)
-            return label_batch(comments_batch, attempt + 1)
-        print(f"\n⚠️ Failed batch after 5 attempts: {e}", flush=True)
+            return label_batch(comments_batch, attempt + 1, model_idx)
+            
+        print(f"\n⚠️ Failed batch after 5 attempts on all models: {e}", flush=True)
         return []
 
 if df.empty:
@@ -251,7 +269,7 @@ with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
 labels_df = pd.DataFrame(all_labels)
 
 if labels_df.empty:
-    raise RuntimeError("❌ All inference requests failed. Check OpenRouter API limits.")
+    raise RuntimeError("❌ All inference requests failed. Check OpenRouter API daily limits (50/day max).")
 
 labels_df["id"] = labels_df["id"].astype(str)
 df["id"] = df["id"].astype(str)
