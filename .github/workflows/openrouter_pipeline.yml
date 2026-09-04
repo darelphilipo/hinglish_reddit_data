@@ -1,0 +1,48 @@
+name: OpenRouter Label & Merge Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_rows:
+        description: 'Number of rows to pull and label'
+        required: true
+        type: string
+        default: '10000'
+      live_merge:
+        description: 'Merge to Hugging Face dataset?'
+        required: true
+        type: boolean
+        default: false
+
+jobs:
+  label_review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas duckdb requests psutil tqdm openai huggingface_hub pyarrow clean-text
+
+      - name: Run OpenRouter Labelling Pipeline
+        env:
+          OPENROUTER_KEY: ${{ secrets.OPENROUTER_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          TARGET_ROWS: ${{ github.event.inputs.target_rows }}
+          LIVE_MERGE: ${{ github.event.inputs.live_merge }}
+        run: python openrouter_label_and_merge.py
+
+      - name: Upload Manual Review CSV
+        if: ${{ github.event.inputs.live_merge == 'false' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: openrouter-review-csv
+          path: output/*.csv
