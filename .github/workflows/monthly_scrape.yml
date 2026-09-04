@@ -5,6 +5,18 @@ on:
     - cron: '0 0 1 * *'
   workflow_dispatch:
     inputs:
+      target_year_start:
+        description: 'Override: Start year (e.g., 2020). Leave blank to use default monthly logic.'
+        required: false
+        type: string
+      target_year_end:
+        description: 'Override: End year (e.g., 2023).'
+        required: false
+        type: string
+      max_rows_per_sub:
+        description: 'Override: Max number of comments to fetch per subreddit.'
+        required: false
+        type: string
       target_year:
         description: 'Year to scrape (leave blank to default to previous calendar month)'
         required: false
@@ -76,6 +88,9 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           PYTHONUNBUFFERED: "1"
           BATCH_NAME: ${{ matrix.batch_name }}
+          TARGET_YEAR_START: ${{ inputs.target_year_start }}
+          TARGET_YEAR_END: ${{ inputs.target_year_end }}
+          MAX_ROWS_PER_SUB: ${{ inputs.max_rows_per_sub }}
           TARGET_YEAR: ${{ inputs.target_year }}
           TARGET_MONTH: ${{ inputs.target_month }}
         run: python fetch_arctic_to_hf.py
