@@ -33,11 +33,15 @@ if not OPENROUTER_KEY:
 if not HF_TOKEN:
     raise ValueError("❌ HF_TOKEN environment variable is missing (Required to read raw data).")
 
-# Smart Fallback Routing: If Google's upstream fails, it instantly tries Meta, then DeepSeek.
+# Model Parameters
+MODEL_NAME = "google/gemma-4-26b-a4b-it:free"
+
+# Smart Fallback Routing: Updated with verified 2026 free models
 FALLBACK_MODELS = [
-    "google/gemma-4-31b-it:free",
-    "meta-llama/llama-3.3-70b-instruct:free",
-    "deepseek/deepseek-r1:free"
+    "google/gemma-4-26b-a4b-it:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+    "z-ai/glm-5.2:free"
 ]
 
 OPENROUTER_REASONING = {
@@ -175,8 +179,6 @@ def sanitize_text(text):
     return re.sub(r'\s{2,}', ' ', text).strip()
 
 raw_df['body_clean'] = raw_df['body'].apply(sanitize_text)
-
-# Fixes the SettingWithCopyWarning by explicitly creating a fresh DataFrame after filtering
 raw_df = raw_df[raw_df['body_clean'].str.len() > 5].copy(deep=True)
 
 print("🛡️ Applying aggressive token-saving deduplication...", flush=True)
@@ -208,7 +210,6 @@ def label_batch(comments_batch, attempt=1, model_idx=0):
     numbered = "\n".join(f'ID: {cid} | Comment: {body}' for cid, body in comments_batch)
     user_prompt = f"Label these comments:\n{numbered}"
     
-    # Select model from fallback array
     current_model = FALLBACK_MODELS[model_idx]
     
     try:
@@ -237,14 +238,13 @@ def label_batch(comments_batch, attempt=1, model_idx=0):
     except Exception as e:
         err_msg = str(e)
         
-        # Immediate Failover Logic: If upstream provider is congested, switch models instantly
-        if "upstream_provider_shared_pool" in err_msg or "Provider returned error" in err_msg:
+        # Immediate Failover Logic: Catches 429 Congestion AND 404/Unavailable Models
+        if any(trigger in err_msg for trigger in ["upstream_provider_shared_pool", "Provider returned error", "404", "unavailable"]):
             if model_idx + 1 < len(FALLBACK_MODELS):
                 next_model = FALLBACK_MODELS[model_idx + 1]
-                print(f"\n   🔄 Upstream congested for {current_model}. Failing over to {next_model}...", flush=True)
+                print(f"\n   🔄 {current_model} is congested/unavailable. Failing over to {next_model}...", flush=True)
                 return label_batch(comments_batch, attempt, model_idx + 1)
         
-        # Standard Exponential Backoff for general rate limits
         if attempt <= 5:
             wait_time = min(3 ** attempt, 30)
             print(f"\n   ⏳ OpenRouter Error ({current_model}) (Attempt {attempt}): {e}. Retrying in {wait_time}s...", flush=True)
