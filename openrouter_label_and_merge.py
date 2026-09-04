@@ -33,13 +33,10 @@ if not OPENROUTER_KEY:
 if not HF_TOKEN:
     raise ValueError("❌ HF_TOKEN environment variable is missing (Required to read raw data).")
 
-# Model Parameters
-MODEL_NAME = "google/gemma-4-26b-a4b-it:free"
-
-# Smart Fallback Routing: Updated with verified 2026 free models
+# Smart Fallback Routing: Nemotron set as default, Gemma as secondary
 FALLBACK_MODELS = [
-    "google/gemma-4-26b-a4b-it:free",
     "nvidia/nemotron-3-super-120b-a12b:free",
+    "google/gemma-4-26b-a4b-it:free",
     "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
     "z-ai/glm-5.2:free"
 ]
@@ -221,7 +218,21 @@ def label_batch(comments_batch, attempt=1, model_idx=0):
             extra_body={"reasoning": OPENROUTER_REASONING}
         )
         
-        raw_content = res.choices[0].message.content.strip()
+        msg_obj = res.choices[0].message
+        raw_content = msg_obj.content.strip()
+        
+        # --- DEBUG: CHECK FOR THINKING/REASONING ---
+        reasoning_text = getattr(msg_obj, 'reasoning', None)
+        if reasoning_text:
+            print(f"\n[🧠 {current_model} THINKING (API Level)]:\n{reasoning_text[:300]}...\n", flush=True)
+        elif "<think>" in raw_content:
+            think_block = re.search(r"<think>(.*?)</think>", raw_content, re.DOTALL)
+            if think_block:
+                print(f"\n[🧠 {current_model} THINKING (Tag Level)]:\n{think_block.group(1).strip()[:300]}...\n", flush=True)
+        # -------------------------------------------
+
+        # Clean up any markdown blocks or leftover think tags before parsing JSON
+        raw_content = re.sub(r"<think>.*?</think>", "", raw_content, flags=re.DOTALL).strip()
         if raw_content.startswith("```"):
             raw_content = re.sub(r"^```(?:json)?\n?", "", raw_content)
             raw_content = re.sub(r"\n?```$", "", raw_content).strip()
@@ -242,7 +253,8 @@ def label_batch(comments_batch, attempt=1, model_idx=0):
         if any(trigger in err_msg for trigger in ["upstream_provider_shared_pool", "Provider returned error", "404", "unavailable"]):
             if model_idx + 1 < len(FALLBACK_MODELS):
                 next_model = FALLBACK_MODELS[model_idx + 1]
-                print(f"\n   🔄 {current_model} is congested/unavailable. Failing over to {next_model}...", flush=True)
+                if attempt == 1:
+                    print(f"\n   🔄 {current_model} is congested/unavailable. Failing over to {next_model}...", flush=True)
                 return label_batch(comments_batch, attempt, model_idx + 1)
         
         if attempt <= 5:
