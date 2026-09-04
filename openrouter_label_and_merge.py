@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import time
 import requests
@@ -116,10 +117,9 @@ except Exception as e:
     raise RuntimeError(f"❌ Failed to fetch System Prompt from GitHub: {e}")
 
 # ==========================================
-# 3. DUCKDB MULTI-TIER EXTRACTION ENGINE (WITH RETRIES)
+# 3. DUCKDB MULTI-TIER EXTRACTION ENGINE
 # ==========================================
 print(f"\n🦆 Initializing DuckDB Engine (Dynamic Seed: {SEED_VALUE})...", flush=True)
-import sys
 con = duckdb.connect()
 con.execute("PRAGMA memory_limit='6GB';") 
 con.execute("PRAGMA threads=4;") 
@@ -146,7 +146,6 @@ if T3_QUOTA > 0:
     USING SAMPLE {fetch_limit} ROWS
     """
     
-    # --- FIX: Network Retry Loop for Hugging Face Extraction ---
     max_db_retries = 3
     for attempt in range(1, max_db_retries + 1):
         try:
@@ -158,13 +157,13 @@ if T3_QUOTA > 0:
             if attempt == max_db_retries:
                 print("   ❌ Exhausted all extraction retries. Exiting cleanly.", flush=True)
                 sys.exit(1)
-            time.sleep(5 * attempt) # Incremental backoff for HF network hiccups
-    # -----------------------------------------------------------
+            time.sleep(5 * attempt)
 
 raw_df = t3_raw_df.copy(deep=True)
 if raw_df.empty:
     print("❌ Extraction returned 0 comments. Exiting cleanly.", flush=True)
     sys.exit(1)
+
 # ==========================================
 # 4. SANITIZATION & DEDUPLICATION
 # ==========================================
@@ -225,20 +224,16 @@ def label_batch(comments_batch, attempt=1, model_idx=0):
             model=current_model, 
             messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_prompt}], 
             temperature=0.1, 
-            # We keep JSON format, but if a model rejects it, the safety catch below handles it
             response_format={"type": "json_object"},
             extra_body={"reasoning": OPENROUTER_REASONING}
         )
         
-        # --- FIX: Safe extraction to prevent 'NoneType' subscript errors ---
         if not hasattr(res, 'choices') or not res.choices:
             raise ValueError(f"API returned empty or invalid choices (Model likely rejected a parameter).")
             
         msg_obj = res.choices[0].message
         raw_content = (msg_obj.content or "").strip()
-        # -----------------------------------------------------------------
         
-        # --- DEBUG: CHECK FOR THINKING/REASONING ---
         reasoning_text = getattr(msg_obj, 'reasoning', None)
         if reasoning_text:
             print(f"\n[🧠 {current_model} THINKING (API Level)]:\n{reasoning_text[:300]}...\n", flush=True)
@@ -246,9 +241,7 @@ def label_batch(comments_batch, attempt=1, model_idx=0):
             think_block = re.search(r"<think>(.*?)</think>", raw_content, re.DOTALL)
             if think_block:
                 print(f"\n[🧠 {current_model} THINKING (Tag Level)]:\n{think_block.group(1).strip()[:300]}...\n", flush=True)
-        # -------------------------------------------
 
-        # Clean up any markdown blocks or leftover think tags before parsing JSON
         raw_content = re.sub(r"<think>.*?</think>", "", raw_content, flags=re.DOTALL).strip()
         if raw_content.startswith("```"):
             raw_content = re.sub(r"^```(?:json)?\n?", "", raw_content)
@@ -259,7 +252,6 @@ def label_batch(comments_batch, attempt=1, model_idx=0):
         except json.JSONDecodeError:
             raise ValueError(f"Model failed to output valid JSON. Output was: {raw_content[:100]}...")
 
-        # Ensure we are working with a list of results
         results = content.get("results", []) if isinstance(content, dict) else content
         
         if isinstance(results, list) and len(results) == len(comments_batch):
@@ -274,7 +266,6 @@ def label_batch(comments_batch, attempt=1, model_idx=0):
     except Exception as e:
         err_msg = str(e)
         
-        # Immediate Failover Logic: Catches Congestion, 404s, AND soft-error Invalid Responses
         failover_triggers = ["upstream_provider_shared_pool", "Provider returned error", "404", "unavailable", "empty or invalid choices", "JSONDecodeError"]
         if any(trigger in err_msg for trigger in failover_triggers):
             if model_idx + 1 < len(FALLBACK_MODELS):
@@ -291,6 +282,30 @@ def label_batch(comments_batch, attempt=1, model_idx=0):
             
         print(f"\n⚠️ Failed batch after 5 attempts on all models: {e}", flush=True)
         return []
+
+if df.empty:
+    print(f"❌ Worker: No valid data to label.", flush=True)
+    sys.exit(0)
+
+batches = [list(zip(df["id"], df["body_clean"]))[i:i + 20] for i in range(0, len(df), 20)]
+all_labels = []
+
+print(f"\n🚀 Running Parallel Inference on {len(df):,} rows across {len(batches):,} batches (OpenRouter Free Tier)...", flush=True)
+with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    for result in tqdm(executor.map(label_batch, batches), total=len(batches), desc="Inference Progress"): 
+        all_labels.extend(result)
+
+labels_df = pd.DataFrame(all_labels)
+
+if labels_df.empty:
+    print("❌ All inference requests failed. Check OpenRouter API daily limits (50/day max).", flush=True)
+    sys.exit(1)
+
+labels_df["id"] = labels_df["id"].astype(str)
+df["id"] = df["id"].astype(str)
+final_df = df.merge(labels_df, on="id", how="inner")
+final_df.drop(columns=["body_clean"], errors='ignore', inplace=True)
+
 # ==========================================
 # 6. DUAL-SCHEMA FORMATTING
 # ==========================================
