@@ -116,9 +116,10 @@ except Exception as e:
     raise RuntimeError(f"❌ Failed to fetch System Prompt from GitHub: {e}")
 
 # ==========================================
-# 3. DUCKDB MULTI-TIER EXTRACTION ENGINE
+# 3. DUCKDB MULTI-TIER EXTRACTION ENGINE (WITH RETRIES)
 # ==========================================
 print(f"\n🦆 Initializing DuckDB Engine (Dynamic Seed: {SEED_VALUE})...", flush=True)
+import sys
 con = duckdb.connect()
 con.execute("PRAGMA memory_limit='6GB';") 
 con.execute("PRAGMA threads=4;") 
@@ -144,16 +145,26 @@ if T3_QUOTA > 0:
       AND length(body) BETWEEN 10 AND 1000
     USING SAMPLE {fetch_limit} ROWS
     """
-    try:
-        t3_raw_df = con.query(t3_query).to_df()
-        print(f"   ✅ Pulled {len(t3_raw_df):,} random raw comments from live dataset.", flush=True)
-    except Exception as e:
-        print(f"   ❌ Query Failed: {e}", flush=True)
+    
+    # --- FIX: Network Retry Loop for Hugging Face Extraction ---
+    max_db_retries = 3
+    for attempt in range(1, max_db_retries + 1):
+        try:
+            t3_raw_df = con.query(t3_query).to_df()
+            print(f"   ✅ Pulled {len(t3_raw_df):,} random raw comments from live dataset.", flush=True)
+            break
+        except Exception as e:
+            print(f"   ⚠️ DuckDB Network/Query Error (Attempt {attempt}/{max_db_retries}): {e}", flush=True)
+            if attempt == max_db_retries:
+                print("   ❌ Exhausted all extraction retries. Exiting cleanly.", flush=True)
+                sys.exit(1)
+            time.sleep(5 * attempt) # Incremental backoff for HF network hiccups
+    # -----------------------------------------------------------
 
 raw_df = t3_raw_df.copy(deep=True)
 if raw_df.empty:
-    raise ValueError("❌ Extraction returned 0 comments.")
-
+    print("❌ Extraction returned 0 comments. Exiting cleanly.", flush=True)
+    sys.exit(1)
 # ==========================================
 # 4. SANITIZATION & DEDUPLICATION
 # ==========================================
