@@ -214,12 +214,18 @@ def label_batch(comments_batch, attempt=1, model_idx=0):
             model=current_model, 
             messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_prompt}], 
             temperature=0.1, 
+            # We keep JSON format, but if a model rejects it, the safety catch below handles it
             response_format={"type": "json_object"},
             extra_body={"reasoning": OPENROUTER_REASONING}
         )
         
+        # --- FIX: Safe extraction to prevent 'NoneType' subscript errors ---
+        if not hasattr(res, 'choices') or not res.choices:
+            raise ValueError(f"API returned empty or invalid choices (Model likely rejected a parameter).")
+            
         msg_obj = res.choices[0].message
-        raw_content = msg_obj.content.strip()
+        raw_content = (msg_obj.content or "").strip()
+        # -----------------------------------------------------------------
         
         # --- DEBUG: CHECK FOR THINKING/REASONING ---
         reasoning_text = getattr(msg_obj, 'reasoning', None)
@@ -237,24 +243,33 @@ def label_batch(comments_batch, attempt=1, model_idx=0):
             raw_content = re.sub(r"^```(?:json)?\n?", "", raw_content)
             raw_content = re.sub(r"\n?```$", "", raw_content).strip()
 
-        content = json.loads(raw_content)
-        results = content.get("results", [])
+        try:
+            content = json.loads(raw_content)
+        except json.JSONDecodeError:
+            raise ValueError(f"Model failed to output valid JSON. Output was: {raw_content[:100]}...")
+
+        # Ensure we are working with a list of results
+        results = content.get("results", []) if isinstance(content, dict) else content
         
-        if len(results) == len(comments_batch):
+        if isinstance(results, list) and len(results) == len(comments_batch):
             for idx, item in enumerate(results): 
+                if not isinstance(item, dict):
+                    raise ValueError(f"Model returned invalid item format in array: {item}")
                 item["id"] = str(comments_batch[idx][0])
             return results
-        raise ValueError("Batch mismatch")
+            
+        raise ValueError(f"Batch mismatch: Expected {len(comments_batch)} results, got {len(results) if isinstance(results, list) else 'non-list'}")
         
     except Exception as e:
         err_msg = str(e)
         
-        # Immediate Failover Logic: Catches 429 Congestion AND 404/Unavailable Models
-        if any(trigger in err_msg for trigger in ["upstream_provider_shared_pool", "Provider returned error", "404", "unavailable"]):
+        # Immediate Failover Logic: Catches Congestion, 404s, AND soft-error Invalid Responses
+        failover_triggers = ["upstream_provider_shared_pool", "Provider returned error", "404", "unavailable", "empty or invalid choices", "JSONDecodeError"]
+        if any(trigger in err_msg for trigger in failover_triggers):
             if model_idx + 1 < len(FALLBACK_MODELS):
                 next_model = FALLBACK_MODELS[model_idx + 1]
                 if attempt == 1:
-                    print(f"\n   🔄 {current_model} is congested/unavailable. Failing over to {next_model}...", flush=True)
+                    print(f"\n   🔄 {current_model} is congested/incompatible. Failing over to {next_model}...", flush=True)
                 return label_batch(comments_batch, attempt, model_idx + 1)
         
         if attempt <= 5:
@@ -265,29 +280,6 @@ def label_batch(comments_batch, attempt=1, model_idx=0):
             
         print(f"\n⚠️ Failed batch after 5 attempts on all models: {e}", flush=True)
         return []
-
-if df.empty:
-    print(f"❌ Worker: No valid data to label.", flush=True)
-    exit(0)
-
-batches = [list(zip(df["id"], df["body_clean"]))[i:i + 20] for i in range(0, len(df), 20)]
-all_labels = []
-
-print(f"\n🚀 Running Parallel Inference on {len(df):,} rows across {len(batches):,} batches (OpenRouter Free Tier)...", flush=True)
-with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-    for result in tqdm(executor.map(label_batch, batches), total=len(batches), desc="Inference Progress"): 
-        all_labels.extend(result)
-
-labels_df = pd.DataFrame(all_labels)
-
-if labels_df.empty:
-    raise RuntimeError("❌ All inference requests failed. Check OpenRouter API daily limits (50/day max).")
-
-labels_df["id"] = labels_df["id"].astype(str)
-df["id"] = df["id"].astype(str)
-final_df = df.merge(labels_df, on="id", how="inner")
-final_df.drop(columns=["body_clean"], errors='ignore', inplace=True)
-
 # ==========================================
 # 6. DUAL-SCHEMA FORMATTING
 # ==========================================
