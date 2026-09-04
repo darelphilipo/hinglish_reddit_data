@@ -32,12 +32,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas duckdb requests psutil tqdm openai huggingface_hub pyarrow clean-text
 
-      - name: Run OpenRouter Labelling Pipeline
+     - name: Run OpenRouter Labelling Pipeline
         env:
           OPENROUTER_KEY: ${{ secrets.OPENROUTER_KEY }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           TARGET_ROWS: ${{ github.event.inputs.target_rows }}
           LIVE_MERGE: ${{ github.event.inputs.live_merge }}
+          PYTHONUNBUFFERED: "1"
         run: python openrouter_label_and_merge.py
 
       - name: Upload Manual Review CSV
