@@ -19,14 +19,12 @@ from datetime import datetime
 # ==========================================
 # 1. CONFIGURATION & OPENROUTER SETUP
 # ==========================================
-# Workflow Overrides
 TARGET_ROWS = int(os.environ.get("TARGET_ROWS", 10000))
 LIVE_MERGE = os.environ.get("LIVE_MERGE", "false").lower() == "true"
 RUN_ID = os.environ.get("GITHUB_RUN_ID", str(int(time.time())))
 SEED_VALUE = int(RUN_ID) % 100000 
 random.seed(SEED_VALUE)
 
-# Credentials
 OPENROUTER_KEY = os.environ.get("OPENROUTER_KEY")
 HF_TOKEN = os.environ.get("HF_TOKEN")
 
@@ -38,15 +36,13 @@ if not HF_TOKEN:
 # Model Parameters
 MODEL_NAME = "google/gemma-4-31b-it:free"
 
-# OpenRouter Specific 'Thinking/Reasoning' Config
-# https://openrouter.ai/docs/guides/best-practices/reasoning-tokens
 OPENROUTER_REASONING = {
     "enabled": True,
-    "effort": "low"  # Options: 'minimal', 'low', 'medium', 'high', 'xhigh'
+    "effort": "low"  
 }
 
 # Free-tier API rate limiting safety
-MAX_WORKERS = 4 
+MAX_WORKERS = 2  # Lowered to 2 to prevent instant 429 Rate Limit errors on the free tier
 
 HF_REPO_ID = "darelphilip/hinglish-toxicity"
 LEDGER_PATH = './seen_ids_ledger.txt'
@@ -65,16 +61,22 @@ KEY_MAPPING = {
 }
 STUDENT_PROMPT = "You are an expert Hinglish content moderation AI. Analyze the following comment and output a JSON object containing the toxic classification flags and a brief analysis of the target and intent."
 
+# Initialize OpenRouter Client with strict timeouts and dashboard headers
 client = OpenAI(
     api_key=OPENROUTER_KEY, 
-    base_url="https://openrouter.ai/api/v1"
+    base_url="https://openrouter.ai/api/v1",
+    timeout=60.0, # Fails fast instead of hanging indefinitely 
+    default_headers={
+        "HTTP-Referer": "https://github.com/darelphilipo/hinglish_reddit_data",
+        "X-Title": "Hinglish Toxicity Pipeline"
+    }
 )
 api = HfApi(token=HF_TOKEN)
 
 # ==========================================
 # 2. LOAD SUBREDDITS & DYNAMIC SYSTEM PROMPT
 # ==========================================
-print(f"\n🔧 Loading Subreddit Configurations & Prompt...")
+print(f"\n🔧 Loading Subreddit Configurations & Prompt...", flush=True)
 try:
     resp = requests.get(SUBREDDIT_URL, timeout=10)
     resp.raise_for_status()
@@ -99,22 +101,21 @@ for cat_name, sub_list in categories.items():
                 seen_tier2.add(s_clean)
                 TIER2_SUBS.append(s_clean)
 
-# Stream 100% of the quota from Tier 3 (The live pool)
 T3_QUOTA = TARGET_ROWS 
-print(f"   ↳ Quota Target (New Dataset): {T3_QUOTA:,} Rows")
+print(f"   ↳ Quota Target (New Dataset): {T3_QUOTA:,} Rows", flush=True)
 
 try:
     response = requests.get(PROMPT_URL, timeout=10)
     response.raise_for_status()
     SYSTEM_PROMPT = response.text.strip()
-    print("✅ System Prompt loaded successfully.")
+    print("✅ System Prompt loaded successfully.", flush=True)
 except Exception as e:
     raise RuntimeError(f"❌ Failed to fetch System Prompt from GitHub: {e}")
 
 # ==========================================
 # 3. DUCKDB MULTI-TIER EXTRACTION ENGINE
 # ==========================================
-print(f"\n🦆 Initializing DuckDB Engine (Dynamic Seed: {SEED_VALUE})...")
+print(f"\n🦆 Initializing DuckDB Engine (Dynamic Seed: {SEED_VALUE})...", flush=True)
 con = duckdb.connect()
 con.execute("PRAGMA memory_limit='6GB';") 
 con.execute("PRAGMA threads=4;") 
@@ -123,7 +124,7 @@ con.execute(f"CREATE SECRET hf_auth (TYPE HUGGINGFACE, TOKEN '{HF_TOKEN}');")
 
 t3_raw_df = pd.DataFrame()
 if T3_QUOTA > 0:
-    print(f"🔍 Streaming from darelphilip/reddit_indian_subs (Target: {T3_QUOTA:,} rows)...")
+    print(f"🔍 Streaming from darelphilip/reddit_indian_subs (Target: {T3_QUOTA:,} rows)...", flush=True)
     all_active_subs = list(set(TIER1_SUBS + TIER2_SUBS))
     if not all_active_subs:
         all_active_subs = ['indiaspeaks', 'india', 'bihar', 'delhi', 'bangalore', 'developersindia']
@@ -142,18 +143,19 @@ if T3_QUOTA > 0:
     """
     try:
         t3_raw_df = con.query(t3_query).to_df()
-        print(f"   ✅ Pulled {len(t3_raw_df):,} random raw comments from live dataset.")
+        print(f"   ✅ Pulled {len(t3_raw_df):,} random raw comments from live dataset.", flush=True)
     except Exception as e:
-        print(f"   ❌ Query Failed: {e}")
+        print(f"   ❌ Query Failed: {e}", flush=True)
 
-raw_df = t3_raw_df
+# Use explicit .copy() to prevent SettingWithCopyWarning during sanitization
+raw_df = t3_raw_df.copy()
 if raw_df.empty:
     raise ValueError("❌ Extraction returned 0 comments.")
 
 # ==========================================
 # 4. SANITIZATION & DEDUPLICATION
 # ==========================================
-print("\n🧹 Sanitizing text...")
+print("\n🧹 Sanitizing text...", flush=True)
 
 def sanitize_text(text):
     if not isinstance(text, str): return ""
@@ -174,19 +176,19 @@ def sanitize_text(text):
 raw_df['body_clean'] = raw_df['body'].apply(sanitize_text)
 raw_df = raw_df[raw_df['body_clean'].str.len() > 5]
 
-print("🛡️ Applying aggressive token-saving deduplication...")
+print("🛡️ Applying aggressive token-saving deduplication...", flush=True)
 initial_count = len(raw_df)
 raw_df['dedup_key'] = raw_df['body_clean'].str.lower().str.replace(r'[^a-z0-9]', '', regex=True)
 raw_df.drop_duplicates(subset=['dedup_key'], keep='first', inplace=True)
 raw_df.drop(columns=['dedup_key'], inplace=True)
-print(f"✂️ Dropped {initial_count - len(raw_df)} spam/copy-paste variants.")
+print(f"✂️ Dropped {initial_count - len(raw_df)} spam/copy-paste variants.", flush=True)
 
 if os.path.exists(LEDGER_PATH):
     with open(LEDGER_PATH, 'r') as f:
         seen = set(line.strip() for line in f if line.strip())
     prev_len = len(raw_df)
     raw_df = raw_df[~raw_df['id'].isin(seen)]
-    print(f"🛡️ Filtered out {prev_len - len(raw_df)} comments processed in previous workflow runs.")
+    print(f"🛡️ Filtered out {prev_len - len(raw_df)} comments processed in previous workflow runs.", flush=True)
 
 if len(raw_df) > TARGET_ROWS:
     df = raw_df.sample(n=TARGET_ROWS, random_state=SEED_VALUE).reset_index(drop=True)
@@ -194,7 +196,7 @@ else:
     df = raw_df.reset_index(drop=True)
 
 df.drop(columns=['index', 'tier_label'], inplace=True, errors='ignore')
-print(f"🎯 Final Inference Pool: {len(df):,} rows.")
+print(f"🎯 Final Inference Pool: {len(df):,} rows.", flush=True)
 
 # ==========================================
 # 5. OPENROUTER INFERENCE ENGINE 
@@ -208,7 +210,6 @@ def label_batch(comments_batch, attempt=1):
             messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_prompt}], 
             temperature=0.1, 
             response_format={"type": "json_object"},
-            # OpenRouter Thinking configuration applied here
             extra_body={"reasoning": OPENROUTER_REASONING}
         )
         
@@ -227,24 +228,31 @@ def label_batch(comments_batch, attempt=1):
         raise ValueError("Batch mismatch")
     except Exception as e:
         if attempt <= 5:
-            time.sleep(min(3 ** attempt, 30)) # Generous backoff for free-tier rate limits
+            wait_time = min(3 ** attempt, 30)
+            # Explicitly log the error so you know if you are hitting OpenRouter's rate limits
+            print(f"\n   ⏳ OpenRouter Error (Attempt {attempt}): {e}. Retrying in {wait_time}s...", flush=True)
+            time.sleep(wait_time)
             return label_batch(comments_batch, attempt + 1)
-        print(f"⚠️ Failed batch after 5 attempts: {e}")
+        print(f"\n⚠️ Failed batch after 5 attempts: {e}", flush=True)
         return []
 
 if df.empty:
-    print(f"❌ Worker: No valid data to label.")
+    print(f"❌ Worker: No valid data to label.", flush=True)
     exit(0)
 
 batches = [list(zip(df["id"], df["body_clean"]))[i:i + 20] for i in range(0, len(df), 20)]
 all_labels = []
 
-print(f"\n🚀 Running Parallel Inference on {len(df):,} rows across {len(batches):,} batches (OpenRouter Free Tier)...")
+print(f"\n🚀 Running Parallel Inference on {len(df):,} rows across {len(batches):,} batches (OpenRouter Free Tier)...", flush=True)
 with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
     for result in tqdm(executor.map(label_batch, batches), total=len(batches), desc="Inference Progress"): 
         all_labels.extend(result)
 
 labels_df = pd.DataFrame(all_labels)
+
+if labels_df.empty:
+    raise RuntimeError("❌ All inference requests failed. Check OpenRouter API limits.")
+
 labels_df["id"] = labels_df["id"].astype(str)
 df["id"] = df["id"].astype(str)
 final_df = df.merge(labels_df, on="id", how="inner")
@@ -253,7 +261,7 @@ final_df.drop(columns=["body_clean"], errors='ignore', inplace=True)
 # ==========================================
 # 6. DUAL-SCHEMA FORMATTING
 # ==========================================
-print("\n🛠️ Formatting Dual-Schema (RoBERTa + Sarvam ChatML)...")
+print("\n🛠️ Formatting Dual-Schema (RoBERTa + Sarvam ChatML)...", flush=True)
 final_df = final_df.dropna(subset=['pv'])
 
 for short_k, long_k in KEY_MAPPING.items():
@@ -295,16 +303,16 @@ total_lbl = len(hf_master_df)
 # ==========================================
 # 7. EXPORT LOGIC (MERGE vs REVIEW)
 # ==========================================
-print("\n==================================================")
-print(f" 📊 FINAL RUN DISTRIBUTION (Yield: {total_lbl:,} rows)")
-print("==================================================")
+print("\n==================================================", flush=True)
+print(f" 📊 FINAL RUN DISTRIBUTION (Yield: {total_lbl:,} rows)", flush=True)
+print("==================================================", flush=True)
 core_cols = list(KEY_MAPPING.values())
 toxic_mask = hf_master_df[core_cols].max(axis=1) == 1
 total_toxic = int(toxic_mask.sum())
-print(f"Toxic Comments: {total_toxic:,} ({total_toxic/max(1, total_lbl)*100:.1f}%)")
+print(f"Toxic Comments: {total_toxic:,} ({total_toxic/max(1, total_lbl)*100:.1f}%)", flush=True)
 
 if LIVE_MERGE:
-    print(f"\n☁️ [LIVE_MERGE=TRUE] Initiating Chunked Upload to Hugging Face...")
+    print(f"\n☁️ [LIVE_MERGE=TRUE] Initiating Chunked Upload to Hugging Face...", flush=True)
     timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     chunks = [hf_master_df[i:i + CHUNK_SIZE] for i in range(0, len(hf_master_df), CHUNK_SIZE)]
     
@@ -313,26 +321,26 @@ if LIVE_MERGE:
         hf_path = f"data/{chunk_name}"
         local_parquet_path = f"./{chunk_name}"
         
-        print(f"   📤 Uploading {chunk_name} ({len(chunk_df):,} rows)...")
+        print(f"   📤 Uploading {chunk_name} ({len(chunk_df):,} rows)...", flush=True)
         chunk_df.to_parquet(local_parquet_path, engine='pyarrow', index=False)
         
         try:
             api.upload_file(path_or_fileobj=local_parquet_path, path_in_repo=hf_path, repo_id=HF_REPO_ID, repo_type="dataset")
-            print(f"   ✅ Successfully pushed {chunk_name} to HF.")
+            print(f"   ✅ Successfully pushed {chunk_name} to HF.", flush=True)
             with open(LEDGER_PATH, 'a') as f:
                 for cid in chunk_df['id'].tolist(): f.write(f"{cid}\n")
         except Exception as e:
-            print(f"   ❌ Failed to upload chunk: {e}")
+            print(f"   ❌ Failed to upload chunk: {e}", flush=True)
         finally:
             if os.path.exists(local_parquet_path): os.remove(local_parquet_path)
             
-    print("\n✅ Merge to original dataset successfully completed.")
+    print("\n✅ Merge to original dataset successfully completed.", flush=True)
 
 else:
-    print(f"\n📁 [LIVE_MERGE=FALSE] Saving to local CSV for manual review...")
+    print(f"\n📁 [LIVE_MERGE=FALSE] Saving to local CSV for manual review...", flush=True)
     os.makedirs("output", exist_ok=True)
     timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_csv = f"output/openrouter_labeled_review_{timestamp_str}.csv"
     hf_master_df.to_csv(output_csv, index=False)
-    print(f"   ✅ Saved {len(hf_master_df):,} rows to {output_csv}.")
-    print("   💡 Review this file via GitHub Artifacts. To merge back to Hugging Face, run the workflow with live_merge=true.")
+    print(f"   ✅ Saved {len(hf_master_df):,} rows to {output_csv}.", flush=True)
+    print("   💡 Review this file via GitHub Artifacts. To merge back to Hugging Face, run the workflow with live_merge=true.", flush=True)
