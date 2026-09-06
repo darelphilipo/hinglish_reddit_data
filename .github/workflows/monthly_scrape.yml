@@ -53,7 +53,7 @@ jobs:
   scrape_and_push:
     needs: cleanup_previous_run
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       max-parallel: 10
