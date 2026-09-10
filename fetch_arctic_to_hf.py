@@ -185,9 +185,16 @@ def fetch_subreddit_comments(subreddit, after, before, time_budget_seconds, max_
     print(f"--- Fetching r/{subreddit} (time budget: {time_budget_seconds:.0f}s) ---", flush=True)
     sub_start_time = time.time()
     all_comments = []
-    current_after = after
+    
+    # --- NEW RANDOMIZATION LOGIC ---
+    # Pick a random starting timestamp within the month, leaving at least a 24-hour buffer (86400s)
+    random_offset = random.randint(0, max(0, before - after - 86400))
+    current_after = after + random_offset
+    print(f"  [🎲] Randomizing start time. Jumping forward {(random_offset / 86400):.1f} days.", flush=True)
+    # -------------------------------
+    
     page_count = 0
-
+    
     while True:
         elapsed_this_sub = time.time() - sub_start_time
         if elapsed_this_sub > time_budget_seconds:
