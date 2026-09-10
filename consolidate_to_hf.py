@@ -4,6 +4,7 @@ import time
 import uuid
 import random
 import pandas as pd
+import duckdb
 from datasets import load_dataset, concatenate_datasets, Features, Value
 from huggingface_hub import HfApi, CommitOperationDelete
 
@@ -69,21 +70,34 @@ def load_parquet_group_safely(repo_id, parquet_files, group_label):
         log_step(f"[ERROR] Failed to load '{group_label}': {e}")
         return None
 
-def deduplicate_dataset_low_mem(dataset):
-    log_step("Starting memory-efficient deduplication. Extracting IDs to Pandas Series...")
+def deduplicate_against_global(dataset):
+    log_step("Authenticating DuckDB for global ID check...")
+    # Authorize DuckDB to read the private dataset
+    duckdb.sql(f"CREATE OR REPLACE SECRET hf_secret (TYPE huggingface, TOKEN '{HF_TOKEN}');")
+    
+    log_step("Fetching historical IDs from Hugging Face over the network...")
+    # Stream ONLY the 'id' column from the existing master files to save RAM
+    existing_ids_df = duckdb.sql("SELECT id FROM 'hf://datasets/darelphilip/reddit_indian_subs/data/**/*.parquet'").df()
+    
+    # Convert to a Python set for instant O(1) lookups
+    existing_ids_set = set(existing_ids_df['id'])
+    log_step(f"Loaded {len(existing_ids_set):,} existing IDs into memory.")
+    
+    log_step("Dropping internal duplicates from the new batch...")
     id_series = pd.Series(dataset["id"])
-    
-    log_step("Calculating unique indices (dropping duplicates)...")
     unique_indices = id_series.drop_duplicates().index.values
+    internal_deduped = dataset.select(unique_indices)
     
-    log_step(f"Deduplication math complete. Before: {len(dataset)} | After: {len(unique_indices)}")
+    log_step("Filtering out global duplicates already on Hugging Face...")
+    # Keep only the rows where the ID is NOT in the historical set
+    final_dataset = internal_deduped.filter(lambda x: x["id"] not in existing_ids_set)
     
-    log_step("Applying native Arrow selection (slicing dataset)...")
-    return dataset.select(unique_indices)
+    log_step(f"Global dedup complete. New unique rows to append: {len(final_dataset)} (Down from {len(dataset)})")
+    return final_dataset
 
 def main():
     print("\n" + "="*70)
-    print("🚀 SCRIPT VERSION: v5.0 (INCREMENTAL APPEND + NATIVE MEMORY DIAGNOSTICS)")
+    print("🚀 SCRIPT VERSION: v6.0 (GLOBAL DEDUPLICATION WITH DUCKDB)")
     print("="*70 + "\n", flush=True)
 
     if not HF_TOKEN:
@@ -110,8 +124,8 @@ def main():
         log_step("Failed to load temporary files. Exiting.")
         sys.exit(1)
 
-    # 2. Deduplicate internally within the new batches
-    final_new_dataset = deduplicate_dataset_low_mem(ds_tmp)
+    # 2. Deduplicate against the global dataset using DuckDB
+    final_new_dataset = deduplicate_against_global(ds_tmp)
 
     # 3. Export to a local parquet file
     chunk_hash = str(uuid.uuid4())[:8]
