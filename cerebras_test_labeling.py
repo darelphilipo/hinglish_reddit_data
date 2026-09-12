@@ -5,55 +5,37 @@ import time
 import requests
 import re
 import random
-import threading
-import psutil
 import pandas as pd
 import duckdb
 import html
-from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 from openai import OpenAI
-from huggingface_hub import HfApi
 from cleantext import clean
 from datetime import datetime
 
 # ==========================================
-# 1. CONFIGURATION & OPENROUTER SETUP
+# 1. CONFIGURATION & CEREBRAS SETUP
 # ==========================================
-TARGET_ROWS = int(os.environ.get("TARGET_ROWS", 10000))
-LIVE_MERGE = os.environ.get("LIVE_MERGE", "false").lower() == "true"
+# For a test trial on a free tier, default to a much smaller row count
+TARGET_ROWS = int(os.environ.get("TARGET_ROWS", 100))
 RUN_ID = os.environ.get("GITHUB_RUN_ID", str(int(time.time())))
 SEED_VALUE = int(RUN_ID) % 100000 
 random.seed(SEED_VALUE)
 
-OPENROUTER_KEY = os.environ.get("OPENROUTER_KEY")
+CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY")
 HF_TOKEN = os.environ.get("HF_TOKEN")
 
-if not OPENROUTER_KEY:
-    raise ValueError("❌ OPENROUTER_KEY environment variable is missing.")
+if not CEREBRAS_API_KEY:
+    raise ValueError("❌ CEREBRAS_API_KEY environment variable is missing.")
 if not HF_TOKEN:
     raise ValueError("❌ HF_TOKEN environment variable is missing (Required to read raw data).")
 
-# Smart Fallback Routing: Nemotron set as default, Gemma as secondary
-FALLBACK_MODELS = [
-    "nvidia/nemotron-3-super-120b-a12b:free",
-    "google/gemma-4-26b-a4b-it:free",
-    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
-    "z-ai/glm-5.2:free"
-]
+MODEL_ID = "qwen-3.8-27b"
+# Max 5 req/min on free tier. Batches of 10 comments to keep token limits safe.
+BATCH_SIZE = 10 
 
-OPENROUTER_REASONING = {
-    "enabled": True,
-    "effort": "low"  
-}
-
-MAX_WORKERS = 2  
-
-HF_REPO_ID = "darelphilip/hinglish-toxicity"
-LEDGER_PATH = './seen_ids_ledger.txt'
 SUBREDDIT_URL = "https://raw.githubusercontent.com/darelphilipo/hinglish_reddit_data/main/prompt/subreddits.json"
 PROMPT_URL = "https://raw.githubusercontent.com/darelphilipo/hinglish_reddit_data/main/prompt/System_Prompt"
-CHUNK_SIZE = 2500
 
 KEY_MAPPING = {
     'pv': 'profanity_vulgarity',
@@ -64,18 +46,20 @@ KEY_MAPPING = {
     'rx': 'regional_xenophobic',
     'mg': 'misogyny_gender'
 }
+
 STUDENT_PROMPT = "You are an expert Hinglish content moderation AI. Analyze the following comment and output a JSON object containing the toxic classification flags and a brief analysis of the target and intent."
 
+# Cerebras uses the standard OpenAI SDK structure
 client = OpenAI(
-    api_key=OPENROUTER_KEY, 
-    base_url="https://openrouter.ai/api/v1",
-    timeout=60.0, 
-    default_headers={
-        "HTTP-Referer": "https://github.com/darelphilipo/hinglish_reddit_data",
-        "X-Title": "Hinglish Toxicity Pipeline"
-    }
+    api_key=CEREBRAS_API_KEY, 
+    base_url="https://api.cerebras.ai/v1",
+    timeout=60.0
 )
-api = HfApi(token=HF_TOKEN)
+
+# Global trackers for free tier monitoring
+global_req_count = 0
+global_input_tokens = 0
+global_output_tokens = 0
 
 # ==========================================
 # 2. LOAD SUBREDDITS & DYNAMIC SYSTEM PROMPT
@@ -105,8 +89,7 @@ for cat_name, sub_list in categories.items():
                 seen_tier2.add(s_clean)
                 TIER2_SUBS.append(s_clean)
 
-T3_QUOTA = TARGET_ROWS 
-print(f"   ↳ Quota Target (New Dataset): {T3_QUOTA:,} Rows", flush=True)
+print(f"   ↳ Quota Target (Test Run): {TARGET_ROWS:,} Rows", flush=True)
 
 try:
     response = requests.get(PROMPT_URL, timeout=10)
@@ -117,7 +100,7 @@ except Exception as e:
     raise RuntimeError(f"❌ Failed to fetch System Prompt from GitHub: {e}")
 
 # ==========================================
-# 3. DUCKDB MULTI-TIER EXTRACTION ENGINE
+# 3. DUCKDB EXTRACTION ENGINE
 # ==========================================
 print(f"\n🦆 Initializing DuckDB Engine (Dynamic Seed: {SEED_VALUE})...", flush=True)
 con = duckdb.connect()
@@ -126,18 +109,18 @@ con.execute("PRAGMA threads=4;")
 con.execute("INSTALL httpfs; LOAD httpfs;")
 con.execute(f"CREATE SECRET hf_auth (TYPE HUGGINGFACE, TOKEN '{HF_TOKEN}');")
 
-t3_raw_df = pd.DataFrame()
-if T3_QUOTA > 0:
-    print(f"🔍 Streaming from darelphilip/reddit_indian_subs (Target: {T3_QUOTA:,} rows)...", flush=True)
+raw_df = pd.DataFrame()
+if TARGET_ROWS > 0:
+    print(f"🔍 Streaming from darelphilip/reddit_indian_subs...", flush=True)
     all_active_subs = list(set(TIER1_SUBS + TIER2_SUBS))
     if not all_active_subs:
         all_active_subs = ['indiaspeaks', 'india', 'bihar', 'delhi', 'bangalore', 'developersindia']
         
     subs_formatted = ", ".join([f"'{s.replace(chr(39), chr(39)+chr(39))}'" for s in all_active_subs])
-    fetch_limit = max(10000, int(T3_QUOTA * 3.0)) 
+    fetch_limit = max(1000, int(TARGET_ROWS * 3.0)) 
     
     t3_query = f"""
-    SELECT id, body, LOWER(subreddit) as subreddit, created_utc, strftime(to_timestamp(created_utc), '%Y-%m') as year_month, 'Tier 3' as tier_label
+    SELECT id, body, LOWER(subreddit) as subreddit, created_utc, strftime(to_timestamp(created_utc), '%Y-%m') as year_month
     FROM read_parquet('hf://datasets/darelphilip/reddit_indian_subs/**/*.parquet', union_by_name=True)
     WHERE LOWER(subreddit) IN ({subs_formatted})
       AND body IS NOT NULL
@@ -146,20 +129,13 @@ if T3_QUOTA > 0:
     USING SAMPLE {fetch_limit} ROWS
     """
     
-    max_db_retries = 3
-    for attempt in range(1, max_db_retries + 1):
-        try:
-            t3_raw_df = con.query(t3_query).to_df()
-            print(f"   ✅ Pulled {len(t3_raw_df):,} random raw comments from live dataset.", flush=True)
-            break
-        except Exception as e:
-            print(f"   ⚠️ DuckDB Network/Query Error (Attempt {attempt}/{max_db_retries}): {e}", flush=True)
-            if attempt == max_db_retries:
-                print("   ❌ Exhausted all extraction retries. Exiting cleanly.", flush=True)
-                sys.exit(1)
-            time.sleep(5 * attempt)
+    try:
+        raw_df = con.query(t3_query).to_df()
+        print(f"   ✅ Pulled {len(raw_df):,} random raw comments.", flush=True)
+    except Exception as e:
+        print(f"   ❌ DuckDB Network/Query Error: {e}", flush=True)
+        sys.exit(1)
 
-raw_df = t3_raw_df.copy(deep=True)
 if raw_df.empty:
     print("❌ Extraction returned 0 comments. Exiting cleanly.", flush=True)
     sys.exit(1)
@@ -188,61 +164,52 @@ def sanitize_text(text):
 raw_df['body_clean'] = raw_df['body'].apply(sanitize_text)
 raw_df = raw_df[raw_df['body_clean'].str.len() > 5].copy(deep=True)
 
-print("🛡️ Applying aggressive token-saving deduplication...", flush=True)
-initial_count = len(raw_df)
 raw_df['dedup_key'] = raw_df['body_clean'].str.lower().str.replace(r'[^a-z0-9]', '', regex=True)
 raw_df.drop_duplicates(subset=['dedup_key'], keep='first', inplace=True)
 raw_df.drop(columns=['dedup_key'], inplace=True)
-print(f"✂️ Dropped {initial_count - len(raw_df)} spam/copy-paste variants.", flush=True)
-
-if os.path.exists(LEDGER_PATH):
-    with open(LEDGER_PATH, 'r') as f:
-        seen = set(line.strip() for line in f if line.strip())
-    prev_len = len(raw_df)
-    raw_df = raw_df[~raw_df['id'].isin(seen)]
-    print(f"🛡️ Filtered out {prev_len - len(raw_df)} comments processed in previous workflow runs.", flush=True)
 
 if len(raw_df) > TARGET_ROWS:
     df = raw_df.sample(n=TARGET_ROWS, random_state=SEED_VALUE).reset_index(drop=True)
 else:
     df = raw_df.reset_index(drop=True)
 
-df.drop(columns=['index', 'tier_label'], inplace=True, errors='ignore')
 print(f"🎯 Final Inference Pool: {len(df):,} rows.", flush=True)
 
 # ==========================================
-# 5. OPENROUTER INFERENCE ENGINE (WITH FAILOVER)
+# 5. CEREBRAS INFERENCE ENGINE 
 # ==========================================
-def label_batch(comments_batch, attempt=1, model_idx=0):
+def label_batch(comments_batch, attempt=1):
+    global global_req_count, global_input_tokens, global_output_tokens
+    
+    # Strictly enforce 5 req/min Cerebras Free Tier limit
+    if global_req_count > 0:
+        time.sleep(15) 
+
     numbered = "\n".join(f'ID: {cid} | Comment: {body}' for cid, body in comments_batch)
     user_prompt = f"Label these comments:\n{numbered}"
     
-    current_model = FALLBACK_MODELS[model_idx]
-    
     try:
         res = client.chat.completions.create(
-            model=current_model, 
+            model=MODEL_ID, 
             messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_prompt}], 
             temperature=0.1, 
             response_format={"type": "json_object"},
-            extra_body={"reasoning": OPENROUTER_REASONING}
+            reasoning_effort="none"  # DeepSeek Strategy: Turn off native thinking
         )
         
-        if not hasattr(res, 'choices') or not res.choices:
-            raise ValueError(f"API returned empty or invalid choices (Model likely rejected a parameter).")
-            
-        msg_obj = res.choices[0].message
-        raw_content = (msg_obj.content or "").strip()
+        global_req_count += 1
         
-        reasoning_text = getattr(msg_obj, 'reasoning', None)
-        if reasoning_text:
-            print(f"\n[🧠 {current_model} THINKING (API Level)]:\n{reasoning_text[:300]}...\n", flush=True)
-        elif "<think>" in raw_content:
-            think_block = re.search(r"<think>(.*?)</think>", raw_content, re.DOTALL)
-            if think_block:
-                print(f"\n[🧠 {current_model} THINKING (Tag Level)]:\n{think_block.group(1).strip()[:300]}...\n", flush=True)
+        # Log exact token usage from Cerebras API
+        if res.usage:
+            in_tok = res.usage.prompt_tokens
+            out_tok = res.usage.completion_tokens
+            global_input_tokens += in_tok
+            global_output_tokens += out_tok
+            print(f"\n   [Cerebras Limits] Req: {global_req_count} | Batch In: {in_tok} | Batch Out: {out_tok} | Total MTD: {global_input_tokens+global_output_tokens:,}/90,000", flush=True)
 
-        raw_content = re.sub(r"<think>.*?</think>", "", raw_content, flags=re.DOTALL).strip()
+        raw_content = (res.choices[0].message.content or "").strip()
+
+        # Clean up any residual markdown wrappers
         if raw_content.startswith("```"):
             raw_content = re.sub(r"^```(?:json)?\n?", "", raw_content)
             raw_content = re.sub(r"\n?```$", "", raw_content).strip()
@@ -264,41 +231,33 @@ def label_batch(comments_batch, attempt=1, model_idx=0):
         raise ValueError(f"Batch mismatch: Expected {len(comments_batch)} results, got {len(results) if isinstance(results, list) else 'non-list'}")
         
     except Exception as e:
-        err_msg = str(e)
-        
-        failover_triggers = ["upstream_provider_shared_pool", "Provider returned error", "404", "unavailable", "empty or invalid choices", "JSONDecodeError"]
-        if any(trigger in err_msg for trigger in failover_triggers):
-            if model_idx + 1 < len(FALLBACK_MODELS):
-                next_model = FALLBACK_MODELS[model_idx + 1]
-                if attempt == 1:
-                    print(f"\n   🔄 {current_model} is congested/incompatible. Failing over to {next_model}...", flush=True)
-                return label_batch(comments_batch, attempt, model_idx + 1)
-        
-        if attempt <= 5:
-            wait_time = min(3 ** attempt, 30)
-            print(f"\n   ⏳ OpenRouter Error ({current_model}) (Attempt {attempt}): {e}. Retrying in {wait_time}s...", flush=True)
-            time.sleep(wait_time)
-            return label_batch(comments_batch, attempt + 1, model_idx)
+        if attempt <= 3:
+            print(f"\n   ⏳ API Error (Attempt {attempt}): {e}. Retrying in 15s...", flush=True)
+            time.sleep(15)
+            return label_batch(comments_batch, attempt + 1)
             
-        print(f"\n⚠️ Failed batch after 5 attempts on all models: {e}", flush=True)
+        print(f"\n⚠️ Failed batch after 3 attempts: {e}", flush=True)
         return []
 
 if df.empty:
     print(f"❌ Worker: No valid data to label.", flush=True)
     sys.exit(0)
 
-batches = [list(zip(df["id"], df["body_clean"]))[i:i + 20] for i in range(0, len(df), 20)]
+batches = [list(zip(df["id"], df["body_clean"]))[i:i + BATCH_SIZE] for i in range(0, len(df), BATCH_SIZE)]
 all_labels = []
 
-print(f"\n🚀 Running Parallel Inference on {len(df):,} rows across {len(batches):,} batches (OpenRouter Free Tier)...", flush=True)
-with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-    for result in tqdm(executor.map(label_batch, batches), total=len(batches), desc="Inference Progress"): 
+print(f"\n🚀 Running Serial Inference on {len(df):,} rows across {len(batches):,} batches (Cerebras API)...", flush=True)
+
+# Process serially to respect rate limits
+for batch in tqdm(batches, desc="Inference Progress"): 
+    result = label_batch(batch)
+    if result:
         all_labels.extend(result)
 
 labels_df = pd.DataFrame(all_labels)
 
 if labels_df.empty:
-    print("❌ All inference requests failed. Check OpenRouter API daily limits (50/day max).", flush=True)
+    print("❌ All inference requests failed. Check API limits.", flush=True)
     sys.exit(1)
 
 labels_df["id"] = labels_df["id"].astype(str)
@@ -349,7 +308,7 @@ hf_master_df = pd.DataFrame(formatted_records)
 total_lbl = len(hf_master_df)
 
 # ==========================================
-# 7. EXPORT LOGIC (MERGE vs REVIEW)
+# 7. EXPORT LOGIC (TEST CSV OUTPUT ONLY)
 # ==========================================
 print("\n==================================================", flush=True)
 print(f" 📊 FINAL RUN DISTRIBUTION (Yield: {total_lbl:,} rows)", flush=True)
@@ -358,37 +317,12 @@ core_cols = list(KEY_MAPPING.values())
 toxic_mask = hf_master_df[core_cols].max(axis=1) == 1
 total_toxic = int(toxic_mask.sum())
 print(f"Toxic Comments: {total_toxic:,} ({total_toxic/max(1, total_lbl)*100:.1f}%)", flush=True)
+print(f"Total Cerebras API Tokens Consumed: {global_input_tokens + global_output_tokens:,}")
 
-if LIVE_MERGE:
-    print(f"\n☁️ [LIVE_MERGE=TRUE] Initiating Chunked Upload to Hugging Face...", flush=True)
-    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    chunks = [hf_master_df[i:i + CHUNK_SIZE] for i in range(0, len(hf_master_df), CHUNK_SIZE)]
-    
-    for chunk_idx, chunk_df in enumerate(chunks):
-        chunk_name = f"openrouter_worker_{timestamp_str}_part_{chunk_idx:03d}.parquet"
-        hf_path = f"data/{chunk_name}"
-        local_parquet_path = f"./{chunk_name}"
-        
-        print(f"   📤 Uploading {chunk_name} ({len(chunk_df):,} rows)...", flush=True)
-        chunk_df.to_parquet(local_parquet_path, engine='pyarrow', index=False)
-        
-        try:
-            api.upload_file(path_or_fileobj=local_parquet_path, path_in_repo=hf_path, repo_id=HF_REPO_ID, repo_type="dataset")
-            print(f"   ✅ Successfully pushed {chunk_name} to HF.", flush=True)
-            with open(LEDGER_PATH, 'a') as f:
-                for cid in chunk_df['id'].tolist(): f.write(f"{cid}\n")
-        except Exception as e:
-            print(f"   ❌ Failed to upload chunk: {e}", flush=True)
-        finally:
-            if os.path.exists(local_parquet_path): os.remove(local_parquet_path)
-            
-    print("\n✅ Merge to original dataset successfully completed.", flush=True)
-
-else:
-    print(f"\n📁 [LIVE_MERGE=FALSE] Saving to local CSV for manual review...", flush=True)
-    os.makedirs("output", exist_ok=True)
-    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_csv = f"output/openrouter_labeled_review_{timestamp_str}.csv"
-    hf_master_df.to_csv(output_csv, index=False)
-    print(f"   ✅ Saved {len(hf_master_df):,} rows to {output_csv}.", flush=True)
-    print("   💡 Review this file via GitHub Artifacts. To merge back to Hugging Face, run the workflow with live_merge=true.", flush=True)
+print(f"\n📁 Saving to local CSV for manual test review...", flush=True)
+os.makedirs("output", exist_ok=True)
+timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+output_csv = f"output/cerebras_qwen_test_{timestamp_str}.csv"
+hf_master_df.to_csv(output_csv, index=False)
+print(f"   ✅ Saved {len(hf_master_df):,} rows to {output_csv}.", flush=True)
+print("   💡 Review this CSV file to evaluate Qwen 3.8 performance before deploying the merge pipeline.", flush=True)
