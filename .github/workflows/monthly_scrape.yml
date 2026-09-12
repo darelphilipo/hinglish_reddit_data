@@ -1,30 +1,18 @@
-name: Monthly Arctic Shift Scrape to HF
+name: Daily Arctic Shift Scrape to HF
 
 on:
   schedule:
-    - cron: '0 0 1 * *'
+    - cron: '0 0 * * *'  # Runs daily at midnight UTC
   workflow_dispatch:
     inputs:
-      target_year_start:
-        description: 'Override: Start year (e.g., 2020). Leave blank to use default monthly logic.'
-        required: false
-        type: string
-      target_year_end:
-        description: 'Override: End year (e.g., 2023).'
-        required: false
-        type: string
       max_rows_per_sub:
         description: 'Override: Max number of comments to fetch per subreddit.'
         required: false
         type: string
-      target_year:
-        description: 'Year to scrape (leave blank to default to previous calendar month)'
-        required: false
-        type: string
-      target_month:
-        description: 'Month to scrape, 1-12 (leave blank to default to previous calendar month)'
-        required: false
-        type: string
+
+# Grant the GITHUB_TOKEN permission to push checkpoint commits back to the repo
+permissions:
+  contents: write
 
 jobs:
   cleanup_previous_run:
@@ -88,17 +76,21 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           PYTHONUNBUFFERED: "1"
           BATCH_NAME: ${{ matrix.batch_name }}
-          TARGET_YEAR_START: ${{ inputs.target_year_start }}
-          TARGET_YEAR_END: ${{ inputs.target_year_end }}
           MAX_ROWS_PER_SUB: ${{ inputs.max_rows_per_sub }}
-          TARGET_YEAR: ${{ inputs.target_year }}
-          TARGET_MONTH: ${{ inputs.target_month }}
         run: python fetch_arctic_to_hf.py
+
+      # Upload the individual batch checkpoint so it isn't lost when the container dies
+      - name: Upload Checkpoint Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkpoint-${{ matrix.batch_name }}
+          path: prompt/checkpoint_${{ matrix.batch_name }}.json
+          retention-days: 1
+          if-no-files-found: ignore
 
   consolidate:
     needs: scrape_and_push
-    if: always()   # run even if some/all batches failed, timed out, or the run was cancelled --
-                    # partial data beats losing everything, which is what happened before this fix
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -109,6 +101,22 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+
+      # Download all 10 checkpoint files into the prompt/ directory
+      - name: Download Checkpoint Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: prompt/
+          merge-multiple: true
+
+      # Commit the updated checkpoints back to the repository
+      - name: Commit Checkpoints to GitHub
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add prompt/checkpoint_*.json
+          git commit -m "Update scraping state checkpoints [skip ci]" || echo "No checkpoint changes to commit"
+          git push
 
       - name: Install Dependencies
         run: |
