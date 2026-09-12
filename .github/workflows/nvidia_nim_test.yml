@@ -1,4 +1,4 @@
-name: Cerebras Qwen 3.8 Trial Run
+name: NVIDIA NIM Trial Run
 
 on:
   workflow_dispatch:
@@ -28,18 +28,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas duckdb requests openai tqdm clean-text pyarrow
 
-      - name: Run Cerebras Inference Script
+      - name: Run NVIDIA NIM Inference Script
         env:
-          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           TARGET_ROWS: ${{ inputs.target_rows }}
           PYTHONUNBUFFERED: "1"
-        run: python cerebras_test_labeling.py
+        run: python nvidia_nim_test_labeling.py
 
       - name: Upload CSV Results as Artifact
         uses: actions/upload-artifact@v4
         if: always() # Uploads the folder even if the script hits a timeout or error midway
         with:
-          name: cerebras-qwen-results
+          name: nvidia-nim-results
           path: output/*.csv
           retention-days: 5
