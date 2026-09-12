@@ -30,10 +30,9 @@ if not NVIDIA_API_KEY:
 if not HF_TOKEN:
     raise ValueError("❌ HF_TOKEN environment variable is missing (Required to read raw data).")
 
-# Using the DeepSeek model provided via NIM
 MODEL_ID = "deepseek-ai/deepseek-v4-flash-0731"
 BATCH_SIZE = 10 
-MAX_WORKERS = 4 # NIM handles concurrency well, so we can run parallel batches
+MAX_WORKERS = 4 
 
 SUBREDDIT_URL = "https://raw.githubusercontent.com/darelphilipo/hinglish_reddit_data/main/prompt/subreddits.json"
 PROMPT_URL = "https://raw.githubusercontent.com/darelphilipo/hinglish_reddit_data/main/prompt/System_Prompt"
@@ -56,7 +55,6 @@ client = OpenAI(
     timeout=60.0
 )
 
-# Global trackers
 global_req_count = 0
 global_input_tokens = 0
 global_output_tokens = 0
@@ -190,7 +188,6 @@ def label_batch(comments_batch, attempt=1):
             messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_prompt}], 
             temperature=0.1, 
             response_format={"type": "json_object"},
-            # Hard-disable native thinking to enforce structural output in the system prompt
             extra_body={"chat_template_kwargs": {"thinking": False}} 
         )
         
@@ -257,4 +254,66 @@ if labels_df.empty:
 
 labels_df["id"] = labels_df["id"].astype(str)
 df["id"] = df["id"].astype(str)
-final_df
+final_df = df.merge(labels_df, on="id", how="inner")
+final_df.drop(columns=["body_clean"], errors='ignore', inplace=True)
+
+# ==========================================
+# 6. DUAL-SCHEMA FORMATTING
+# ==========================================
+print("\n🛠️ Formatting Dual-Schema (RoBERTa + Sarvam ChatML)...", flush=True)
+final_df = final_df.dropna(subset=['pv'])
+
+for short_k, long_k in KEY_MAPPING.items():
+    if short_k in final_df.columns and long_k not in final_df.columns:
+        final_df[long_k] = final_df[short_k]
+    elif long_k not in final_df.columns:
+        final_df[long_k] = 0
+
+formatted_records = []
+for idx, row in final_df.iterrows():
+    try:
+        labels = {long_key: int(row.get(short_key, 0)) for short_key, long_key in KEY_MAPPING.items()}
+        has_analysis = 'analysis' in row and pd.notna(row['analysis'])
+        if has_analysis:
+            labels['analysis'] = str(row['analysis']).strip()
+            
+        chatml_messages = [
+            {"role": "system", "content": STUDENT_PROMPT},
+            {"role": "user", "content": str(row['body']).strip()},
+            {"role": "assistant", "content": json.dumps(labels, ensure_ascii=False)}
+        ]
+        
+        record = {
+            "id": str(row['id']),
+            "text": str(row['body']).strip(),
+            "subreddit": str(row.get('subreddit', 'unknown')),
+            "created_utc": row.get('created_utc', None),
+            "year_month": str(row['year_month']) if pd.notna(row.get('year_month')) else None
+        }
+        record.update(labels)
+        record["messages"] = chatml_messages
+        if has_analysis: record['analysis'] = str(row['analysis']).strip() 
+        formatted_records.append(record)
+    except Exception as e: pass
+
+hf_master_df = pd.DataFrame(formatted_records)
+total_lbl = len(hf_master_df)
+
+# ==========================================
+# 7. EXPORT LOGIC (TEST CSV OUTPUT ONLY)
+# ==========================================
+print("\n==================================================", flush=True)
+print(f" 📊 FINAL RUN DISTRIBUTION (Yield: {total_lbl:,} rows)", flush=True)
+print("==================================================", flush=True)
+core_cols = list(KEY_MAPPING.values())
+toxic_mask = hf_master_df[core_cols].max(axis=1) == 1
+total_toxic = int(toxic_mask.sum())
+print(f"Toxic Comments: {total_toxic:,} ({total_toxic/max(1, total_lbl)*100:.1f}%)", flush=True)
+print(f"Total NVIDIA API Tokens Consumed: {global_input_tokens + global_output_tokens:,}")
+
+print(f"\n📁 Saving to local CSV for manual test review...", flush=True)
+os.makedirs("output", exist_ok=True)
+timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+output_csv = f"output/nvidia_nim_test_{timestamp_str}.csv"
+hf_master_df.to_csv(output_csv, index=False)
+print(f"   ✅ Saved {len(hf_master_df):,} rows to {output_csv}.", flush=True)
