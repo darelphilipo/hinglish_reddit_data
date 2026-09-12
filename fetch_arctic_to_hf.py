@@ -9,6 +9,10 @@ from datasets import Dataset, Features, Value
 from huggingface_hub.errors import HfHubHTTPError
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
+# Explicit schema -- pinned so a batch where a column happens to be all-null
+# (e.g. no [removed]/[deleted] comments in this particular slice) doesn't get
+# its type inferred as Arrow 'null' and clash with other splits where that
+# same column has real string values. 
 SCHEMA = Features({
     "id": Value("string"),
     "body": Value("string"),
@@ -22,7 +26,7 @@ SCHEMA = Features({
 # ==========================================
 # CONFIGURATION
 # ==========================================
-HF_DATASET_REPO = "darelphilip/reddit_indian_subs"
+HF_DATASET_REPO = "darelphilip/reddit_indian_subs"  
 HF_TOKEN = os.getenv("HF_TOKEN")
 CHECKPOINT_EVERY = 2
 BATCH_NAME = os.getenv("BATCH_NAME", "heavy_1")
@@ -71,10 +75,12 @@ def get_dynamic_batches():
     categories = data.get("categories", {})
     
     active_subs = set()
+    # Obey the JSON config: Only add subreddits if the category config == 1
     for cat, subs in categories.items():
         if config.get(cat, 0) == 1:
             active_subs.update(subs)
             
+    # Reference pools to maintain the historical heavy/medium grouping sizes
     KNOWN_HEAVY = {"IndiaSpeaks", "india", "indiameme", "funnyIndia", "IndianDankMemes", "CarryMinati", "ipl", "IndianGaming", "bollywood", "developersIndia", "UPSC", "IndianStockMarket", "JEENEETards", "Btechtards", "StartUpIndia", "AskIndia"}
     KNOWN_MEDIUM = {"indianews", "indiadiscussion", "CriticalThinkingIndia", "unitedstatesofindia", "bihar", "uttarpradesh", "delhi", "karnataka", "TamilNadu", "Maharashtra", "gujarat", "Rajasthan", "bangalore", "mumbai", "chennai", "hyderabad", "kolkata", "pune", "ahmedabad", "lucknow", "Arrangedmarriage", "RelationshipIndia", "TwoXIndia", "AskIndianWomen", "AskIndianMen", "OffMyChestIndia", "TeenIndia", "IndianTeenagers", "Indiangirlsontinder", "DesiWeddings", "TwentiesIndia", "CricketShitpost", "IndiaCricket", "IndianFootball", "indiansports", "RCB", "csk", "chessindia", "SaimanSays", "ShahRukhKhan", "SamayRaina", "thugeshh", "beastboyshub", "sunraybee", "FingMemes", "dankrishu", "ViratKohli", "BollyBlindsNGossip", "InstaCelebsGossip", "bollywoodmemes", "BollywoodFashion", "sharktankindia", "biggboss", "IndianTellyTalk", "DHHMemes", "punjabimusic", "kollywood", "tollywood", "IndianCinema", "BollywoodRealism", "IndianOTTbestof", "AnimeMirchi", "animeindian", "BollywoodMusic", "MalayalamMovies", "IndianHipHopHeads", "IndianStreetBets", "IndiaInvestments", "personalfinanceindia", "CreditCardsIndia", "CryptoIndia", "mutualfunds", "IndiaTax", "BitcoinIndia", "StockMarketIndia", "FIREIndia", "FatFIREIndia", "IndianStocks", "beermoneyindia", "Frugal_Ind", "CATpreparation", "Indian_Academia", "JEE", "IndiaCareers", "BITSPilani", "Indians_StudyAbroad", "IndianWorkplace", "ICSE", "CharteredAccountants", "IndiaBusiness", "smallbusinessindia", "CBSE", "indianmedschool", "CarsIndia", "indianrailways", "indianbikes", "AirTravelIndia", "Indianbooks", "IndianArtAndThinking", "indiafood", "IndianArtAI", "hindi", "IndianFoodPhotos", "IndiaCoffee", "PhotographyIndia", "IndiansRead", "IndiaTech", "GadgetsIndia", "Indiangamers", "XboxIndia", "IndiaPS5", "DesiVideoMemes", "indianmemer", "IndianMeyMeys", "IndianMemeTemplates", "desimemes"}
     
@@ -93,23 +99,44 @@ def get_dynamic_batches():
     return batches
 
 BATCH_DEFINITIONS = get_dynamic_batches()
+
 if BATCH_NAME not in BATCH_DEFINITIONS:
-    raise ValueError(f"Unknown BATCH_NAME '{BATCH_NAME}'.")
+    raise ValueError(f"Unknown BATCH_NAME '{BATCH_NAME}'. Valid options: {list(BATCH_DEFINITIONS.keys())}")
+
 SUBREDDITS = BATCH_DEFINITIONS[BATCH_NAME]
+
+# ==========================================
+# PARSE OVERRIDES FROM ENVIRONMENT
+# ==========================================
+def parse_env_int(key):
+    val = os.getenv(key)
+    return int(val) if val and val.strip() else None
+
+max_rows_per_sub = parse_env_int("MAX_ROWS_PER_SUB")
 SPLIT_NAME = f"tmp_batch_{BATCH_NAME}"
 
-# Parse environment overrides
-max_rows_per_sub = os.getenv("MAX_ROWS_PER_SUB")
-max_rows_per_sub = int(max_rows_per_sub) if max_rows_per_sub and max_rows_per_sub.strip() else None
-
-# Execution variables
 MAX_ATTEMPTS = 2               
 HARD_REQUEST_TIMEOUT = 15      
 _executor = ThreadPoolExecutor(max_workers=1)
-session = requests.Session()
+
+def get_secure_session():
+    return requests.Session()
+
+session = get_secure_session()
 
 def _do_request(params):
-    return session.get(ARCTIC_SHIFT_URL, params=params, timeout=HARD_REQUEST_TIMEOUT)
+    response = session.get(ARCTIC_SHIFT_URL, params=params, timeout=HARD_REQUEST_TIMEOUT)
+    return response
+
+def _log_response_headers(response, context):
+    interesting = {}
+    for key in ("Retry-After", "X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"):
+        if key in response.headers:
+            interesting[key] = response.headers[key]
+    if interesting:
+        print(f"    [headers:{context}] status={response.status_code} {interesting}", flush=True)
+    else:
+        print(f"    [headers:{context}] status={response.status_code} (no rate-limit headers present)", flush=True)
 
 def fetch_page_with_retries(params):
     for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -118,38 +145,57 @@ def fetch_page_with_retries(params):
             future = _executor.submit(_do_request, params)
             response = future.result(timeout=HARD_REQUEST_TIMEOUT)
             elapsed = time.time() - t0
+
             if response.status_code >= 400:
+                _log_response_headers(response, context=f"attempt {attempt}")
                 response.raise_for_status()
+
+            remaining = response.headers.get("X-RateLimit-Remaining")
+            if remaining is not None and int(remaining) < 5:
+                print(f"    [!] Rate limit getting low: {remaining} requests remaining "
+                      f"(resets at {response.headers.get('X-RateLimit-Reset')})", flush=True)
+
             return response.json(), elapsed
+
         except FutureTimeoutError:
+            elapsed = time.time() - t0
             future.cancel()
-            if attempt == MAX_ATTEMPTS: raise
+            print(f"    [!] attempt {attempt}/{MAX_ATTEMPTS} timed out after {elapsed:.1f}s "
+                  f"(no response within {HARD_REQUEST_TIMEOUT}s).", flush=True)
+            if attempt == MAX_ATTEMPTS:
+                raise
         except Exception as e:
-            if attempt == MAX_ATTEMPTS: raise
+            elapsed = time.time() - t0
+            print(f"    [!] attempt {attempt}/{MAX_ATTEMPTS} failed after {elapsed:.1f}s: {e}", flush=True)
+            if attempt == MAX_ATTEMPTS:
+                raise
 
 def fetch_subreddit_comments(subreddit, state_dict, time_budget_seconds, max_rows):
     print(f"--- Fetching r/{subreddit} (time budget: {time_budget_seconds:.0f}s) ---", flush=True)
     sub_start_time = time.time()
     all_comments = []
-    page_count = 0
     
-    # 1. State Memory & Randomization
+    # --- CHECKPOINT MEMORY & RANDOMIZATION LOGIC ---
     if subreddit in state_dict:
         current_after = state_dict[subreddit]
         resume_date = datetime.fromtimestamp(current_after).strftime('%Y-%m-%d %H:%M:%S')
         print(f"  [📍] Historical checkpoint found. Resuming strictly from: {resume_date}", flush=True)
     else:
-        # If no checkpoint exists, drop into a random month between 2020 and 2026
-        # Leaving a 30-day buffer from the end of 2026
         current_after = random.randint(START_EPOCH_2020, END_EPOCH_2026 - (86400 * 30))
         random_date = datetime.fromtimestamp(current_after).strftime('%Y-%m-%d %H:%M:%S')
         print(f"  [🎲] No checkpoint exists. Selecting random start: {random_date}", flush=True)
-
+    
+    page_count = 0
+    
     while True:
-        if (time.time() - sub_start_time) > time_budget_seconds:
-            print(f"  [!] Time budget exhausted. Saving cursor.", flush=True)
+        elapsed_this_sub = time.time() - sub_start_time
+        if elapsed_this_sub > time_budget_seconds:
+            print(f"  [!] r/{subreddit} hit its {time_budget_seconds:.0f}s allocated budget at page "
+                  f"{page_count} ({len(all_comments)} collected). Moving on.", flush=True)
             break
+            
         if max_rows and len(all_comments) >= max_rows:
+            print(f"  [!] r/{subreddit} reached maximum requested rows ({max_rows}). Moving on.", flush=True)
             break
 
         page_count += 1
@@ -166,12 +212,14 @@ def fetch_subreddit_comments(subreddit, state_dict, time_budget_seconds, max_row
             comments = data.get("data", [])
 
             if not comments:
-                print(f"    r/{subreddit}: 0 new comments (Reached end of 2026)", flush=True)
+                print(f"    r/{subreddit} page {page_count}: 0 new comments (end of range), req took {elapsed:.1f}s", flush=True)
                 break
 
             kept = 0
             for comment in comments:
-                if max_rows and len(all_comments) >= max_rows: break
+                if max_rows and len(all_comments) >= max_rows:
+                    break
+                    
                 body = comment.get("body", "")
                 if body and body not in ["[removed]", "[deleted]"]:
                     kept += 1
@@ -185,67 +233,111 @@ def fetch_subreddit_comments(subreddit, state_dict, time_budget_seconds, max_row
                         "collapsed_reason_code": comment.get("collapsed_reason_code")
                     })
 
+            # THE PAGE-BY-PAGE PROGRESS LOG
+            print(f"    r/{subreddit} page {page_count}: fetched {len(comments)}, kept {kept} "
+                  f"(running total {len(all_comments)}), req took {elapsed:.1f}s", flush=True)
+
             new_after = comments[-1]["created_utc"]
             if new_after == current_after:
+                print(f"    [!] Pagination cursor stuck at {new_after} on r/{subreddit} "
+                      f"(page {page_count}). Nudging cursor forward by 1s.", flush=True)
                 new_after += 1
             current_after = new_after
             time.sleep(1.0) 
 
         except Exception as e:
-            print(f"  [!] Error at page {page_count}: {e}. Halting sub and saving cursor.", flush=True)
+            print(f"  [!] Giving up on r/{subreddit} at page {page_count} after {MAX_ATTEMPTS} failed "
+                  f"attempts: {e}. Moving on with what was collected so far.", flush=True)
             break
 
-    # 2. Update and save checkpoint instantly
+    # Save the updated cursor state instantly for the next day's run
     state_dict[subreddit] = current_after
     save_checkpoint(state_dict)
-    
-    print(f"Collected {len(all_comments)} comments from r/{subreddit} in {time.time() - sub_start_time:.0f}s", flush=True)
+
+    sub_elapsed = time.time() - sub_start_time
+    print(f"Collected {len(all_comments)} comments from r/{subreddit} "
+          f"({page_count} pages, {sub_elapsed:.0f}s)", flush=True)
     return all_comments
 
 def push_checkpoint(master_dataset, split_name, label):
-    if not master_dataset: return
+    if not master_dataset:
+        print(f"  [checkpoint:{label}] Nothing to push yet, skipping.", flush=True)
+        return
+
     df_chunk = pd.DataFrame(master_dataset).drop_duplicates(subset=["id"])
     dataset = Dataset.from_pandas(df_chunk, features=SCHEMA, preserve_index=False)
-    for attempt in range(1, 6):
+
+    max_push_attempts = 5
+    for attempt in range(1, max_push_attempts + 1):
         try:
+            print(f"  [checkpoint:{label}] Pushing {len(df_chunk)} rows to split '{split_name}' "
+                  f"(attempt {attempt}/{max_push_attempts})...", flush=True)
             dataset.push_to_hub(repo_id=HF_DATASET_REPO, split=split_name, private=True)
+            print(f"  [checkpoint:{label}] Push complete.", flush=True)
             return
-        except Exception:
-            if attempt < 5:
-                time.sleep(random.uniform(3, 10) * attempt)
-            else:
-                raise
+        except Exception as e:
+            is_conflict = "412" in str(e) or "Precondition Failed" in str(e)
+            if attempt < max_push_attempts:
+                wait = random.uniform(3, 10) * attempt 
+                reason = "branch conflict from a concurrent job's push" if is_conflict else \
+                          f"transient error ({type(e).__name__}: {e})"
+                print(f"  [checkpoint:{label}] Push failed -- {reason}. "
+                      f"Retrying in {wait:.1f}s...", flush=True)
+                time.sleep(wait)
+                continue
+            print(f"  [checkpoint:{label}] Push failed after {attempt} attempt(s): {e}", flush=True)
+            raise
 
 def main():
-    if not HF_TOKEN: raise ValueError("HF_TOKEN environment variable is not set!")
-    if not SUBREDDITS: return
+    if not HF_TOKEN:
+        raise ValueError("HF_TOKEN environment variable is not set!")
 
-    print(f"Batch '{BATCH_NAME}' initializing...", flush=True)
+    if not SUBREDDITS:
+        print(f"Batch '{BATCH_NAME}' is empty. Nothing to do.", flush=True)
+        return
+
+    print(f"Batch '{BATCH_NAME}' covers {len(SUBREDDITS)} subreddits. Target split: '{SPLIT_NAME}'", flush=True)
+    print(f"Job time budget: {JOB_TIME_BUDGET_SECONDS}s across {len(SUBREDDITS)} subreddits "
+          f"(adaptive per-subreddit allocation, {MIN_SUBREDDIT_SECONDS}s floor)", flush=True)
+    if max_rows_per_sub:
+        print(f"Row limit override active: Fetching up to {max_rows_per_sub} comments per subreddit.", flush=True)
+
     state_dict = load_checkpoints()
     master_dataset = []
     job_start_time = time.time()
 
     for i, sub in enumerate(SUBREDDITS, start=1):
-        remaining_total = JOB_TIME_BUDGET_SECONDS - (time.time() - job_start_time)
+        elapsed_job = time.time() - job_start_time
+        remaining_total = JOB_TIME_BUDGET_SECONDS - elapsed_job
         remaining_subs = len(SUBREDDITS) - i + 1
 
-        if remaining_total <= MIN_SUBREDDIT_SECONDS: break
+        if remaining_total <= MIN_SUBREDDIT_SECONDS:
+            skipped = SUBREDDITS[i - 1:]
+            print(f"[!] Job time budget nearly exhausted after {i - 1}/{len(SUBREDDITS)} subreddits "
+                  f"({remaining_total:.0f}s left). Skipping remaining {len(skipped)} subs: {skipped}", flush=True)
+            break
+
         fair_share = max(remaining_total / remaining_subs, MIN_SUBREDDIT_SECONDS)
+        print(f"[time budget] {remaining_total:.0f}s left for {remaining_subs} subs remaining "
+              f"-> allocating up to {fair_share:.0f}s to r/{sub}", flush=True)
 
         sub_comments = fetch_subreddit_comments(
             subreddit=sub, 
-            state_dict=state_dict,
+            state_dict=state_dict, 
             time_budget_seconds=fair_share, 
             max_rows=max_rows_per_sub
         )
         master_dataset.extend(sub_comments)
+        print(f"[batch progress] {i}/{len(SUBREDDITS)} subreddits done, "
+              f"{len(master_dataset)} total rows collected so far in this batch\n", flush=True)
 
         if i % CHECKPOINT_EVERY == 0 or i == len(SUBREDDITS):
             push_checkpoint(master_dataset, SPLIT_NAME, label=f"{i}/{len(SUBREDDITS)} subs done")
+
         time.sleep(1.0) 
 
     push_checkpoint(master_dataset, SPLIT_NAME, label="final")
-    print(f"Batch '{BATCH_NAME}' finished.", flush=True)
+    print(f"\nBatch '{BATCH_NAME}' finished. Final size: {len(master_dataset)} comments.", flush=True)
 
 if __name__ == "__main__":
     main()
