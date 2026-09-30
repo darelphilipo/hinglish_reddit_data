@@ -4,7 +4,7 @@ import time
 import os
 import random
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from datasets import Dataset, Features, Value
 from huggingface_hub.errors import HfHubHTTPError
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
@@ -35,28 +35,148 @@ JOB_TIME_BUDGET_SECONDS = JOB_TIME_BUDGET_MINUTES * 60
 MIN_SUBREDDIT_SECONDS = 45  
 ARCTIC_SHIFT_URL = "https://arctic-shift.photon-reddit.com/api/comments/search"
 
-# Global bounds for randomization and cutoff (2020 to end of 2026)
-START_EPOCH_2020 = int(datetime(2020, 1, 1).timestamp())
-END_EPOCH_2026 = int(datetime(2026, 12, 31, 23, 59, 59).timestamp())
+# ---- Time-range / coverage-index settings ----
+UTC = timezone.utc
+
+def epoch(year, month=1, day=1):
+    return int(datetime(year, month, day, tzinfo=UTC).timestamp())
+
+def fmt_ts(t):
+    return datetime.fromtimestamp(int(t), UTC).strftime('%Y-%m-%d %H:%M:%S')
+
+EARLIEST_YEAR = int(os.getenv("EARLIEST_YEAR", "2020"))
+EARLIEST_EPOCH = epoch(EARLIEST_YEAR)
+
+# Never look at "now": the upper bound is always in the PAST. The small lag
+# gives Arctic Shift time to ingest recent comments so we don't mark a range
+# as covered before it is complete.
+INGEST_LAG_SECONDS = int(os.getenv("INGEST_LAG_HOURS", "6")) * 3600
+CEILING_EPOCH = int(time.time()) - INGEST_LAG_SECONDS
+CEILING_YEAR = datetime.fromtimestamp(CEILING_EPOCH, UTC).year
+
+MIN_GAP_SECONDS = 3600          # uncovered gaps shorter than this are ignored
+PAGE_LIMIT = 100
+MAX_CONSECUTIVE_EMPTY = 6       # empty random windows in a row -> give up on sub this run
+MAX_CONSECUTIVE_FAILURES = 2    # failed segments in a row -> give up on sub this run
+MAX_SEGMENTS_PER_SUB = 200
+DEAD_RECHECK_SECONDS = 14 * 86400   # re-probe a sub with zero comments after 14 days
+HISTORY_KEEP = 50
+STATE_VERSION = 2
 
 # ==========================================
-# CHECKPOINT MANAGEMENT
+# COVERAGE INDEX (per-subreddit ledger)
 # ==========================================
+# File format (prompt/checkpoint_<batch>.json):
+# {
+#   "_version": 2,
+#   "subs": {
+#     "<sub>": {
+#        "earliest": <epoch of the sub's first comment >= EARLIEST_YEAR, or null>,
+#        "dead_checked_at": <epoch, only if the sub has no comments at all>,
+#        "intervals": [[start, end], ...],   # merged, sorted, already-fetched time ranges
+#        "rows_total": <rows kept so far>,
+#        "history": [{start, end, start_iso, end_iso, rows, run}, ...]  # last 50 segments
+#     }
+#   }
+# }
 os.makedirs("prompt", exist_ok=True)
 CHECKPOINT_FILE = f"prompt/checkpoint_{BATCH_NAME}.json"
 
-def load_checkpoints():
-    if os.path.exists(CHECKPOINT_FILE):
-        try:
-            with open(CHECKPOINT_FILE, "r") as f:
-                return json.load(f)
-        except json.JSONDecodeError:
-            pass
-    return {}
+def load_state():
+    fresh = {"_version": STATE_VERSION, "subs": {}}
+    if not os.path.exists(CHECKPOINT_FILE):
+        return fresh
+    try:
+        with open(CHECKPOINT_FILE, "r") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        print("  [!] Checkpoint file unreadable. Starting with an empty coverage index.", flush=True)
+        return fresh
+    if not isinstance(data, dict) or data.get("_version") != STATE_VERSION:
+        print("  [!] Legacy (v1) checkpoint format detected -- its cursors are ignored "
+              "(they were single timestamps, not ranges). Starting a fresh coverage index. "
+              "Overlap with already-stored rows is removed by consolidate's global dedup.", flush=True)
+        return fresh
+    data.setdefault("subs", {})
+    return data
 
-def save_checkpoint(checkpoints_dict):
-    with open(CHECKPOINT_FILE, "w") as f:
-        json.dump(checkpoints_dict, f, indent=4)
+def save_state(state):
+    tmp = CHECKPOINT_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=1)
+    os.replace(tmp, CHECKPOINT_FILE)
+
+def get_sub_state(state, subreddit):
+    st = state["subs"].setdefault(subreddit, {})
+    st.setdefault("earliest", None)
+    st.setdefault("intervals", [])
+    st.setdefault("rows_total", 0)
+    st.setdefault("history", [])
+    return st
+
+def merge_intervals(intervals, tol=1):
+    cleaned = sorted([int(a), int(b)] for a, b in intervals if b >= a)
+    merged = []
+    for s, e in cleaned:
+        if merged and s <= merged[-1][1] + tol:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    return merged
+
+def find_gaps(lo, hi, intervals, min_gap):
+    """Uncovered (start, end) pieces of [lo, hi] that are at least min_gap long."""
+    gaps = []
+    cur = lo
+    for s, e in intervals:
+        if e <= cur:
+            continue
+        if s >= hi:
+            break
+        if s > cur and (s - cur) >= min_gap:
+            gaps.append((cur, s))
+        cur = max(cur, e)
+        if cur >= hi:
+            break
+    if hi - cur >= min_gap:
+        gaps.append((cur, hi))
+    return gaps
+
+def pick_target(intervals, earliest):
+    """
+    Newest year first (2026, then 2025, ...). Inside the first year that still has
+    uncovered time, choose a gap (weighted by its length) and a uniformly random
+    start inside it. Returns (year, seg_start, seg_end) or None if everything is covered.
+    """
+    lower_bound = max(EARLIEST_EPOCH, earliest) if earliest else EARLIEST_EPOCH
+    for year in range(CEILING_YEAR, EARLIEST_YEAR - 1, -1):
+        lo = max(epoch(year), lower_bound)
+        hi = min(epoch(year + 1), CEILING_EPOCH)
+        if hi - lo < MIN_GAP_SECONDS:
+            continue
+        gaps = find_gaps(lo, hi, intervals, MIN_GAP_SECONDS)
+        if not gaps:
+            continue
+        gap = random.choices(gaps, weights=[g[1] - g[0] for g in gaps])[0]
+        seg_start = random.randint(gap[0], gap[1] - MIN_GAP_SECONDS)
+        return year, seg_start, gap[1]
+    return None
+
+def commit_pending(state, pending):
+    """Fold segments into the persistent ledger. Called ONLY after their rows were pushed to HF."""
+    now = int(time.time())
+    for sub, segs in pending.items():
+        if not segs:
+            continue
+        st = get_sub_state(state, sub)
+        for s, e, rows in segs:
+            st["rows_total"] += rows
+            st["history"].append({"start": s, "end": e, "start_iso": fmt_ts(s),
+                                  "end_iso": fmt_ts(e), "rows": rows, "run": now})
+        st["intervals"] = merge_intervals(st["intervals"] + [[s, e] for s, e, _ in segs])
+        st["history"] = st["history"][-HISTORY_KEEP:]
+    pending.clear()
+    save_state(state)
 
 # ==========================================
 # DYNAMIC SUBREDDIT FETCHING & BUCKETING
@@ -170,99 +290,201 @@ def fetch_page_with_retries(params):
             if attempt == MAX_ATTEMPTS:
                 raise
 
-def fetch_subreddit_comments(subreddit, state_dict, time_budget_seconds, max_rows):
-    print(f"--- Fetching r/{subreddit} (time budget: {time_budget_seconds:.0f}s) ---", flush=True)
-    sub_start_time = time.time()
-    all_comments = []
-    
-    # --- CHECKPOINT MEMORY & RANDOMIZATION LOGIC ---
-    if subreddit in state_dict:
-        current_after = state_dict[subreddit]
-        resume_date = datetime.fromtimestamp(current_after).strftime('%Y-%m-%d %H:%M:%S')
-        print(f"  [📍] Historical checkpoint found. Resuming strictly from: {resume_date}", flush=True)
-    else:
-        current_after = random.randint(START_EPOCH_2020, END_EPOCH_2026 - (86400 * 30))
-        random_date = datetime.fromtimestamp(current_after).strftime('%Y-%m-%d %H:%M:%S')
-        print(f"  [🎲] No checkpoint exists. Selecting random start: {random_date}", flush=True)
-    
-    page_count = 0
-    
+
+# ==========================================
+# FETCHING
+# ==========================================
+def probe_earliest(subreddit, sub_state):
+    """
+    One cheap request that finds the sub's first comment on/after EARLIEST_YEAR.
+    Everything before it is treated as 'sub did not exist yet' and is never
+    scheduled. Returns False if the sub has no comments at all (skip it).
+    """
+    if sub_state.get("earliest") is not None:
+        return True
+    checked = sub_state.get("dead_checked_at")
+    if checked and (time.time() - checked) < DEAD_RECHECK_SECONDS:
+        print(f"  [skip] r/{subreddit} had no comments when last probed "
+              f"({fmt_ts(checked)}). Skipping.", flush=True)
+        return False
+
+    params = {"subreddit": subreddit, "after": EARLIEST_EPOCH, "before": CEILING_EPOCH,
+              "limit": 1, "sort": "asc"}
+    data, elapsed = fetch_page_with_retries(params)
+    comments = data.get("data", [])
+    if not comments:
+        sub_state["dead_checked_at"] = int(time.time())
+        print(f"  [skip] r/{subreddit} has NO comments between {fmt_ts(EARLIEST_EPOCH)} and "
+              f"{fmt_ts(CEILING_EPOCH)}. Skipping (probe {elapsed:.1f}s).", flush=True)
+        return False
+
+    sub_state["earliest"] = int(comments[0]["created_utc"])
+    sub_state.pop("dead_checked_at", None)
+    print(f"  [probe] r/{subreddit} first comment in range: {fmt_ts(sub_state['earliest'])} "
+          f"(nothing before this will be scheduled)", flush=True)
+    return True
+
+def fetch_segment(subreddit, seg_start, seg_end, deadline, max_rows, all_comments):
+    """
+    Fetch comments ascending from seg_start, never past seg_end (which is the start of
+    the next already-covered range / year end / ceiling).
+    Returns (status, covered_end). Everything in [seg_start, covered_end] is fully fetched.
+    status: complete | budget | row_limit | error
+    """
+    cursor = seg_start
+    last_ts = None
+    pages = 0
+    status = "complete"
+
     while True:
-        elapsed_this_sub = time.time() - sub_start_time
-        if elapsed_this_sub > time_budget_seconds:
-            print(f"  [!] r/{subreddit} hit its {time_budget_seconds:.0f}s allocated budget at page "
-                  f"{page_count} ({len(all_comments)} collected). Moving on.", flush=True)
+        if time.time() > deadline:
+            status = "budget"
             break
-            
         if max_rows and len(all_comments) >= max_rows:
-            print(f"  [!] r/{subreddit} reached maximum requested rows ({max_rows}). Moving on.", flush=True)
+            status = "row_limit"
             break
 
-        page_count += 1
-        params = {
-            "subreddit": subreddit,
-            "after": current_after,
-            "before": END_EPOCH_2026,
-            "limit": 100,
-            "sort": "asc"
-        }
-
+        pages += 1
+        params = {"subreddit": subreddit, "after": cursor, "before": seg_end,
+                  "limit": PAGE_LIMIT, "sort": "asc"}
         try:
             data, elapsed = fetch_page_with_retries(params)
-            comments = data.get("data", [])
-
-            if not comments:
-                print(f"    r/{subreddit} page {page_count}: 0 new comments (end of range), req took {elapsed:.1f}s", flush=True)
-                break
-
-            kept = 0
-            for comment in comments:
-                if max_rows and len(all_comments) >= max_rows:
-                    break
-                    
-                body = comment.get("body", "")
-                if body and body not in ["[removed]", "[deleted]"]:
-                    kept += 1
-                    all_comments.append({
-                        "id": comment.get("id"),
-                        "body": body,
-                        "created_utc": comment.get("created_utc"),
-                        "subreddit": subreddit,
-                        "score": comment.get("score"),
-                        "controversiality": comment.get("controversiality"),
-                        "collapsed_reason_code": comment.get("collapsed_reason_code")
-                    })
-
-            # THE PAGE-BY-PAGE PROGRESS LOG
-            print(f"    r/{subreddit} page {page_count}: fetched {len(comments)}, kept {kept} "
-                  f"(running total {len(all_comments)}), req took {elapsed:.1f}s", flush=True)
-
-            new_after = comments[-1]["created_utc"]
-            if new_after == current_after:
-                print(f"    [!] Pagination cursor stuck at {new_after} on r/{subreddit} "
-                      f"(page {page_count}). Nudging cursor forward by 1s.", flush=True)
-                new_after += 1
-            current_after = new_after
-            time.sleep(1.0) 
-
         except Exception as e:
-            print(f"  [!] Giving up on r/{subreddit} at page {page_count} after {MAX_ATTEMPTS} failed "
-                  f"attempts: {e}. Moving on with what was collected so far.", flush=True)
+            print(f"  [!] r/{subreddit}: giving up on this segment at page {pages} after "
+                  f"{MAX_ATTEMPTS} failed attempts: {e}", flush=True)
+            status = "error"
             break
 
-    # Save the updated cursor state instantly for the next day's run
-    state_dict[subreddit] = current_after
-    save_checkpoint(state_dict)
+        comments = data.get("data", [])
+        if not comments:
+            print(f"    r/{subreddit} page {pages}: 0 comments -> range confirmed complete "
+                  f"up to {fmt_ts(seg_end)} (req {elapsed:.1f}s)", flush=True)
+            cursor = seg_end
+            status = "complete"
+            break
+
+        kept = 0
+        truncated = False
+        for comment in comments:
+            if max_rows and len(all_comments) >= max_rows:
+                truncated = True
+                break
+            last_ts = int(comment.get("created_utc"))
+            body = comment.get("body", "")
+            if body and body not in ["[removed]", "[deleted]"]:
+                kept += 1
+                all_comments.append({
+                    "id": comment.get("id"),
+                    "body": body,
+                    "created_utc": comment.get("created_utc"),
+                    "subreddit": subreddit,
+                    "score": comment.get("score"),
+                    "controversiality": comment.get("controversiality"),
+                    "collapsed_reason_code": comment.get("collapsed_reason_code")
+                })
+
+        print(f"    r/{subreddit} page {pages}: fetched {len(comments)}, kept {kept} "
+              f"(running total {len(all_comments)}), at {fmt_ts(last_ts or cursor)}, "
+              f"req {elapsed:.1f}s", flush=True)
+
+        if truncated:
+            # Only claim coverage up to the last comment we actually processed.
+            if last_ts is not None:
+                cursor = last_ts
+            status = "row_limit"
+            break
+
+        new_after = int(comments[-1]["created_utc"])
+        if new_after == cursor:
+            print(f"    [!] Pagination cursor stuck at {new_after} on r/{subreddit}. "
+                  f"Nudging cursor forward by 1s.", flush=True)
+            new_after += 1
+        cursor = new_after
+        time.sleep(1.0)
+
+    covered_end = cursor if cursor > seg_start else None
+    return status, covered_end
+
+def fetch_subreddit_comments(subreddit, sub_state, time_budget_seconds, max_rows):
+    """
+    Repeatedly: pick a random uncovered window (newest year first), fetch it, and record the
+    range. Returns (comments, segments) where segments = [(start, end, rows_kept), ...].
+    The ledger is NOT updated here; main() commits segments only after the rows are pushed.
+    """
+    print(f"--- Fetching r/{subreddit} (time budget: {time_budget_seconds:.0f}s) ---", flush=True)
+    sub_start_time = time.time()
+    deadline = sub_start_time + time_budget_seconds
+    all_comments = []
+    segments = []
+
+    try:
+        if not probe_earliest(subreddit, sub_state):
+            return all_comments, segments
+    except Exception as e:
+        print(f"  [!] Probe failed for r/{subreddit}: {e}. Skipping this sub for now.", flush=True)
+        return all_comments, segments
+
+    consecutive_empty = 0
+    consecutive_fail = 0
+
+    for seg_no in range(1, MAX_SEGMENTS_PER_SUB + 1):
+        if time.time() > deadline:
+            print(f"  [!] r/{subreddit} hit its {time_budget_seconds:.0f}s budget. Moving on.", flush=True)
+            break
+        if max_rows and len(all_comments) >= max_rows:
+            print(f"  [!] r/{subreddit} reached max requested rows ({max_rows}). Moving on.", flush=True)
+            break
+
+        local_iv = merge_intervals(sub_state["intervals"] + [[s, e] for s, e, _ in segments])
+        target = pick_target(local_iv, sub_state.get("earliest"))
+        if target is None:
+            print(f"  [✓] r/{subreddit} is fully covered from {fmt_ts(max(EARLIEST_EPOCH, sub_state.get('earliest') or 0))} "
+                  f"to {fmt_ts(CEILING_EPOCH)}. Nothing left to fetch.", flush=True)
+            break
+
+        year, seg_start, seg_end = target
+        print(f"  [🎲] segment {seg_no}: year {year}, random start {fmt_ts(seg_start)} "
+              f"(window ends {fmt_ts(seg_end)})", flush=True)
+
+        before = len(all_comments)
+        status, covered_end = fetch_segment(subreddit, seg_start, seg_end, deadline, max_rows, all_comments)
+        rows = len(all_comments) - before
+
+        if covered_end is not None:
+            segments.append((seg_start, covered_end, rows))
+            print(f"  [📒] segment {seg_no} covered {fmt_ts(seg_start)} -> {fmt_ts(covered_end)} "
+                  f"({rows} rows, status={status})", flush=True)
+
+        if status == "error":
+            consecutive_fail += 1
+            if consecutive_fail >= MAX_CONSECUTIVE_FAILURES:
+                print(f"  [!] {consecutive_fail} failed segments in a row on r/{subreddit}. Moving on.", flush=True)
+                break
+            continue
+        consecutive_fail = 0
+
+        if status == "complete" and rows == 0:
+            consecutive_empty += 1
+            if consecutive_empty >= MAX_CONSECUTIVE_EMPTY:
+                print(f"  [skip] {consecutive_empty} empty windows in a row on r/{subreddit} "
+                      f"(sub likely inactive in those periods). Moving on.", flush=True)
+                break
+        else:
+            consecutive_empty = 0
+
+        if status in ("budget", "row_limit"):
+            break
 
     sub_elapsed = time.time() - sub_start_time
-    print(f"Collected {len(all_comments)} comments from r/{subreddit} "
-          f"({page_count} pages, {sub_elapsed:.0f}s)", flush=True)
-    return all_comments
+    print(f"Collected {len(all_comments)} comments from r/{subreddit} in {len(segments)} segment(s) "
+          f"({sub_elapsed:.0f}s)", flush=True)
+    return all_comments, segments
 
 def push_checkpoint(master_dataset, split_name, label):
+    """Returns True when the rows are safely on HF (or there was nothing to push). Raises on failure."""
     if not master_dataset:
         print(f"  [checkpoint:{label}] Nothing to push yet, skipping.", flush=True)
-        return
+        return True
 
     df_chunk = pd.DataFrame(master_dataset).drop_duplicates(subset=["id"])
     dataset = Dataset.from_pandas(df_chunk, features=SCHEMA, preserve_index=False)
@@ -274,7 +496,7 @@ def push_checkpoint(master_dataset, split_name, label):
                   f"(attempt {attempt}/{max_push_attempts})...", flush=True)
             dataset.push_to_hub(repo_id=HF_DATASET_REPO, split=split_name, private=True)
             print(f"  [checkpoint:{label}] Push complete.", flush=True)
-            return
+            return True
         except Exception as e:
             is_conflict = "412" in str(e) or "Precondition Failed" in str(e)
             if attempt < max_push_attempts:
@@ -297,13 +519,17 @@ def main():
         return
 
     print(f"Batch '{BATCH_NAME}' covers {len(SUBREDDITS)} subreddits. Target split: '{SPLIT_NAME}'", flush=True)
+    print(f"Time window: {fmt_ts(EARLIEST_EPOCH)} -> {fmt_ts(CEILING_EPOCH)} UTC "
+          f"(newest year first, random start inside uncovered gaps)", flush=True)
     print(f"Job time budget: {JOB_TIME_BUDGET_SECONDS}s across {len(SUBREDDITS)} subreddits "
           f"(adaptive per-subreddit allocation, {MIN_SUBREDDIT_SECONDS}s floor)", flush=True)
     if max_rows_per_sub:
         print(f"Row limit override active: Fetching up to {max_rows_per_sub} comments per subreddit.", flush=True)
 
-    state_dict = load_checkpoints()
+    state = load_state()
+    pending = {}          # segments fetched this run, not yet confirmed pushed
     master_dataset = []
+    last_pushed_rows = 0
     job_start_time = time.time()
 
     for i, sub in enumerate(SUBREDDITS, start=1):
@@ -321,22 +547,29 @@ def main():
         print(f"[time budget] {remaining_total:.0f}s left for {remaining_subs} subs remaining "
               f"-> allocating up to {fair_share:.0f}s to r/{sub}", flush=True)
 
-        sub_comments = fetch_subreddit_comments(
-            subreddit=sub, 
-            state_dict=state_dict, 
-            time_budget_seconds=fair_share, 
+        sub_state = get_sub_state(state, sub)
+        sub_comments, segments = fetch_subreddit_comments(
+            subreddit=sub,
+            sub_state=sub_state,
+            time_budget_seconds=fair_share,
             max_rows=max_rows_per_sub
         )
         master_dataset.extend(sub_comments)
+        pending[sub] = segments
         print(f"[batch progress] {i}/{len(SUBREDDITS)} subreddits done, "
               f"{len(master_dataset)} total rows collected so far in this batch\n", flush=True)
 
         if i % CHECKPOINT_EVERY == 0 or i == len(SUBREDDITS):
-            push_checkpoint(master_dataset, SPLIT_NAME, label=f"{i}/{len(SUBREDDITS)} subs done")
+            if push_checkpoint(master_dataset, SPLIT_NAME, label=f"{i}/{len(SUBREDDITS)} subs done"):
+                last_pushed_rows = len(master_dataset)
+                commit_pending(state, pending)   # ledger only advances after a successful push
 
         time.sleep(1.0) 
 
-    push_checkpoint(master_dataset, SPLIT_NAME, label="final")
+    if len(master_dataset) != last_pushed_rows:
+        push_checkpoint(master_dataset, SPLIT_NAME, label="final")
+    commit_pending(state, pending)
+    save_state(state)   # also persists probe results (earliest / dead markers)
     print(f"\nBatch '{BATCH_NAME}' finished. Final size: {len(master_dataset)} comments.", flush=True)
 
 if __name__ == "__main__":
